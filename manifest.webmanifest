@@ -1,0 +1,12 @@
+{
+  "name": "PEGS Supercoach Franchise",
+  "short_name": "PEGS",
+  "start_url": "./#home",
+  "display": "standalone",
+  "background_color": "#07111c",
+  "theme_color": "#07111c",
+  "description": "PEGS fantasy AFL franchise league hub",
+  "icons": [
+    {"src": "pegs-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
+  ]
+}

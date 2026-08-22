@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#07111c">
+  <meta name="description" content="PEGS Supercoach Franchise league hub - teams, ladder, draft, results and head-to-head matchups.">
+  <title>PEGS Supercoach Franchise</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="pegs-icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <div class="stadium-glow" aria-hidden="true"></div>
+
+  <header class="site-header">
+    <div class="shell header-inner">
+      <a class="brand" href="#home" aria-label="PEGS home">
+        <span class="brand-ball" aria-hidden="true">
+          <svg viewBox="0 0 64 64" role="img"><ellipse cx="32" cy="32" rx="25" ry="16" transform="rotate(-28 32 32)"/><path d="M23 35l18-9M27 29l2 4m5-7l2 4m5-7l2 4"/></svg>
+        </span>
+        <span class="brand-copy"><strong>PEGS</strong><small>Supercoach Franchise</small></span>
+      </a>
+      <nav class="desktop-nav" aria-label="Primary">
+        <button data-route="home">Home</button>
+        <button data-route="matchups">Matchups</button>
+        <button data-route="results">Results</button>
+        <button data-route="teams">Teams</button>
+        <button data-route="ladder">Ladder</button>
+        <button data-route="draft">Draft</button>
+        <button data-route="transactions">Moves</button>
+        <button data-route="history">History</button>
+      </nav>
+      <div class="header-actions">
+        <span class="season-pill"><span class="status-dot"></span><span id="season-pill-year">2026</span></span>
+        <button class="icon-button" id="open-commissioner" aria-label="Commissioner login" title="Commissioner login">
+          <span aria-hidden="true">C</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main id="main-content" class="shell app-main" tabindex="-1"></main>
+
+  <nav class="mobile-nav" aria-label="Mobile primary">
+    <button data-route="home"><span aria-hidden="true">H</span><small>Home</small></button>
+    <button data-route="matchups"><span aria-hidden="true">VS</span><small>Matchups</small></button>
+    <button data-route="teams"><span aria-hidden="true">T</span><small>Teams</small></button>
+    <button data-route="ladder"><span aria-hidden="true">#</span><small>Ladder</small></button>
+    <button data-route="transactions"><span aria-hidden="true">M</span><small>Moves</small></button>
+    <button data-route="draft"><span aria-hidden="true">D</span><small>Draft</small></button>
+  </nav>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
+  <dialog id="commissioner-dialog" class="commissioner-dialog" aria-labelledby="commissioner-title">
+    <form method="dialog" class="dialog-head">
+      <div>
+        <span class="eyebrow">Commissioner only</span>
+        <h2 id="commissioner-title">Commissioner Control Centre</h2>
+      </div>
+      <button class="icon-button" aria-label="Close commissioner tools">X</button>
+    </form>
+    <div id="commissioner-content"></div>
+  </dialog>
+
+  <script src="config.js"></script>
+  <script src="league-data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

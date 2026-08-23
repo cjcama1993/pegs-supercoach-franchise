@@ -1,4 +1,4 @@
-const CACHE='pegs-v12';
+const CACHE='pegs-v13-2-full-time-projection';
 const ASSETS=["./", "./index.html", "./styles.css", "./app.js", "./config.js", "./league-data.js", "./manifest.webmanifest", "./pegs-icon.svg", "./assets/figureheads/bailey-smith.png", "./assets/figureheads/brodie-grundy.png", "./assets/figureheads/clayton-oliver.png", "./assets/figureheads/errol-gulden.png", "./assets/figureheads/harry-sheezel.png", "./assets/figureheads/matt-rowell.png", "./assets/figureheads/max-gawn.png", "./assets/figureheads/max-holmes.png", "./assets/figureheads/nasiah-wanganeen-milera.png", "./assets/figureheads/nick-daicos.png", "./assets/figureheads/will-ashcroft.png", "./assets/figureheads/zak-butters.png"];
 self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(ASSETS)).then(()=>self.skipWaiting())));
 self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim())));

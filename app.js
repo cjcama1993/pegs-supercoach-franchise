@@ -117,7 +117,10 @@
   }
   function figurehead(key,size=''){
     const t=team(key),p=figureheadPlayer(key),src=playerPhotoUrl(p.player,p.club),initials=String(p.player||t.owner).split(/\s+/).slice(0,2).map(x=>x[0]||'').join('').toUpperCase();
-    return `<span class="team-figurehead ${size}" style="--accent:${esc(t.accent)}" title="${esc(p.player)} — ${esc(t.name)}"><span class="figurehead-fallback" aria-hidden="true">${esc(initials||t.code)}</span>${src?`<img src="${esc(src)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.hidden=true">`:''}</span>`;
+    // Keep the initials visible until a portrait has actually decoded. If a
+    // remote player photo is missing or malformed, the figurehead stays as a
+    // clean branded fallback instead of showing a broken-image state.
+    return `<span class="team-figurehead ${size}" style="--accent:${esc(t.accent)}" title="${esc(p.player)} — ${esc(t.name)}"><span class="figurehead-fallback" aria-hidden="true">${esc(initials||t.code)}</span>${src?`<img src="${esc(src)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" onload="this.parentElement.classList.add('photo-ready')" onerror="this.remove()">`:''}</span>`;
   }
 
   function teamIdentity(key, size = '') {
@@ -532,15 +535,21 @@
     return Object.prototype.hasOwnProperty.call(all, id) ? Number(all[id]) : undefined;
   }
 
+  function scoreCountForRoundRecord(rec){
+    const playing=Number(rec?.aflTeamsPlaying||D.meta.topPlayersDefault||18);
+    const banked=[...new Set((rec?.bankClubs||[]).map(normalizeAflCode).filter(Boolean))].length;
+    // An OR banked club contributes one available score slot in addition to
+    // the clubs physically playing that round. There are only 18 AFL clubs.
+    return Math.min(18,Math.max(0,playing)+banked);
+  }
   function topPlayersForRound(round) {
-    const rec=effectiveRoundRecord(round);
-    return Number(rec.aflTeamsPlaying || D.meta.topPlayersDefault || 18);
+    return scoreCountForRoundRecord(effectiveRoundRecord(round));
   }
   function roundContext(round){
-    const rec=effectiveRoundRecord(round),banks=rec.bankClubs||[],byes=rec.byeClubs||[];
-    if(banks.length) return `Opening Round scores are banked for ${banks.join(', ')} because those AFL clubs have the bye. ${rec.aflTeamsPlaying} AFL clubs play, so ${rec.aflTeamsPlaying} PEGS scores count.`;
-    if(byes.length) return `${rec.aflTeamsPlaying} AFL clubs play. Byes: ${byes.join(', ')}. The top ${rec.aflTeamsPlaying} PEGS Field scores count.`;
-    return `All ${rec.aflTeamsPlaying} AFL clubs are playing, so the top ${rec.aflTeamsPlaying} PEGS Field scores count.`;
+    const rec=effectiveRoundRecord(round),banks=rec.bankClubs||[],byes=rec.byeClubs||[],count=topPlayersForRound(round);
+    if(banks.length) return `${rec.aflTeamsPlaying} AFL clubs play and ${banks.length} Opening Round club${banks.length===1?' is':'s are'} banked, so the top ${count} PEGS Field scores count.`;
+    if(byes.length) return `${rec.aflTeamsPlaying} AFL clubs play. Byes: ${byes.join(', ')}. The top ${count} PEGS Field scores count.`;
+    return `All ${rec.aflTeamsPlaying} AFL clubs are playing, so the top ${count} PEGS Field scores count.`;
   }
 
   function teamRoundPlayers(round, teamKey) {
@@ -553,31 +562,72 @@
       player:p.player,position:p.position,status:'Field',score:0,projected:baselineProjection(p.player,0),club:p.club,scoreSource:scoringSnapshotForRound(round)?`${scoringSnapshotForRound(round).stage} scoring lock`:'Season roster'
     }));
   }
+  function normalizeAvailabilityStatus(value){
+    const raw=String(value||'TBC').trim().toUpperCase();
+    const compact=raw.replace(/[\s_-]+/g,'');
+    if(compact==='PLAYINGNEXTROUND'||compact==='SELECTED'||compact==='PLAYING')return 'SELECTED';
+    if(compact==='NOTPLAYINGNEXTROUND'||compact==='NOTSELECTED'||compact==='OUT')return 'OUT';
+    if(compact==='EMERGENCY'||compact==='EMERGENCYNEXTROUND')return 'EMERGENCY';
+    if(compact==='INJURED'||compact==='INJURY'||compact.includes('INJUR'))return 'INJURED';
+    if(compact==='BYE')return 'BYE';
+    if(compact==='BANKED')return 'BANKED';
+    if(compact==='OVERRIDE')return 'OVERRIDE';
+    if(compact==='FT')return 'FT';
+    if(compact==='LIVE')return 'LIVE';
+    return raw||'TBC';
+  }
+  function unavailableForProjection(status){
+    return ['OUT','NOT_SELECTED','NOTPLAYINGNEXTROUND','EMERGENCY','INJURED','BYE'].includes(normalizeAvailabilityStatus(status));
+  }
+  function mergeProviderTeamRecord(matchRec={},teamRec={}){
+    return {...matchRec,...teamRec,
+      status:normalizeAvailabilityStatus(teamRec.status||matchRec.status||'TBC'),
+      actual:matchRec.actual===null||matchRec.actual===undefined?(teamRec.actual??null):matchRec.actual,
+      gameStatus:String(matchRec.gameStatus||teamRec.gameStatus||'PRE').toUpperCase(),
+      source:matchRec.source||teamRec.source||'Supercoach.live'
+    };
+  }
+  function liveFeedCompleteForRound(round){
+    const feed=getLiveFeed(),same=Number(feed.season)===currentSeason()&&Number(feed.round)===Number(round),expected=Number(feed.expectedGameCount||0),matched=Number(feed.matchedGameCount||feed.games?.length||0),completed=Number(feed.completedGameCount||0);
+    return Boolean(same&&expected>0&&matched>=expected&&completed>=expected);
+  }
   function availabilityInfo(p,round,teamKey){
-    const finalized=roundFinalized(round); if(finalized)return {status:'FT',gameStatus:'FT',source:'Finalised',projection:Number(p.projected||0),actual:Number(p.score||0)};
+    const finalized=roundFinalized(round); if(finalized)return {status:'FT',gameStatus:'FT',source:'Finalised',projection:Number(p.score||0),actual:Number(p.score||0)};
     if(!activeSeasonSetup() && currentSeason()===Number(D.meta.season) && D.roundScores[String(round)]?.[teamKey]) return {status:'FT',gameStatus:'FT',source:p.scoreSource||'Workbook result',projection:Number(p.projected||p.score||0),actual:Number(p.score||0)};
     const over=scoreOverride(round,teamKey,p.player); if(over!==undefined)return {status:'OVERRIDE',gameStatus:'FT',source:'Commissioner score override',projection:Number(over),actual:Number(over)};
     if(p.scoreSource==='Opening Round banked')return {status:'BANKED',gameStatus:'FT',source:'OR bank',projection:Number(p.score||0),actual:Number(p.score||0)};
     const roundRec=effectiveRoundRecord(round),clubCode=normalizeAflCode(p.club),bankApplies=(roundRec.bankClubs||[]).includes(clubCode),onBye=(roundRec.byeClubs||[]).includes(clubCode);
     if(bankApplies){const bank=getOpeningBank()?.[String(currentSeason())]?.players?.[canonicalPlayerName(p.player)];if(bank&&bank.actual!==null&&bank.actual!==undefined)return {status:'BANKED',gameStatus:'FT',source:'Opening Round bank',projection:Number(bank.actual||0),actual:Number(bank.actual||0)};return {status:'BYE',gameStatus:'PRE',source:'AFL bye - no Opening Round score',projection:0,actual:null};}
     if(onBye)return {status:'BYE',gameStatus:'PRE',source:'AFL bye',projection:0,actual:null};
-    const feed=getLiveFeed(),liveRound=Number(feed.season)===currentSeason()&&Number(feed.round)===Number(round),rec=liveRound?feed.players?.[canonicalPlayerName(p.player)]:null;
+    const feed=getLiveFeed(),liveRound=Number(feed.season)===currentSeason()&&Number(feed.round)===Number(round),feedComplete=liveFeedCompleteForRound(round),rec=liveRound?feed.players?.[canonicalPlayerName(p.player)]:null;
     const statusOverride=selectionOverride(round,teamKey,p.player);
-    if(statusOverride==='OUT')return {status:'OUT',gameStatus:'PRE',source:'Commissioner selection override',projection:0,actual:null};
-    if(statusOverride==='SELECTED')return {status:'SELECTED',gameStatus:String(rec?.gameStatus||'PRE').toUpperCase(),source:'Commissioner selection override',projection:Number(rec?.projection??p.projected??baselineProjection(p.player,0)),actual:rec?.actual===null||rec?.actual===undefined?null:Number(rec.actual),updatedAt:rec?.updatedAt||feed.updatedAt};
-    if(!rec)return {status:'TBC',gameStatus:'PRE',source:'Projection',projection:Number(p.projected||baselineProjection(p.player,0)),actual:null};
-    return {status:String(rec.status||'TBC').toUpperCase(),gameStatus:String(rec.gameStatus||'PRE').toUpperCase(),source:rec.source||feed.source||'Live feed',projection:Number(rec.projection??p.projected??baselineProjection(p.player,0)),actual:rec.actual===null||rec.actual===undefined?null:Number(rec.actual),updatedAt:rec.updatedAt||feed.updatedAt};
+    if(statusOverride==='OUT')return {status:'OUT',gameStatus:feedComplete?'FT':'PRE',source:'Commissioner selection override',projection:0,actual:feedComplete?0:null};
+    if(statusOverride==='SELECTED'){
+      if(feedComplete&&!rec)return {status:'OUT',gameStatus:'FT',source:'Complete round feed - did not play',projection:0,actual:0,updatedAt:feed.updatedAt};
+      return {status:'SELECTED',gameStatus:String(rec?.gameStatus||'PRE').toUpperCase(),source:'Commissioner selection override',projection:Number(rec?.projection??p.projected??baselineProjection(p.player,0)),actual:rec?.actual===null||rec?.actual===undefined?null:Number(rec.actual),updatedAt:rec?.updatedAt||feed.updatedAt};
+    }
+    if(!rec){
+      if(feedComplete)return {status:'OUT',gameStatus:'FT',source:'Complete round feed - did not play',projection:0,actual:0,updatedAt:feed.updatedAt};
+      return {status:'TBC',gameStatus:'PRE',source:'Projection',projection:Number(p.projected||baselineProjection(p.player,0)),actual:null};
+    }
+    const providerStatus=normalizeAvailabilityStatus(rec.status||'TBC');
+    const providerProjection=unavailableForProjection(providerStatus)?0:Number(rec.projection??p.projected??baselineProjection(p.player,0));
+    return {status:providerStatus,gameStatus:String(rec.gameStatus||'PRE').toUpperCase(),source:rec.source||feed.source||'Live feed',projection:providerProjection,actual:rec.actual===null||rec.actual===undefined?null:Number(rec.actual),updatedAt:rec.updatedAt||feed.updatedAt};
   }
   function calcTeamRound(round, teamKey) {
     const topN=topPlayersForRound(round);
     const players=teamRoundPlayers(round,teamKey).map(p=>{
       const info=availabilityInfo(p,round,teamKey); let score=0,played=false,liveValue=Number(info.projection||0),status=info.status;
       if(info.status==='BANKED'||info.status==='OVERRIDE'||info.gameStatus==='FT'){
-        score=Number(info.actual??p.score??0); played=true; liveValue=score;
+        score=Number(info.actual??p.score??0); played=score>0||info.status==='BANKED'||info.status==='OVERRIDE'; liveValue=score;
+      } else if(info.gameStatus==='LIVE'&&Number(info.actual||0)>0){
+        // A positive live score is proof the player has taken the field, even if a
+        // stale team-list marker still says emergency/out.
+        score=Number(info.actual||0); played=true; liveValue=Math.max(score,Number(info.projection||0)); status='LIVE';
+      } else if(unavailableForProjection(info.status)){
+        score=0; played=false; liveValue=0;
       } else if(info.gameStatus==='LIVE'){
         score=Number(info.actual||0); played=score>0; liveValue=Math.max(score,Number(info.projection||0));
-      } else if(['OUT','NOT_SELECTED','NOTPLAYINGNEXTROUND','EMERGENCY','INJURED','BYE'].includes(info.status)){
-        score=0; played=false; liveValue=0;
       } else if(Number(p.score||0)>0 && currentSeason()===Number(D.meta.season) && !activeSeasonSetup()){
         score=Number(p.score||0); played=true; liveValue=score; status='FT';
       }
@@ -586,7 +636,7 @@
     const actualRank=[...players].sort((a,b)=>b.score-a.score||b.liveValue-a.liveValue),actualCounted=new Set(actualRank.slice(0,topN).map(p=>p.player));
     const liveRank=[...players].sort((a,b)=>b.liveValue-a.liveValue||b.score-a.score),liveCounted=new Set(liveRank.slice(0,topN).map(p=>p.player));
     const actual=actualRank.slice(0,topN).reduce((s,p)=>s+p.score,0),projected=liveRank.slice(0,topN).reduce((s,p)=>s+p.liveValue,0);
-    const preRoundProjection=[...players].sort((a,b)=>b.feedProjection-a.feedProjection).slice(0,topN).reduce((s,p)=>s+(['OUT','NOT_SELECTED','NOTPLAYINGNEXTROUND','EMERGENCY','INJURED','BYE'].includes(p.availability)?0:p.feedProjection),0);
+    const preRoundProjection=[...players].map(p=>({...p,effectiveFeedProjection:unavailableForProjection(p.availability)?0:p.feedProjection})).sort((a,b)=>b.effectiveFeedProjection-a.effectiveFeedProjection).slice(0,topN).reduce((s,p)=>s+p.effectiveFeedProjection,0);
     return {players,actual:Math.round(actual),projected:Math.round(projected),preRoundProjection:Math.round(preRoundProjection),actualCounted,liveCounted,topN};
   }
 
@@ -646,12 +696,35 @@
     toastEl._timer = setTimeout(() => toastEl.classList.remove('show'), 2600);
   }
 
+  function projectedLadderForRound(round){
+    const base=effectiveLadder().map(r=>({...r})),setup=activeSeasonSetup(),regular=Number(setup?.pegsRegularRounds||20);
+    if(Number(round)>regular||roundFinalized(round))return base;
+    const byTeam=Object.fromEntries(base.map(r=>[r.team,r]));
+    const fixtures=effectiveFixtures().filter(f=>Number(f.round)===Number(round)&&Number(f.round)<=regular&&f.away&&!f.finalType);
+    for(const f of fixtures){
+      const h=byTeam[f.home],a=byTeam[f.away]; if(!h||!a)continue;
+      const hc=calcTeamRound(round,f.home),ac=calcTeamRound(round,f.away),hs=Number(hc.projected||0),as=Number(ac.projected||0);
+      h.played++;a.played++;h.pf+=hs;h.pa+=as;a.pf+=as;a.pa+=hs;
+      if(hs>as){h.wins++;a.losses++;h.points+=4;}else if(as>hs){a.wins++;h.losses++;a.points+=4;}else{h.draws++;a.draws++;h.points+=2;a.points+=2;}
+    }
+    const rows=Object.values(byTeam);rows.forEach(r=>r.percentage=r.pa?100*r.pf/r.pa:(r.pf?999:0));rows.sort((a,b)=>b.points-a.points||b.percentage-a.percentage||b.pf-a.pf);rows.forEach((r,i)=>r.position=i+1);return rows;
+  }
+  function liveRoundBadge(round){
+    const feed=getLiveFeed(),same=Number(feed.season)===currentSeason()&&Number(feed.round)===Number(round),expected=Number(feed.expectedGameCount||0),done=Number(feed.completedGameCount||0);
+    if(roundFinalized(round))return {label:'FINAL',tone:'green'};
+    if(liveFeedCompleteForRound(round))return {label:'FULL TIME DATA',tone:'green'};
+    if(same&&Object.values(feed.players||{}).some(p=>String(p.gameStatus||'').toUpperCase()==='LIVE'))return {label:'LIVE',tone:'red'};
+    if(same&&Object.keys(feed.players||{}).length)return {label:'PROJECTED',tone:'blue'};
+    return {label:'PROJECTIONS',tone:'neutral'};
+  }
   function renderConfiguredSeasonHome(){
-    const setup=activeSeasonSetup(),round=effectiveCurrentRound(),fixtures=effectiveFixtures().filter(f=>Number(f.round)===round),ladder=effectiveLadder(),rec=effectiveRoundRecord(round),feed=getLiveFeed();
-    const fixtureCards=fixtures.slice(0,6).map(f=>{const h=calcTeamRound(round,f.home),a=calcTeamRound(round,f.away),hp=winProbability(h.projected,a.projected);return `<button class="card season-live-fixture" data-action="open-matchup" data-round="${round}" data-home="${f.home}" data-away="${f.away}"><div>${teamIdentity(f.home,'sm')}<strong>${h.actual}</strong><small>Proj ${h.projected}</small></div><span class="vs-dot" style="width:34px;height:34px;font-size:10px">VS</span><div>${teamIdentity(f.away,'sm')}<strong>${a.actual}</strong><small>Proj ${a.projected}</small></div><div class="fixture-prob">${hp}% / ${100-hp}%</div></button>`;}).join('');
-    const ladderRows=ladder.slice(0,6).map(r=>`<div class="mini-ladder-row"><b>${r.position}</b>${teamIdentity(r.team,'sm')}<span>${r.wins}-${r.losses}</span><b>${r.points}</b></div>`).join('');
-    const feedFresh=Number(feed.season)===currentSeason()&&Number(feed.round)===round&&feed.updatedAt;
-    main.innerHTML=`<section class="hero-grid"><article class="card hero-score"><span class="eyebrow kicker">${currentSeason()} season</span><div class="hero-meta"><span class="badge ${feedFresh?'green':'neutral'}">${feedFresh?'LIVE DATA':'PRE-SEASON / TBC'}</span><span class="badge neutral">Round ${round}</span></div><h1>${setup.openingRound?.enabled?'Opening Round banking enabled':'Standard season format'}</h1><p>${roundContext(round)}</p><div class="stat-strip" style="grid-template-columns:repeat(3,1fr);margin-top:18px"><div class="stat-box"><span>AFL clubs playing</span><strong>${rec.aflTeamsPlaying}</strong></div><div class="stat-box"><span>PEGS scores counted</span><strong>${topPlayersForRound(round)}</strong></div><div class="stat-box"><span>Live feed</span><strong>${feedFresh?'SYNCED':'WAITING'}</strong><small>${feedFresh?fmtDate(feed.updatedAt):'Commissioner setup'}</small></div></div><div class="button-row"><button class="primary-button" data-route="matchups/${round}">Round matchups</button><button class="secondary-button" data-route="draft">Draft room</button><button class="secondary-button" data-route="transactions">Propose move</button></div></article><aside class="hero-side"><article class="card mini-ladder"><div class="section-title"><h2>${currentSeason()} ladder</h2><button class="link-button" data-route="ladder">Full ladder</button></div>${ladderRows}</article><article class="card card-pad"><div class="section-title"><h2>Season settings</h2></div><div class="rules-list"><div class="rule-item"><span class="rule-num">OR</span><span>${setup.openingRound?.enabled?'Opening Round score banking active':'No Opening Round'}</span></div><div class="rule-item"><span class="rule-num">BYE</span><span>${(setup.rounds||[]).filter(r=>(r.byeClubs||[]).length).length} AFL rounds contain byes</span></div><div class="rule-item"><span class="rule-num">H2H</span><span>${setup.pegsRegularRounds||20} PEGS regular-season rounds configured</span></div></div></article></aside></section><section class="card card-pad" style="margin-top:16px"><div class="section-title"><div><span class="eyebrow">Round ${round}</span><h2>Head-to-head board</h2></div><button class="link-button" data-route="matchups/${round}">Full match centre</button></div><div class="season-fixture-grid">${fixtureCards||'<div class="empty">No PEGS H2H fixtures configured for this round.</div>'}</div></section>`;
+    const round=effectiveCurrentRound(),fixtures=effectiveFixtures().filter(f=>Number(f.round)===round),badge=liveRoundBadge(round),ladder=projectedLadderForRound(round),regular=Number(activeSeasonSetup()?.pegsRegularRounds||20),roundComplete=Boolean(roundFinalized(round)||liveFeedCompleteForRound(round)),ladderProjected=Number(round)<=regular&&!roundComplete;
+    const fixtureCards=fixtures.map(f=>{
+      const h=calcTeamRound(round,f.home),a=calcTeamRound(round,f.away),hp=winProbability(h.projected,a.projected),hSub=roundComplete?'Final':`Proj ${h.projected}`,aSub=roundComplete?'Final':`Proj ${a.projected}`,centre=roundComplete?'FINAL':`${hp}% · ${100-hp}%`;
+      return `<button class="live-h2h-card" data-action="open-matchup" data-round="${round}" data-home="${f.home}" data-away="${f.away}"><div class="live-h2h-team">${teamIdentity(f.home,'sm')}<div class="live-h2h-score"><strong>${h.actual}</strong><span>${hSub}</span></div></div><div class="live-h2h-centre"><span class="vs-dot">VS</span><small>${centre}</small></div><div class="live-h2h-team away">${teamIdentity(f.away,'sm')}<div class="live-h2h-score"><strong>${a.actual}</strong><span>${aSub}</span></div></div></button>`;
+    }).join('');
+    const ladderRows=ladder.map(r=>`<button class="live-ladder-row ${r.position<=4?'top-four':''}" data-route="team/${r.team}"><b class="live-ladder-pos">${r.position}</b>${teamIdentity(r.team,'sm')}<span class="live-ladder-record">${r.wins}-${r.losses}${r.draws?`-${r.draws}`:''}</span><strong>${r.points}</strong><span class="live-ladder-pct">${Number(r.percentage||0).toFixed(1)}%</span></button>`).join('');
+    main.innerHTML=`<section class="live-home"><header class="live-round-head"><div><span class="eyebrow">${currentSeason()} PEGS</span><h1>ROUND ${round}</h1>${roundLabel(round)!==`Round ${round}`?`<p>${esc(roundLabel(round))}</p>`:''}</div><span class="badge ${badge.tone}">${badge.label}</span></header><div class="live-home-grid"><section class="card live-h2h-board"><div class="section-title"><div><span class="eyebrow">Live</span><h2>Head-to-head board</h2></div><span class="live-count-note">${topPlayersForRound(round)} scores count</span></div><div class="live-h2h-list">${fixtureCards||'<div class="empty">No PEGS matchups are configured for this round.</div>'}</div></section><aside class="card live-ladder"><div class="section-title"><div><span class="eyebrow">${ladderProjected?'Projected':'Live'}</span><h2>Live ladder</h2></div><button class="link-button" data-route="ladder">Full ladder</button></div><div class="live-ladder-head"><span>#</span><span>Team</span><span>W-L</span><span>Pts</span><span>%</span></div><div class="live-ladder-list">${ladderRows}</div>${Number(round)>regular?'<p class="live-ladder-note">Regular-season ladder locked for finals.</p>':ladderProjected?'<p class="live-ladder-note">Includes this round using current live projections.</p>':''}</aside></div></section>`;
   }
 
   function renderHome() {
@@ -724,9 +797,12 @@
   }
 
   function availabilityBadge(p){
-    const st=String(p.availability||'TBC').toUpperCase();
-    const map={SELECTED:['green','PLAYING'],PLAYINGNEXTROUND:['green','PLAYING'],LIVE:['red','LIVE'],FT:['neutral','FT'],OUT:['red','OUT'],NOT_SELECTED:['red','OUT'],NOTPLAYINGNEXTROUND:['red','OUT'],EMERGENCY:['amber','EMG'],INJURED:['red','OUT'],BYE:['neutral','BYE'],BANKED:['blue','OR BANK'],OVERRIDE:['blue','OVERRIDE'],TBC:['neutral','TBC']};
-    const [tone,label]=map[p.gameStatus==='LIVE'?'LIVE':p.gameStatus==='FT'&&st!=='BANKED'&&st!=='OVERRIDE'?'FT':st]||['neutral',st];
+    const st=normalizeAvailabilityStatus(p.availability||'TBC');
+    const map={SELECTED:['green','PLAYING'],LIVE:['red','LIVE'],FT:['neutral','FT'],OUT:['red','OUT'],EMERGENCY:['amber','EMG'],INJURED:['red','OUT'],BYE:['neutral','BYE'],BANKED:['blue','OR BANK'],OVERRIDE:['blue','OVERRIDE'],TBC:['neutral','TBC']};
+    const unavailable=unavailableForProjection(st);
+    const positiveLive=String(p.gameStatus||'').toUpperCase()==='LIVE'&&Number(p.score||0)>0;
+    const displayKey=positiveLive?'LIVE':unavailable?st:String(p.gameStatus||'').toUpperCase()==='LIVE'?'LIVE':String(p.gameStatus||'').toUpperCase()==='FT'&&st!=='BANKED'&&st!=='OVERRIDE'?'FT':st;
+    const [tone,label]=map[displayKey]||['neutral',displayKey];
     return `<span class="badge ${tone} availability-badge">${label}</span>`;
   }
   function lineupColumn(round, teamKey, calc) {
@@ -844,11 +920,15 @@
   }
 
   function effectiveLadder(){
-    const setup=activeSeasonSetup(); if(!setup||currentSeason()===Number(D.meta.season)&&Object.keys(getSeasonResults()?.[String(currentSeason())]||{}).length===0)return D.ladder;
+    const setup=activeSeasonSetup(),results=getSeasonResults()?.[String(currentSeason())]||{};
+    if(!setup)return D.ladder;
+    const regular=Number(setup.pegsRegularRounds||20),regularFixtures=(setup.pegsFixtures||[]).filter(f=>Number(f.round)<=regular&&f.away),hasRegularResults=Object.keys(results).some(r=>Number(r)<=regular);
+    // When the live 2026 setup was activated after the regular season, preserve
+    // the workbook ladder until real regular-season rounds exist in shared state.
+    if(currentSeason()===Number(D.meta.season)&&!hasRegularResults)return D.ladder;
     const rows=Object.fromEntries(D.teams.map(t=>[t.key,{position:0,team:t.key,played:0,wins:0,losses:0,draws:0,pf:0,pa:0,points:0,percentage:0}]));
-    const results=getSeasonResults()?.[String(currentSeason())]||{};
-    for(const f of effectiveFixtures()){
-      const rr=results[String(f.round)]; if(!rr||!f.away)continue; const hs=Number(rr.teamScores?.[f.home]||0),as=Number(rr.teamScores?.[f.away]||0); if(!hs&&!as)continue;
+    for(const f of regularFixtures){
+      const rr=results[String(f.round)]; if(!rr)continue; const hs=Number(rr.teamScores?.[f.home]||0),as=Number(rr.teamScores?.[f.away]||0); if(!hs&&!as)continue;
       const h=rows[f.home],a=rows[f.away]; if(!h||!a)continue; h.played++;a.played++;h.pf+=hs;h.pa+=as;a.pf+=as;a.pa+=hs;
       if(hs>as){h.wins++;a.losses++;h.points+=4;} else if(as>hs){a.wins++;h.losses++;a.points+=4;} else {h.draws++;a.draws++;h.points+=2;a.points+=2;}
     }
@@ -1365,7 +1445,14 @@
         for(const club of clubs){
           try{
             const x=await fetchSlice({mode:'team',team:club});
-            for(const [key,p] of Object.entries(x.players||{}))players[key]={...p,...(players[key]||{})};
+            for(const [key,p] of Object.entries(x.players||{})){
+              const matchRec=players[key]||{};
+              // Team pages are authoritative for selection availability and
+              // projections. Match pages are authoritative for actual score and
+              // match state. Do not let a generic match-page SELECTED flag overwrite
+              // OUT / emergency / injury markers from the team list.
+              players[key]=mergeProviderTeamRecord(matchRec,p);
+            }
           }catch(e){console.warn(e);warnings.push(`${club} selection/projection feed unavailable`);}
         }
       }
@@ -1394,7 +1481,7 @@
   }
   function seasonRoundPreview(setup){
     const rounds=setup.rounds||[]; if(!rounds.length)return '<div class="notice"><strong>No AFL fixture loaded yet.</strong> Retrieve it by season, or paste/upload a fixture manually as a fallback.</div>';
-    const byeRounds=rounds.filter(r=>(r.byeClubs||[]).length),rows=rounds.slice(0,Math.max(1,Math.min(30,rounds.length))).map(r=>`<tr><td>${r.round}</td><td><strong>${r.aflTeamsPlaying}</strong></td><td>${(r.byeClubs||[]).join(', ')||'—'}</td><td>${(r.bankClubs||[]).join(', ')||'—'}</td></tr>`).join('');
+    const byeRounds=rounds.filter(r=>(r.byeClubs||[]).length),rows=rounds.slice(0,Math.max(1,Math.min(30,rounds.length))).map(r=>`<tr><td>${r.round}</td><td><strong>${scoreCountForRoundRecord(r)}</strong></td><td>${(r.byeClubs||[]).join(', ')||'—'}</td><td>${(r.bankClubs||[]).join(', ')||'—'}</td></tr>`).join('');
     const source=setup.fixtureSource?`<div class="fixture-source">Fixture source: <strong>${esc(setup.fixtureSource)}</strong>${setup.fixtureRetrievedAt?` · retrieved ${fmtDate(setup.fixtureRetrievedAt)}`:''}</div>`:'';
     return `${source}<div class="stat-strip" style="grid-template-columns:repeat(3,1fr);margin-bottom:12px"><div class="stat-box"><span>Opening Round</span><strong>${setup.openingRound?.enabled?'YES':'NO'}</strong></div><div class="stat-box"><span>Bye rounds</span><strong>${byeRounds.length}</strong></div><div class="stat-box"><span>AFL rounds loaded</span><strong>${rounds.length}</strong></div></div><div class="table-wrap setup-round-table"><table class="data-table"><thead><tr><th>Round</th><th>PEGS scores count</th><th>AFL byes</th><th>OR banked clubs</th></tr></thead><tbody>${rows}</tbody></table></div>`;
   }
@@ -1612,7 +1699,7 @@
   window.addEventListener('storage',e=>{if([OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,DRAFT_STATE_KEY,PROPOSALS_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY].includes(e.key)){if(e.key===PROPOSALS_KEY)proposalCache=getLocalProposals();render();}});
 
   // Lightweight non-UI test surface used by the bundled QA script.
-  window.__PEGS_TEST__={render,parseAflFixtureCsv,generatePegsFixture,validatePegsFixture,saveSeasonSetup,getSeasonSetup,saveLiveFeed,getLiveFeed,getSelectionOverrides,saveSelectionOverrides,saveOpeningBank,getOpeningBank,calcTeamRound,effectiveRoundRecord,effectiveLadder,preSeasonDraftOrder,draftPickLedger,teamRoundPlayers,availabilityInfo,currentSeason,effectiveCurrentRound,getProposalWindows,saveProposalWindows,proposalWindowOpen,getScoringSnapshots,saveScoringSnapshots,captureScoringSnapshot,scoringSnapshotForRound,scoringRostersForRound,nextUnfinalizedScoringRound,effectiveRosters,submitProposal,approveProposal,getDraftState,saveDraftState,draftOrder,currentDraftTeam,nextDraftTeam,draftSecondsRemaining,draftIsOvertime,pushDraftPickBackLocal,advanceDraftLocal,getFigureheadOverrides,saveFigureheadOverrides,figureheadPlayer,figureheadAverage,playerPhotoUrl,finalsConfig,calculatedFinalsBracket,effectiveFinals,roundLabel,finalizeRound};
+  window.__PEGS_TEST__={render,parseAflFixtureCsv,generatePegsFixture,validatePegsFixture,saveSeasonSetup,getSeasonSetup,saveLiveFeed,getLiveFeed,getSelectionOverrides,saveSelectionOverrides,saveOpeningBank,getOpeningBank,calcTeamRound,effectiveRoundRecord,scoreCountForRoundRecord,topPlayersForRound,effectiveLadder,projectedLadderForRound,liveRoundBadge,liveFeedCompleteForRound,normalizeAvailabilityStatus,unavailableForProjection,mergeProviderTeamRecord,preSeasonDraftOrder,draftPickLedger,teamRoundPlayers,availabilityInfo,currentSeason,effectiveCurrentRound,getProposalWindows,saveProposalWindows,proposalWindowOpen,getScoringSnapshots,saveScoringSnapshots,captureScoringSnapshot,scoringSnapshotForRound,scoringRostersForRound,nextUnfinalizedScoringRound,effectiveRosters,submitProposal,approveProposal,getDraftState,saveDraftState,draftOrder,currentDraftTeam,nextDraftTeam,draftSecondsRemaining,draftIsOvertime,pushDraftPickBackLocal,advanceDraftLocal,getFigureheadOverrides,saveFigureheadOverrides,figureheadPlayer,figureheadAverage,playerPhotoUrl,finalsConfig,calculatedFinalsBracket,effectiveFinals,roundLabel,finalizeRound};
 
   if('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('./sw.js').catch(()=>{});
   proposalCache=getLocalProposals();

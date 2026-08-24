@@ -7,6 +7,8 @@
   const toastEl = document.getElementById('toast');
   const commissionerDialog = document.getElementById('commissioner-dialog');
   const commissionerContent = document.getElementById('commissioner-content');
+  const teamDialog = document.getElementById('team-dialog');
+  const teamLoginContent = document.getElementById('team-login-content');
   const teamMap = Object.fromEntries(D.teams.map(t => [t.key, t]));
   const ownerToKey = Object.fromEntries(D.teams.map(t => [t.owner.toUpperCase(), t.key]));
   const OVERRIDE_KEY = 'pegs-score-overrides-v6';
@@ -18,6 +20,9 @@
   const DRAFT_STATE_KEY = 'pegs-draft-state-v6';
   const PROPOSALS_KEY = 'pegs-proposals-v6';
   const BACKEND_TOKEN_KEY = 'pegs-supabase-token-v6';
+  const BACKEND_REFRESH_KEY = 'pegs-supabase-refresh-v14';
+  const IDENTITY_KEY = 'pegs-identity-v14';
+  const DRAFT_POOL_KEY = 'pegs-draft-pool-v14';
   const SEASON_SETUP_KEY = 'pegs-season-setup-v6';
   const SEASON_RESULTS_KEY = 'pegs-season-results-v6';
   const LIVE_FEED_KEY = 'pegs-live-feed-v6';
@@ -60,6 +65,12 @@
   let commissionerTab = 'scores';
   let proposalCache = [];
   let draftTicker = null;
+  let currentIdentity = (()=>{try{return JSON.parse(sessionStorage.getItem(IDENTITY_KEY)||'{"role":"public"}');}catch(_){return {role:'public'};}})();
+  let draftPoolCache = null;
+  let backupCache = [];
+  let auditCache = [];
+  let teamAccountsCache = [];
+  let teamCredentialCache = [];
 
   const DRAFT_ROUNDS = { 'Pre-Season': 5, 'Mid-Season': 10 };
 
@@ -420,7 +431,9 @@
       payload: row.payload || {},
       status: row.status || 'PENDING',
       commissionerNote: row.commissioner_note || row.commissionerNote || '',
-      decidedAt: row.decided_at || row.decidedAt || null
+      decidedAt: row.decided_at || row.decidedAt || null,
+      counterpartyDecidedAt: row.counterparty_decided_at || row.counterpartyDecidedAt || null,
+      counterpartyUserId: row.counterparty_user_id || row.counterpartyUserId || null
     };
   }
   async function syncProposals() {
@@ -432,44 +445,68 @@
     return proposalCache;
   }
   async function submitProposal(proposal) {
-    const row = normalizeProposal({...proposal, createdAt:new Date().toISOString(), status:'PENDING'});
+    const row = normalizeProposal({...proposal, createdAt:new Date().toISOString()});
     if(row.type==='TRADE'&&!proposalWindowOpen('TRADE',row.phase))throw new Error('The Commissioner has closed trading submissions.');
     if(row.type==='DELIST'&&!proposalWindowOpen('DELIST',row.phase))throw new Error('The Commissioner has closed delisting submissions.');
     if(row.type==='DRAFT_PICK'&&!proposalWindowOpen('DRAFT_PICK',row.phase))throw new Error('The draft is not currently open.');
     if (!backendConfigured()) {
+      row.status=row.type==='TRADE'?'AWAITING_COUNTERPARTY':'AWAITING_COMMISSIONER';
       row.id = 'local-' + Date.now() + '-' + Math.random().toString(36).slice(2,8);
       const all = [row, ...getLocalProposals()]; saveLocalProposals(all); return row;
     }
-    const body = {type:row.type, phase:row.phase, proposer_team:row.proposerTeam, counterparty_team:row.counterpartyTeam || null, payload:row.payload, status:'PENDING'};
-    const created = await backendFetch('/rest/v1/pegs_proposals',{method:'POST',headers:{Prefer:'return=representation'},body:JSON.stringify(body)});
-    const out = normalizeProposal(created?.[0]); await syncProposals(); return out;
+    if(!teamLoggedIn())throw new Error('Team login required.');
+    const out=await backendFetch('/rest/v1/rpc/pegs_submit_team_proposal',{method:'POST',body:JSON.stringify({p_type:row.type,p_phase:row.phase||'',p_counterparty_team:row.counterpartyTeam||null,p_payload:row.payload||{}})});
+    await syncProposals(); updateSessionUI(); return normalizeProposal(out);
   }
+
   async function decideProposal(id,status,note='') {
     if (!backendConfigured()) {
       const all=getLocalProposals().map(p=>String(p.id)===String(id)?{...p,status,commissionerNote:note,decidedAt:new Date().toISOString()}:p);
       saveLocalProposals(all); return;
     }
+    if(!commissionerLoggedIn())throw new Error('Commissioner login required.');
     await backendFetch('/rest/v1/pegs_proposals?id=eq.'+encodeURIComponent(id),{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify({status,commissioner_note:note,decided_at:new Date().toISOString()})});
     await syncProposals();
   }
+  async function respondTrade(id,accept){
+    if(!teamLoggedIn())throw new Error('Team login required.');
+    const out=await backendFetch('/rest/v1/rpc/pegs_respond_trade',{method:'POST',body:JSON.stringify({p_proposal_id:Number(id),p_accept:Boolean(accept)})});
+    await syncProposals();updateSessionUI();return normalizeProposal(out);
+  }
+
 
   function backendConfigured() { return Boolean(CONFIG.supabaseUrl && CONFIG.supabaseAnonKey); }
   function backendToken() { return sessionStorage.getItem(BACKEND_TOKEN_KEY) || ''; }
-  async function backendFetch(path, options={}) {
+  function backendRefreshToken(){return sessionStorage.getItem(BACKEND_REFRESH_KEY)||'';}
+  function identity(){return currentIdentity&&typeof currentIdentity==='object'?currentIdentity:{role:'public'};}
+  function setIdentity(value){currentIdentity=value||{role:'public'};sessionStorage.setItem(IDENTITY_KEY,JSON.stringify(currentIdentity));updateSessionUI();}
+  function clearBackendSession(){sessionStorage.removeItem(BACKEND_TOKEN_KEY);sessionStorage.removeItem(BACKEND_REFRESH_KEY);sessionStorage.removeItem(IDENTITY_KEY);sessionStorage.removeItem(COMM_SESSION_KEY);currentIdentity={role:'public'};updateSessionUI();}
+  async function refreshBackendToken(){
+    const refresh=backendRefreshToken();if(!refresh)return false;
+    const res=await fetch(CONFIG.supabaseUrl.replace(/\/$/,'')+'/auth/v1/token?grant_type=refresh_token',{method:'POST',headers:{apikey:CONFIG.supabaseAnonKey,'Content-Type':'application/json'},body:JSON.stringify({refresh_token:refresh})});
+    if(!res.ok){clearBackendSession();return false;}const data=await res.json();sessionStorage.setItem(BACKEND_TOKEN_KEY,data.access_token||'');if(data.refresh_token)sessionStorage.setItem(BACKEND_REFRESH_KEY,data.refresh_token);return true;
+  }
+  async function backendFetch(path, options={}, retry=true) {
     const token=backendToken();
     const headers={apikey:CONFIG.supabaseAnonKey,'Content-Type':'application/json',...(options.headers||{})};
     headers.Authorization='Bearer '+(token||CONFIG.supabaseAnonKey);
     const res=await fetch(CONFIG.supabaseUrl.replace(/\/$/,'')+path,{...options,headers});
+    if(res.status===401&&retry&&backendRefreshToken()&&await refreshBackendToken())return backendFetch(path,options,false);
     if(!res.ok) throw new Error((await res.text()) || ('HTTP '+res.status));
     return res.status===204 ? null : res.json();
   }
-  async function backendLogin(email,password) {
+  async function refreshIdentity(){
+    if(!backendConfigured()||!backendToken()){setIdentity({role:'public'});return currentIdentity;}
+    try{const who=await backendFetch('/rest/v1/rpc/pegs_whoami',{method:'POST',body:'{}'});setIdentity(who||{role:'unknown'});return currentIdentity;}catch(e){clearBackendSession();return currentIdentity;}
+  }
+  async function backendLogin(email,password,expectedRole='') {
     const res=await fetch(CONFIG.supabaseUrl.replace(/\/$/,'')+'/auth/v1/token?grant_type=password',{method:'POST',headers:{apikey:CONFIG.supabaseAnonKey,'Content-Type':'application/json'},body:JSON.stringify({email,password})});
-    if(!res.ok) throw new Error('Commissioner login failed.');
-    const data=await res.json(); sessionStorage.setItem(BACKEND_TOKEN_KEY,data.access_token); return data;
+    if(!res.ok) throw new Error('Login failed. Check the username/password and try again.');
+    const data=await res.json();sessionStorage.setItem(BACKEND_TOKEN_KEY,data.access_token||'');sessionStorage.setItem(BACKEND_REFRESH_KEY,data.refresh_token||'');
+    const who=await refreshIdentity();if(expectedRole&&who.role!==expectedRole){clearBackendSession();throw new Error(expectedRole==='commissioner'?'This account is not the Commissioner account.':'This is not an active team account.');}return data;
   }
   async function pushSharedState(key,value) {
-    if(!backendConfigured() || !backendToken()) return;
+    if(!backendConfigured() || !commissionerLoggedIn()) return;
     try { await backendFetch('/rest/v1/pegs_state?on_conflict=key',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({key,value,updated_at:new Date().toISOString()})}); } catch(e){ console.warn('Shared PEGS state update failed',e); }
   }
   async function pullSharedState() {
@@ -491,21 +528,146 @@
       }
     } catch(e){ console.warn('Shared PEGS state unavailable',e); }
   }
+  function commissionerLoggedIn() { return backendConfigured() ? identity().role==='commissioner' : sessionStorage.getItem(COMM_SESSION_KEY)==='1'; }
+  function teamLoggedIn(){return backendConfigured()&&identity().role==='team'&&Boolean(identity().teamKey);}
+  function loggedTeamKey(){return teamLoggedIn()?String(identity().teamKey||'').toUpperCase():'';}
+  function teamAuthEmail(teamKey){const t=team(teamKey);return `${String(t.owner||teamKey).toLowerCase().replace(/[^a-z0-9]+/g,'')}@pegs.local`;}
+  function incomingTradeRequests(){const k=loggedTeamKey();return k?proposalCache.filter(p=>p.type==='TRADE'&&p.status==='AWAITING_COUNTERPARTY'&&p.counterpartyTeam===k):[];}
+  function updateSessionUI(){
+    const label=document.getElementById('team-login-label'),dot=document.getElementById('team-notification-dot');
+    if(label)label.textContent=teamLoggedIn()?team(loggedTeamKey()).owner:'Team Login';
+    if(dot){const n=incomingTradeRequests().length;dot.hidden=!n;dot.textContent=n?String(n):'';}
+  }
+  function teamNotificationBanner(){
+    if(!teamLoggedIn())return '';const n=incomingTradeRequests().length;if(!n)return '';
+    return `<button class="home-trade-notification" data-route="transactions"><span class="notification-pulse">${n}</span><span><strong>${n} trade request${n===1?'':'s'} awaiting your decision</strong><small>Review the trade impact, accept or decline.</small></span><span class="notification-open">Review →</span></button>`;
+  }
   async function hashPin(pin) {
     if(globalThis.crypto?.subtle){const bytes=new TextEncoder().encode(pin);const digest=await crypto.subtle.digest('SHA-256',bytes);return [...new Uint8Array(digest)].map(b=>b.toString(16).padStart(2,'0')).join('');}
     let h=0; for(const c of pin) h=((h<<5)-h)+c.charCodeAt(0)|0; return String(h);
   }
-  function commissionerLoggedIn() { return backendConfigured() ? Boolean(backendToken()) : sessionStorage.getItem(COMM_SESSION_KEY)==='1'; }
+
+  async function teamLoginUI(){
+    if(!backendConfigured()){
+      teamLoginContent.innerHTML='<div class="commissioner-body commissioner-login"><div class="notice danger"><strong>Team accounts require the shared Supabase backend.</strong></div></div>';
+      return;
+    }
+    if(teamLoggedIn()){
+      const k=loggedTeamKey(),incoming=incomingTradeRequests();
+      teamLoginContent.innerHTML=`<div class="commissioner-body commissioner-login"><div class="team-login-avatar">${figurehead(k,'md')}</div><span class="eyebrow">Signed in</span><h3>${esc(team(k).owner)} · ${esc(team(k).name)}</h3><p>This login can only submit actions for this franchise.</p>${incoming.length?`<div class="notice trade-notification"><strong>${incoming.length} trade request${incoming.length===1?'':'s'} waiting.</strong> Review ${incoming.length===1?'it':'them'} in Moves.</div>`:''}<div class="button-row"><button class="primary-button" id="team-go-moves">Open Moves</button><button class="secondary-button" id="team-logout">Log out</button></div></div>`;
+      document.getElementById('team-go-moves')?.addEventListener('click',()=>{teamDialog.close();routeTo('transactions');});
+      document.getElementById('team-logout')?.addEventListener('click',()=>{teamCredentialCache=[];clearBackendSession();proposalCache=[];teamDialog.close();void syncProposals().then(()=>render());toast('Team logged out.');});
+      return;
+    }
+    const options=D.teams.map(t=>`<option value="${t.key}">${esc(t.owner)} · ${esc(t.name)}</option>`).join('');
+    teamLoginContent.innerHTML=`<div class="commissioner-body commissioner-login"><div class="team-login-avatar"><span class="commissioner-lock">T</span></div><span class="eyebrow">Franchise access</span><h3>Team Login</h3><p>Choose your coach username and enter the six-letter password supplied by the Commissioner.</p><div class="form-grid" style="margin-top:16px"><div class="field-group"><label for="team-login-team">Coach username</label><select class="select" id="team-login-team">${options}</select></div><div class="field-group"><label for="team-login-password">Password</label><input class="search-input team-password-input" id="team-login-password" type="password" maxlength="6" autocomplete="current-password" placeholder="ABCDEF"></div></div><div class="button-row"><button class="primary-button" id="team-login-submit">Login to my team</button></div><div class="notice" style="margin-top:16px"><strong>Permissions:</strong> your login is tied to one franchise. PEGS will not accept a draft pick, swap, delisting or trade proposal for another team.</div></div>`;
+    const login=async()=>{const k=document.getElementById('team-login-team').value,pw=String(document.getElementById('team-login-password').value||'').trim().toUpperCase();if(pw.length!==6){toast('Enter the six-letter team password.');return;}try{await backendLogin(teamAuthEmail(k),pw,'team');await pullSharedState();await syncProposals();await loadDraftPool();updateSessionUI();teamDialog.close();toast(`${team(k).owner} logged in.`);render();}catch(e){toast(e.message||'Team login failed.');}};
+    document.getElementById('team-login-submit')?.addEventListener('click',login);
+    document.getElementById('team-login-password')?.addEventListener('keydown',e=>{if(e.key==='Enter')void login();});
+  }
+
+  function tradeActionFor(teamA,teamB,assetsA,assetsB){
+    const moves=[];(assetsA?.players||[]).forEach(player=>moves.push({player,from:teamA,to:teamB}));(assetsB?.players||[]).forEach(player=>moves.push({player,from:teamB,to:teamA}));
+    return {type:'Trade',status:'CONFIRMED',teamA,teamB,moves};
+  }
+  function tradeImpactTeamHtml(teamKey,beforeRows,afterRows){
+    const b=rosterSummary(beforeRows||[]),a=rosterSummary(afterRows||[]),legal=rosterIsLegal(afterRows||[]);
+    const item=(label,before,after,cap,kind='money')=>{const roomBefore=Number(cap)-Number(before),roomAfter=Number(cap)-Number(after),fmt=kind==='money'?money:(n=>String(n));return `<div class="trade-impact-row"><span>${esc(label)}</span><span>${fmt(before)} <small>(${kind==='money'?money(roomBefore)+' room':roomBefore+' room'})</small></span><span class="trade-impact-arrow">→</span><strong class="${roomAfter<0?'impact-bad':'impact-good'}">${fmt(after)} <small>(${kind==='money'?money(roomAfter)+' room':roomAfter+' room'})</small></strong></div>`;};
+    return `<article class="trade-impact-card ${legal?'legal':'blocked'}"><div class="section-title"><div>${teamIdentity(teamKey,'sm')}<span class="eyebrow">After proposed trade</span></div><span class="badge ${legal?'green':'red'}">${legal?'CAN ACCOMMODATE':'BLOCKED'}</span></div><div class="trade-impact-head"><span>Rule</span><span>Before</span><span></span><span>After</span></div>${item('Main salary',b.caps.main,a.caps.main,D.rules.mainContractCap)}${item('Field salary',b.caps.field,a.caps.field,D.rules.fieldCap)}${item('Rookie salary',b.caps.rookie,a.caps.rookie,D.rules.rookieContractCap)}${item('Main contracts',b.counts.main||0,a.counts.main||0,28,'count')}${item('Field players',b.counts.field,a.counts.field,D.rules.maxFieldPlayers,'count')}<div class="trade-position-impact">${Object.entries(D.rules.positionMax).map(([pos,max])=>`<span class="${Number(a.counts[pos]||0)>Number(max)?'impact-bad':''}">${pos} <b>${b.counts[pos]||0} → ${a.counts[pos]||0}</b> / ${max}</span>`).join('')}</div></article>`;
+  }
+  function tradeImpactHtml(teamA,teamB,assetsA,assetsB){
+    if(!teamA||!teamB)return '<div class="notice">Choose both franchises to see the trade impact.</div>';
+    const before=effectiveRosters(),after=effectiveRosters(tradeActionFor(teamA,teamB,assetsA,assetsB));
+    return `<div class="trade-impact-grid">${tradeImpactTeamHtml(teamA,before[teamA]||[],after[teamA]||[])}${tradeImpactTeamHtml(teamB,before[teamB]||[],after[teamB]||[])}</div>`;
+  }
+
+  function activeProposalStatus(status){return ['PENDING','AWAITING_COUNTERPARTY','AWAITING_COMMISSIONER'].includes(String(status||'').toUpperCase());}
+  function draftPoolRecord(){
+    if(draftPoolCache)return draftPoolCache;
+    try{return JSON.parse(localStorage.getItem(DRAFT_POOL_KEY)||'null');}catch(_){return null;}
+  }
+  async function loadDraftPool(sessionId=''){
+    if(!backendConfigured())return draftPoolRecord();
+    try{
+      const state=getDraftState(),wanted=sessionId||state.poolSessionId||'';
+      let path='/rest/v1/pegs_draft_pools?select=*&order=captured_at.desc&limit=1';
+      if(wanted)path='/rest/v1/pegs_draft_pools?select=*&session_id=eq.'+encodeURIComponent(wanted)+'&limit=1';
+      const rows=await backendFetch(path);draftPoolCache=rows?.[0]||null;if(draftPoolCache)localStorage.setItem(DRAFT_POOL_KEY,JSON.stringify(draftPoolCache));return draftPoolCache;
+    }catch(e){console.warn('Draft pool unavailable',e);return draftPoolRecord();}
+  }
+  function frozenDraftPlayers(){
+    const state=getDraftState(),pool=draftPoolRecord();
+    if(state.active)return pool&&pool.complete&&(!state.poolSessionId||pool.session_id===state.poolSessionId)?(pool.players||[]):[];
+    return pool?.complete?(pool.players||[]):D.playerPool;
+  }
+  function draftPlayerByName(name){return frozenDraftPlayers().find(p=>canonicalPlayerName(p.player)===canonicalPlayerName(name))||null;}
+  async function refreshCurrentDraftPool(type,onProgress=()=>{}){
+    if(!commissionerLoggedIn())throw new Error('Commissioner login required.');
+    const fn=CONFIG.liveScoreFunction||'supercoach-sync',base=CONFIG.supabaseUrl.replace(/\/$/,'')+`/functions/v1/${fn}`,headers={apikey:CONFIG.supabaseAnonKey,Authorization:'Bearer '+backendToken()};
+    const all=[],clubResults=[];
+    for(let i=0;i<AFL_TEAMS.length;i++){
+      const [code]=AFL_TEAMS[i];onProgress(i,code);
+      const r=await fetch(`${base}?mode=pool&team=${encodeURIComponent(code)}`,{headers});if(!r.ok)throw new Error(`${code} player pool failed: ${await r.text()}`);const x=await r.json();const rows=Array.isArray(x.players)?x.players:[];clubResults.push({club:code,count:rows.length});all.push(...rows);
+    }
+    const rostered=new Set(Object.values(effectiveRosters()).flat().map(p=>canonicalPlayerName(p.player))),seen=new Set(),players=[];
+    for(const p of all){const key=canonicalPlayerName(p.player);if(!key||seen.has(key)||rostered.has(key)||!Number(p.price||0)||!p.position)continue;seen.add(key);players.push({player:p.player,club:p.club,position:String(p.position).toUpperCase(),price:Number(p.price),startPrice:Number(p.price),average:Number(p.average||0),source:'Supercoach.live'});}
+    players.sort((a,b)=>a.player.localeCompare(b.player));
+    const phase=normalizedDraftType(type),season=draftSeasonFor(phase),sessionId=`pool-${season}-${phase.toLowerCase().replace(/[^a-z]+/g,'-')}-${Date.now()}`,complete=clubResults.length===18&&clubResults.every(x=>x.count>=35);
+    const rec={session_id:sessionId,season,phase,captured_at:new Date().toISOString(),source:'Supercoach.live current-price snapshot',complete,club_count:clubResults.length,player_count:players.length,players};
+    const created=await backendFetch('/rest/v1/pegs_draft_pools',{method:'POST',headers:{Prefer:'return=representation'},body:JSON.stringify(rec)});draftPoolCache=created?.[0]||rec;localStorage.setItem(DRAFT_POOL_KEY,JSON.stringify(draftPoolCache));onProgress(18,'DONE');return draftPoolCache;
+  }
+  function draftPoolStatusHtml(type){
+    const p=draftPoolRecord(),phase=normalizedDraftType(type),season=draftSeasonFor(phase),match=p&&p.complete&&Number(p.season)===season&&normalizedDraftType(p.phase)===phase;
+    if(!match)return `<div class="notice danger"><strong>No complete ${esc(phase)} draft pool.</strong> Refresh all 18 AFL clubs immediately before starting the draft. PEGS will freeze current prices and remove every player already on a PEGS list.</div>`;
+    return `<div class="notice"><strong>Frozen draft pool ready:</strong> ${p.player_count||p.players?.length||0} unrostered AFL players · 18/18 clubs · captured ${fmtDate(p.captured_at)}. Prices will not change once the draft starts.</div>`;
+  }
+
+  async function syncServerAuthority(){
+    if(!backendConfigured()||!commissionerLoggedIn())return;
+    const rosters=effectiveRosters(),picks=[...draftPickLedger('Pre-Season'),...draftPickLedger('Mid-Season')];
+    await backendFetch('/rest/v1/rpc/pegs_sync_roster_authority',{method:'POST',body:JSON.stringify({p_rosters:rosters})});
+    await backendFetch('/rest/v1/rpc/pegs_sync_pick_authority',{method:'POST',body:JSON.stringify({p_picks:picks})});
+  }
+  async function logCommissioner(action,entityType='',entityId='',detail={}){if(!commissionerLoggedIn())return;try{await backendFetch('/rest/v1/rpc/pegs_log_commissioner_action',{method:'POST',body:JSON.stringify({p_action:action,p_entity_type:entityType,p_entity_id:String(entityId||''),p_detail:detail||{}})});}catch(e){console.warn('Audit log write failed',e);}}
+
+  async function teamAccountAdmin(action,teamKey=''){
+    if(!commissionerLoggedIn())throw new Error('Commissioner login required.');
+    const fn=CONFIG.teamAccountFunction||'team-account-admin',r=await fetch(CONFIG.supabaseUrl.replace(/\/$/,'')+`/functions/v1/${fn}`,{method:'POST',headers:{apikey:CONFIG.supabaseAnonKey,Authorization:'Bearer '+backendToken(),'Content-Type':'application/json'},body:JSON.stringify({action,teamKey})});
+    if(!r.ok)throw new Error((await r.text())||'Team account operation failed');return await r.json();
+  }
+  async function loadTeamAccounts(){try{const x=await teamAccountAdmin('list');teamAccountsCache=x.accounts||[];}catch(e){console.warn(e);teamAccountsCache=[];}return teamAccountsCache;}
+  function credentialsTable(credentials){if(!credentials?.length)return '<div class="notice">No new passwords were generated.</div>';return `<div class="credential-sheet" id="credential-sheet"><div class="credential-head"><span>Coach</span><span>Username</span><span>6-letter password</span></div>${credentials.map(c=>`<div><strong>${esc(c.coachName)}</strong><span>${esc(c.username)}</span><code>${esc(c.password)}</code></div>`).join('')}</div><div class="notice danger"><strong>Copy these now.</strong> Passwords are not stored in PEGS and cannot be displayed again; you can reset a team later.</div>`;}
+
+  function backupDerivedData(){
+    return {meta:{league:D.meta.league,season:currentSeason(),round:effectiveCurrentRound(),createdAt:new Date().toISOString()},rules:D.rules,teams:D.teams,rosters:effectiveRosters(),ladder:effectiveLadder(),fixtures:effectiveFixtures(),finals:effectiveFinals(),transactions:[...getCommissionerActions().filter(x=>x.status==='CONFIRMED'),...D.transactions],draftHistory:[...D.draft,...getCommissionerActions().filter(x=>x.type==='Drafted'&&x.status==='CONFIRMED')],pickOwnership:{preSeason:draftPickLedger('Pre-Season'),midSeason:draftPickLedger('Mid-Season')},honours:D.honours};
+  }
+  async function syncBackups(){if(!commissionerLoggedIn())return [];try{backupCache=await backendFetch('/rest/v1/pegs_backups?select=id,created_at,season,round,label,reason&order=created_at.desc&limit=100')||[];}catch(e){console.warn(e);backupCache=[];}return backupCache;}
+  async function createServerBackup(reason='MANUAL',label=''){const id=await backendFetch('/rest/v1/rpc/pegs_create_backup',{method:'POST',body:JSON.stringify({p_label:label,p_reason:reason,p_derived:backupDerivedData()})});await syncBackups();return id;}
+  async function getBackupSnapshot(id){const rows=await backendFetch('/rest/v1/pegs_backups?select=*&id=eq.'+encodeURIComponent(id)+'&limit=1');if(!rows?.[0])throw new Error('Backup not found.');return rows[0];}
+  function downloadBlob(name,blob){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),500);}
+  async function exportBackupJson(id){const rec=await getBackupSnapshot(id);downloadBlob(`PEGS-Backup-${rec.season||currentSeason()}-R${rec.round||0}-${id}.json`,new Blob([JSON.stringify(rec.snapshot,null,2)],{type:'application/json'}));}
+  async function ensureSheetJs(){if(globalThis.XLSX)return globalThis.XLSX;await new Promise((resolve,reject)=>{const sc=document.createElement('script');sc.src='https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';sc.onload=resolve;sc.onerror=()=>reject(new Error('Excel library could not be loaded.'));document.head.appendChild(sc);});return globalThis.XLSX;}
+  function backupSheetRows(snapshot){
+    const d=snapshot?.derived||{},state=snapshot?.state||{},results=state.season_results||{},season=String(d.meta?.season||state.season_setup?.season||currentSeason()),seasonResults=results?.[season]||{};
+    const teamLists=[];for(const [k,rows] of Object.entries(d.rosters||{}))for(const p of rows||[])teamLists.push({Team:team(k).name,Coach:team(k).owner,Player:p.player,AFLClub:p.club,Position:p.position,Contract:p.contract,Salary:Number(p.salary||0),ContractEnd:p.contractEnd,ListLocation:p.status});
+    const roundResults=[],playerScores=[];for(const [round,rr] of Object.entries(seasonResults)){for(const [k,score] of Object.entries(rr.teamScores||{}))roundResults.push({Round:Number(round),Team:team(k).name,Coach:team(k).owner,Score:Number(score||0),TopPlayers:Number(rr.topPlayers||0),FinalizedAt:rr.finalizedAt||''});for(const [k,ps] of Object.entries(rr.players||{}))for(const p of ps||[])playerScores.push({Round:Number(round),Team:team(k).name,Player:p.player,Position:p.position,AFLClub:p.club,Score:Number(p.score||0),Source:p.scoreSource||''});}
+    const bank=state.opening_bank?.[season]?.players||{},opening=Object.values(bank).map(p=>({Player:p.player,AFLClub:p.club,OpeningRoundScore:Number(p.actual||0),Source:p.source||''}));
+    const auditLog=(snapshot?.auditLog||[]).map(a=>({ID:a.id,CreatedAt:a.created_at,ActorRole:a.actor_role,ActorTeam:a.actor_team,Action:a.action,EntityType:a.entity_type,EntityID:a.entity_id,Detail:JSON.stringify(a.detail||{})}));
+    return {summary:[{League:d.meta?.league||D.meta.league,Season:d.meta?.season||season,Round:d.meta?.round||'',CreatedAt:snapshot?.createdAt||''}],teamLists,ladder:d.ladder||[],roundResults,playerScores,transactions:d.transactions||[],draftHistory:d.draftHistory||[],pickOwnership:[...(d.pickOwnership?.preSeason||[]),...(d.pickOwnership?.midSeason||[])],opening,finals:d.finals||[],seasonSettings:[state.season_setup||{}],auditLog};
+  }
+  async function exportBackupExcel(id){const rec=await getBackupSnapshot(id),X=await ensureSheetJs(),rows=backupSheetRows(rec.snapshot),wb=X.utils.book_new(),add=(name,data)=>X.utils.book_append_sheet(wb,X.utils.json_to_sheet(data?.length?data:[{Info:'No records'}]),name);add('League Summary',rows.summary);add('Team Lists',rows.teamLists);add('Ladder',rows.ladder);add('Round Results',rows.roundResults);add('Player Scores',rows.playerScores);add('Transactions',rows.transactions);add('Draft History',rows.draftHistory);add('Draft Pick Ownership',rows.pickOwnership);add('Opening Round Banking',rows.opening);add('Finals',rows.finals);add('Season Settings',rows.seasonSettings);add('Audit Log',rows.auditLog);X.writeFile(wb,`PEGS-Backup-${rec.season||currentSeason()}-R${rec.round||0}-${id}.xlsx`);}
+  async function restoreServerBackup(id){if(!commissionerLoggedIn())throw new Error('Commissioner login required.');const typed=prompt(`Restore backup #${id}? PEGS will first create an emergency copy of the current state. Type RESTORE to continue.`);if(typed!=='RESTORE')return false;await backendFetch('/rest/v1/rpc/pegs_restore_backup',{method:'POST',body:JSON.stringify({p_backup_id:Number(id)})});[OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,DRAFT_STATE_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,FIGUREHEAD_OVERRIDE_KEY,DRAFT_POOL_KEY].forEach(k=>localStorage.removeItem(k));draftPoolCache=null;proposalCache=[];await pullSharedState();await syncProposals();await loadDraftPool();await syncBackups();await syncServerAuthority();return true;}
+  async function syncAudit(){if(!commissionerLoggedIn())return [];try{auditCache=await backendFetch('/rest/v1/pegs_audit_log?select=*&order=created_at.desc&limit=100')||[];}catch(e){auditCache=[];}return auditCache;}
 
   function rosterSummary(rows){
     const main=Math.round(rows.filter(x=>String(x.contract).toLowerCase()==='main').reduce((s,x)=>s+Number(x.salary||0),0));
     const field=Math.round(rows.filter(x=>String(x.status).toLowerCase()==='field').reduce((s,x)=>s+Number(x.salary||0),0));
     const rookie=Math.round(rows.filter(x=>String(x.contract).toLowerCase()==='rookie').reduce((s,x)=>s+Number(x.salary||0),0));
-    const counts={field:rows.filter(x=>String(x.status).toLowerCase()==='field').length,interchange:rows.filter(x=>String(x.status).toLowerCase()==='interchange').length};
+    const counts={main:rows.filter(x=>String(x.contract).toLowerCase()==='main').length,field:rows.filter(x=>String(x.status).toLowerCase()==='field').length,interchange:rows.filter(x=>String(x.status).toLowerCase()==='interchange').length};
     for(const pos of Object.keys(D.rules.positionMax)) counts[pos]=rows.filter(x=>String(x.status).toLowerCase()==='field'&&x.position===pos).length;
     return {caps:{main,field,rookie},counts};
   }
-  function rosterIsLegal(rows){const x=rosterSummary(rows);return x.caps.main<=D.rules.mainContractCap&&x.caps.field<=D.rules.fieldCap&&x.caps.rookie<=D.rules.rookieContractCap&&x.counts.field<=D.rules.maxFieldPlayers&&Object.entries(D.rules.positionMax).every(([p,m])=>(x.counts[p]||0)<=m);}
+  function rosterIsLegal(rows){const x=rosterSummary(rows);return x.caps.main<=D.rules.mainContractCap&&x.caps.field<=D.rules.fieldCap&&x.caps.rookie<=D.rules.rookieContractCap&&x.counts.main<=28&&x.counts.field<=D.rules.maxFieldPlayers&&Object.entries(D.rules.positionMax).every(([p,m])=>(x.counts[p]||0)<=m);}
   function effectiveRosters(extraAction=null){
     const out={}; for(const [k,rows] of Object.entries(D.rosters)) out[k]=rows.map(x=>({...x}));
     const actions=[...getCommissionerActions(),...(extraAction?[extraAction]:[])].filter(x=>x.status==='CONFIRMED');
@@ -724,7 +886,7 @@
       return `<button class="live-h2h-card" data-action="open-matchup" data-round="${round}" data-home="${f.home}" data-away="${f.away}"><div class="live-h2h-team">${teamIdentity(f.home,'sm')}<div class="live-h2h-score"><strong>${h.actual}</strong><span>${hSub}</span></div></div><div class="live-h2h-centre"><span class="vs-dot">VS</span><small>${centre}</small></div><div class="live-h2h-team away">${teamIdentity(f.away,'sm')}<div class="live-h2h-score"><strong>${a.actual}</strong><span>${aSub}</span></div></div></button>`;
     }).join('');
     const ladderRows=ladder.map(r=>`<button class="live-ladder-row ${r.position<=4?'top-four':''}" data-route="team/${r.team}"><b class="live-ladder-pos">${r.position}</b>${teamIdentity(r.team,'sm')}<span class="live-ladder-record">${r.wins}-${r.losses}${r.draws?`-${r.draws}`:''}</span><strong>${r.points}</strong><span class="live-ladder-pct">${Number(r.percentage||0).toFixed(1)}%</span></button>`).join('');
-    main.innerHTML=`<section class="live-home"><header class="live-round-head"><div><span class="eyebrow">${currentSeason()} PEGS</span><h1>ROUND ${round}</h1>${roundLabel(round)!==`Round ${round}`?`<p>${esc(roundLabel(round))}</p>`:''}</div><span class="badge ${badge.tone}">${badge.label}</span></header><div class="live-home-grid"><section class="card live-h2h-board"><div class="section-title"><div><span class="eyebrow">Live</span><h2>Head-to-head board</h2></div><span class="live-count-note">${topPlayersForRound(round)} scores count</span></div><div class="live-h2h-list">${fixtureCards||'<div class="empty">No PEGS matchups are configured for this round.</div>'}</div></section><aside class="card live-ladder"><div class="section-title"><div><span class="eyebrow">${ladderProjected?'Projected':'Live'}</span><h2>Live ladder</h2></div><button class="link-button" data-route="ladder">Full ladder</button></div><div class="live-ladder-head"><span>#</span><span>Team</span><span>W-L</span><span>Pts</span><span>%</span></div><div class="live-ladder-list">${ladderRows}</div>${Number(round)>regular?'<p class="live-ladder-note">Regular-season ladder locked for finals.</p>':ladderProjected?'<p class="live-ladder-note">Includes this round using current live projections.</p>':''}</aside></div></section>`;
+    main.innerHTML=`${teamNotificationBanner()}<section class="live-home"><header class="live-round-head"><div><span class="eyebrow">${currentSeason()} PEGS</span><h1>ROUND ${round}</h1>${roundLabel(round)!==`Round ${round}`?`<p>${esc(roundLabel(round))}</p>`:''}</div><span class="badge ${badge.tone}">${badge.label}</span></header><div class="live-home-grid"><section class="card live-h2h-board"><div class="section-title"><div><span class="eyebrow">Live</span><h2>Head-to-head board</h2></div><span class="live-count-note">${topPlayersForRound(round)} scores count</span></div><div class="live-h2h-list">${fixtureCards||'<div class="empty">No PEGS matchups are configured for this round.</div>'}</div></section><aside class="card live-ladder"><div class="section-title"><div><span class="eyebrow">${ladderProjected?'Projected':'Live'}</span><h2>Live ladder</h2></div><button class="link-button" data-route="ladder">Full ladder</button></div><div class="live-ladder-head"><span>#</span><span>Team</span><span>W-L</span><span>Pts</span><span>%</span></div><div class="live-ladder-list">${ladderRows}</div>${Number(round)>regular?'<p class="live-ladder-note">Regular-season ladder locked for finals.</p>':ladderProjected?'<p class="live-ladder-note">Includes this round using current live projections.</p>':''}</aside></div></section>`;
   }
 
   function renderHome() {
@@ -753,7 +915,7 @@
 
     const tx = D.transactions.slice(0, 5).map(transactionItem).join('');
 
-    main.innerHTML = `
+    main.innerHTML = `${teamNotificationBanner()}
       <section class="hero-grid" aria-labelledby="home-title">
         <article class="card hero-score">
           <span class="eyebrow kicker">${currentSeason()} Grand Final</span>
@@ -945,29 +1107,27 @@
   }
 
   function availablePlayers() {
-    const q = draftSearch.trim().toLowerCase();
-    const rostered=new Set(Object.values(effectiveRosters()).flat().map(p=>p.player));
-    const reserved=new Set(proposalCache.filter(x=>x.type==='DRAFT_PICK'&&x.status==='PENDING').map(x=>x.payload?.player).filter(Boolean));
-    return D.playerPool.filter(p => !rostered.has(p.player) && !reserved.has(p.player) && (!q || p.player.toLowerCase().includes(q) || p.club.toLowerCase().includes(q) || p.position.toLowerCase().includes(q))).slice(0, 80);
+    const q=draftSearch.trim().toLowerCase(),pool=frozenDraftPlayers();
+    const rostered=new Set(Object.values(effectiveRosters()).flat().map(p=>canonicalPlayerName(p.player)));
+    const reserved=new Set(proposalCache.filter(x=>x.type==='DRAFT_PICK'&&activeProposalStatus(x.status)).map(x=>canonicalPlayerName(x.payload?.player)).filter(Boolean));
+    return pool.filter(p=>!rostered.has(canonicalPlayerName(p.player))&&!reserved.has(canonicalPlayerName(p.player))&&(!q||String(p.player).toLowerCase().includes(q)||String(p.club).toLowerCase().includes(q)||String(p.position).toLowerCase().includes(q))).slice(0,120);
   }
 
   function validateDraft(teamKey, player, contract, status, fixedPosition='') {
-    const t = effectiveTeam(teamKey), price = Number(player?.startPrice || player?.price || 0), pos = fixedPosition || String(player?.position || '').split('/')[0];
-    const checks=[];
-    if (!player) return checks;
-    const isMain=contract==='Main', isField=status==='Field';
-    const newMain=t.caps.main+(isMain?price:0);
-    const newField=t.caps.field+(isField?price:0);
-    const newRookie=t.caps.rookie+(!isMain?price:0);
-    const newFieldCount=t.counts.field+(isField?1:0);
-    const newPos=(t.counts[pos]||0)+(isField?1:0);
-    const rostered=new Set(Object.values(effectiveRosters()).flat().map(p=>p.player));
-    checks.push({label:'Player is currently unrostered',pass:!rostered.has(player.player),detail:player.player});
+    const t=effectiveTeam(teamKey),price=Number(player?.price||player?.startPrice||0),pos=String(fixedPosition||String(player?.position||'').split('/')[0]).toUpperCase();
+    const checks=[];if(!player)return checks;
+    const isMain=contract==='Main',isField=status==='Field',newMain=t.caps.main+(isMain?price:0),newField=t.caps.field+(isField?price:0),newRookie=t.caps.rookie+(!isMain?price:0),newMainCount=(t.counts.main||0)+(isMain?1:0),newFieldCount=t.counts.field+(isField?1:0),newPos=(t.counts[pos]||0)+(isField?1:0);
+    const rostered=new Set(Object.values(effectiveRosters()).flat().map(p=>canonicalPlayerName(p.player)));
+    const validPositions=String(player?.position||'').toUpperCase().split('/').filter(Boolean);
+    checks.push({label:'Player is currently unrostered',pass:!rostered.has(canonicalPlayerName(player.player)),detail:player.player});
+    checks.push({label:'Frozen draft price available',pass:price>0,detail:money(price)});
+    checks.push({label:'PEGS contract position',pass:Boolean(pos)&&validPositions.includes(pos),detail:pos||'Choose position'});
     checks.push({label:'Main contract cap',pass:newMain<=D.rules.mainContractCap,detail:`${compactMoney(newMain)} / ${compactMoney(D.rules.mainContractCap)}`});
     checks.push({label:'Field salary cap',pass:newField<=D.rules.fieldCap,detail:`${compactMoney(newField)} / ${compactMoney(D.rules.fieldCap)}`});
     checks.push({label:'Rookie contract cap',pass:newRookie<=D.rules.rookieContractCap,detail:`${compactMoney(newRookie)} / ${compactMoney(D.rules.rookieContractCap)}`});
+    checks.push({label:'Main contract list size',pass:newMainCount<=28,detail:`${newMainCount} / 28`});
     checks.push({label:'Field list size',pass:newFieldCount<=D.rules.maxFieldPlayers,detail:`${newFieldCount} / ${D.rules.maxFieldPlayers}`});
-    if (isField && pos) checks.push({label:`${pos} position limit`,pass:newPos<=(D.rules.positionMax[pos]||99),detail:`${newPos} / ${D.rules.positionMax[pos]||'-'}`});
+    if(isField&&pos)checks.push({label:`${pos} position limit`,pass:newPos<=(D.rules.positionMax[pos]||99),detail:`${newPos} / ${D.rules.positionMax[pos]||'-'}`});
     return checks;
   }
 
@@ -1030,56 +1190,49 @@
   }
 
   function renderDraft() {
-    const ds=getDraftState();
-    const currentTeam=currentDraftTeam(ds);
-    const currentPick=Number(ds.currentPick||1);
-    const currentPickRec=Array.isArray(ds.picks)?ds.picks.find(p=>Number(p.pick)===currentPick):null;
-    const selected = draftSelection ? D.playerPool.find(p=>p.player===draftSelection) : null;
-    const results=availablePlayers();
-    const liveDraftActions=getCommissionerActions().filter(a=>a.type==='Drafted'&&a.status==='CONFIRMED');
+    const ds=getDraftState(),currentTeam=currentDraftTeam(ds),currentPick=Number(ds.currentPick||1),currentPickRec=Array.isArray(ds.picks)?ds.picks.find(p=>Number(p.pick)===currentPick):null;
+    const selected=draftSelection?draftPlayerByName(draftSelection):null,results=availablePlayers(),liveDraftActions=getCommissionerActions().filter(a=>a.type==='Drafted'&&a.status==='CONFIRMED');
     const draftSource=[...D.draft,...liveDraftActions.map(a=>({pick:a.pick,team:a.team,player:a.player,position:a.position,club:a.club,salary:a.salary,type:a.phase||''}))];
     const draftRows=draftSource.sort((a,b)=>(a.pick||0)-(b.pick||0)).map(d=>`<div class="draft-pick"><span class="pick-no">${d.pick}</span>${figurehead(d.team,'sm')}<span class="draft-player"><strong>${esc(d.player)}</strong><small>${esc(d.position)} - ${esc(d.club)} - ${esc(team(d.team).name)}</small></span><span class="money">${money(d.salary)}</span></div>`).join('');
-    const pendingCurrent=proposalCache.find(p=>p.type==='DRAFT_PICK'&&p.status==='PENDING'&&Number(p.payload?.pick)===currentPick&&p.proposerTeam===currentTeam);
-    const draftSub = ds.active
-      ? `${Number(ds.season||draftSeasonFor(ds.type))} ${esc(ds.type||'Draft')} · Pick <strong>${currentPick}</strong> · ${team(currentTeam).name} (${team(currentTeam).owner}) · <strong id="draft-countdown" class="${draftIsOvertime(ds)?'overtime-clock':''}">${draftClockText(ds)}</strong>${currentPickRec&&currentPickRec.originalOwner!==currentPickRec.owner?` · <span class="muted-copy">slot originally ${esc(team(currentPickRec.originalOwner).owner)}</span>`:''}`
-      : 'The Commissioner starts and ends both pre-season and mid-season drafts.';
-    main.innerHTML = `${pageHeader('Draft centre','2026 Draft Room','The active franchise submits its own pick. Every selection is provisional until the Commissioner approves it.')}
+    const pendingCurrent=proposalCache.find(p=>p.type==='DRAFT_PICK'&&p.status==='AWAITING_COMMISSIONER'&&Number(p.payload?.pick)===currentPick&&p.proposerTeam===currentTeam);
+    const myTurn=ds.active&&teamLoggedIn()&&loggedTeamKey()===currentTeam;
+    const draftSub=ds.active?`${Number(ds.season||draftSeasonFor(ds.type))} ${esc(ds.type||'Draft')} · Pick <strong>${currentPick}</strong> · ${team(currentTeam).name} (${team(currentTeam).owner}) · <strong id="draft-countdown" class="${draftIsOvertime(ds)?'overtime-clock':''}">${draftClockText(ds)}</strong>${currentPickRec&&currentPickRec.originalOwner!==currentPickRec.owner?` · <span class="muted-copy">slot originally ${esc(team(currentPickRec.originalOwner).owner)}</span>`:''}`:'The Commissioner starts and ends both pre-season and mid-season drafts.';
+    const accessNotice=!ds.active?'Draft selections are closed.':!teamLoggedIn()?'<strong>Team Login required.</strong> Sign in as the coach whose franchise is on the clock to submit a pick.':myTurn?`<strong>Your pick is live.</strong> ${esc(team(currentTeam).name)} can submit the current selection.`:`<strong>Watching draft.</strong> You are signed in as ${esc(team(loggedTeamKey()).owner)}; only ${esc(team(currentTeam).owner)} can submit Pick ${currentPick}.`;
+    main.innerHTML=`${pageHeader('Draft centre',`${currentSeason()} Draft Room`,'Only the logged-in franchise on the clock can submit a player. Current prices are frozen when the Commissioner starts the draft.')}
       <section class="card draft-status-card ${ds.active?'live-draft-card':''}"><div><span class="eyebrow">Draft status</span><h2>${ds.active?'LIVE - '+esc(ds.type||'Draft'):'Draft closed'}</h2><p>${draftSub}</p>${ds.active?`<div style="margin-top:12px">${teamIdentity(currentTeam,'sm')}</div>`:''}</div><span id="draft-clock-badge" class="badge ${ds.active?(draftIsOvertime(ds)?'amber':'red'):'neutral'}">${ds.active?(draftIsOvertime(ds)?'OVERTIME':'3 MIN CLOCK'):'CLOSED'}</span></section>
-      ${ds.active?`<div id="draft-overtime-notice" class="notice danger" style="display:${draftIsOvertime(ds)?'block':'none'};margin-bottom:14px"><strong>Clock expired — ${esc(team(currentTeam).name)} remains on the clock.</strong> Nothing moves automatically. The Commissioner can leave this pick live or push it back one slot, which promotes the next franchise and restarts a fresh 3:00 clock.</div>`:''}
-      ${ds.active&&pendingCurrent?`<div class="notice pending-pick-notice"><strong>Pick submitted:</strong> ${esc(pendingCurrent.payload?.player||'')} is provisionally reserved for ${esc(team(currentTeam).name)} and awaiting Commissioner approval. The next franchise is already on the clock.</div>`:''}
-      <section class="draft-layout">
-        <article class="card draft-board"><div class="section-title" style="padding:18px 18px 0"><div><span class="eyebrow">Completed</span><h2>Draft history</h2></div><span class="badge neutral">${draftSource.length} recorded picks</span></div>${draftRows}</article>
-        <article class="card draft-sim"><span class="eyebrow">${ds.active?'Current selection':'Player explorer'}</span><h2>${ds.active?`${esc(team(currentTeam).name)} is on the clock`:'Draft selections are closed'}</h2><p style="color:var(--muted);margin-top:0">${ds.active?'No team login is required. Choose a player and submit the current pick for Commissioner approval.':'You can still inspect available players and roster-rule checks.'}</p>
-          <div class="field-group"><label for="draft-search">Find available player</label><input class="search-input" id="draft-search" value="${esc(draftSearch)}" placeholder="Search player, club or position"></div>
-          <div class="draft-search-results" id="draft-search-results">${results.map(p=>`<button class="player-option ${selected?.player===p.player?'selected':''}" data-action="select-draft-player" data-player="${esc(p.player)}"><span><strong>${esc(p.player)}</strong><small>${esc(p.position)} - ${esc(p.club)} - Avg ${p.average}</small></span><span class="money"><strong>${money(p.startPrice||p.price)}</strong><small>opening</small></span></button>`).join('') || '<div class="empty">No available players match.</div>'}</div>
-          <div class="form-grid" style="margin-top:14px"><div class="field-group"><label for="draft-contract">Contract</label><select class="select" id="draft-contract"><option>Main</option><option>Rookie</option></select></div><div class="field-group"><label for="draft-status">List location</label><select class="select" id="draft-status"><option>Field</option><option>Interchange</option></select></div><div class="field-group"><label for="draft-fixed-position">PEGS position for contract</label><select class="select" id="draft-fixed-position" ${selected?'':'disabled'}>${selected?String(selected.position||'').split('/').map(pos=>`<option value="${esc(pos)}">${esc(pos)}</option>`).join(''):'<option>Select player first</option>'}</select></div></div>
-          <div id="draft-check-output">${selected ? draftCheckOutput(currentTeam,selected,'Main','Field',Boolean(ds.active),Boolean(pendingCurrent),String(selected.position||'').split('/')[0]) : '<div class="notice" style="margin-top:16px">Select an available player to run the salary-cap and positional checks.</div>'}</div>
-        </article>
-      </section>`;
+      ${ds.active?`<div class="notice ${myTurn?'':'warning-notice'}" style="margin-bottom:14px">${accessNotice}</div>`:''}
+      ${ds.active?`<div id="draft-overtime-notice" class="notice danger" style="display:${draftIsOvertime(ds)?'block':'none'};margin-bottom:14px"><strong>Clock expired — ${esc(team(currentTeam).name)} remains on the clock.</strong> Nothing advances automatically. The Commissioner may push the overdue pick back one slot.</div>`:''}
+      ${pendingCurrent?`<div class="notice pending-pick-notice"><strong>Selection awaiting Commissioner:</strong> ${esc(pendingCurrent.payload?.player||'')} is provisionally reserved.</div>`:''}
+      <section class="draft-layout"><article class="card draft-board"><div class="section-title" style="padding:18px 18px 0"><div><span class="eyebrow">Completed</span><h2>Draft history</h2></div><span class="badge neutral">${draftSource.length} recorded picks</span></div>${draftRows}</article>
+      <article class="card draft-sim"><span class="eyebrow">${ds.active?'Current selection':'Player explorer'}</span><h2>${ds.active?`${esc(team(currentTeam).name)} is on the clock`:'Draft selections are closed'}</h2><p class="muted-copy">${ds.active?'The available pool is the frozen pre-draft AFL/SuperCoach snapshot less PEGS-owned and provisionally selected players.':'You can inspect the most recently loaded player pool.'}</p>
+      <div class="field-group"><label for="draft-search">Find available player</label><input class="search-input" id="draft-search" value="${esc(draftSearch)}" placeholder="Search player, club or position"></div>
+      <div class="draft-search-results" id="draft-search-results">${results.map(p=>`<button class="player-option ${selected?.player===p.player?'selected':''}" data-action="select-draft-player" data-player="${esc(p.player)}"><span><strong>${esc(p.player)}</strong><small>${esc(p.position)} - ${esc(p.club)}${Number(p.average||0)?` - Avg ${Number(p.average).toFixed(1)}`:''}</small></span><span class="money"><strong>${money(p.price||p.startPrice)}</strong><small>${ds.active?'frozen':'price'}</small></span></button>`).join('')||'<div class="empty">No available players match.</div>'}</div>
+      <div class="form-grid" style="margin-top:14px"><div class="field-group"><label for="draft-contract">Contract</label><select class="select" id="draft-contract"><option>Main</option><option>Rookie</option></select></div><div class="field-group"><label for="draft-status">List location</label><select class="select" id="draft-status"><option>Field</option><option>Interchange</option></select></div><div class="field-group"><label for="draft-fixed-position">PEGS position for contract</label><select class="select" id="draft-fixed-position" ${selected?'':'disabled'}>${selected?String(selected.position||'').split('/').map(pos=>`<option value="${esc(pos)}">${esc(pos)}</option>`).join(''):'<option>Select player first</option>'}</select></div></div>
+      <div id="draft-check-output">${selected?draftCheckOutput(currentTeam,selected,'Main','Field',myTurn,Boolean(pendingCurrent),String(selected.position||'').split('/')[0]):'<div class="notice" style="margin-top:16px">Select an available player to run the salary-cap, list-size and positional checks.</div>'}</div></article></section>`;
     startDraftTicker();
   }
 
   async function handleDraftProposalSubmission() {
-    const state=getDraftState(),key=currentDraftTeam(state),pick=Number(state.currentPick||1),p=draftSelection?D.playerPool.find(x=>x.player===draftSelection):null;
+    const state=getDraftState(),key=currentDraftTeam(state),pick=Number(state.currentPick||1),p=draftSelection?draftPlayerByName(draftSelection):null;
     if(!state.active){toast('The draft is closed.');render();return;}
-    if(proposalCache.some(x=>x.type==='DRAFT_PICK'&&x.status==='PENDING'&&Number(x.payload?.pick)===pick&&x.proposerTeam===key)){toast('This franchise already has a pending selection for this pick.');return;}
+    if(!teamLoggedIn()){toast('Team Login required to draft.');return;}
+    if(loggedTeamKey()!==key){toast(`It is ${team(key).owner}'s pick.`);return;}
+    if(proposalCache.some(x=>x.type==='DRAFT_PICK'&&activeProposalStatus(x.status)&&Number(x.payload?.pick)===pick&&x.proposerTeam===key)){toast('This pick already has a submitted selection.');return;}
     const contract=document.getElementById('draft-contract')?.value||'Main',status=document.getElementById('draft-status')?.value||'Field',fixedPosition=document.getElementById('draft-fixed-position')?.value||String(p?.position||'').split('/')[0];
-    const checks=validateDraft(key,p,contract,status,fixedPosition); if(!p||!checks.length||!checks.every(c=>c.pass)){toast('That selection is blocked by the league rules.');return;}
+    const checks=validateDraft(key,p,contract,status,fixedPosition);if(!p||!checks.length||!checks.every(c=>c.pass)){toast('That selection is blocked by the league rules.');return;}
     try{
-      await submitProposal({type:'DRAFT_PICK',phase:state.type||'Draft',proposerTeam:key,payload:{pick,draftSeason:Number(state.season||draftSeasonFor(state.type)),sessionId:state.sessionId||'',player:p.player,position:fixedPosition,club:p.club,salary:Number(p.startPrice||p.price||0),contract,listStatus:status}});
+      await submitProposal({type:'DRAFT_PICK',phase:state.type||'Draft',proposerTeam:key,payload:{pick,draftSeason:Number(state.season||draftSeasonFor(state.type)),sessionId:state.sessionId||'',player:p.player,position:fixedPosition,club:p.club,salary:Number(p.price||p.startPrice||0),contract,listStatus:status,poolSessionId:state.poolSessionId||''}});
       if(backendConfigured()){
         const value=await backendFetch('/rest/v1/rpc/pegs_advance_draft_after_submission',{method:'POST',body:JSON.stringify({p_pick:pick,p_team:key})});
-        if(value&&typeof value==='object')localStorage.setItem(DRAFT_STATE_KEY,JSON.stringify(value));
-        await pullSharedState();
-      } else advanceDraftLocal('SUBMITTED');
+        if(value&&typeof value==='object')localStorage.setItem(DRAFT_STATE_KEY,JSON.stringify(value));await pullSharedState();
+      }else advanceDraftLocal('SUBMITTED');
       draftSelection=null;toast(`Pick ${pick} submitted. Next franchise is on the clock.`);render();
     }catch(e){toast(e.message||'Could not submit the draft pick.');}
   }
 
-  function draftCheckOutput(teamKey, player, contract, status, canSubmit=false, alreadyPending=false, fixedPosition='') {
-    const checks=validateDraft(teamKey,player,contract,status,fixedPosition); const pass=checks.length && checks.every(c=>c.pass);
-    const buttonText=alreadyPending?'Selection already submitted':canSubmit?'Submit pick for approval':'Draft is closed';
-    return `<div class="draft-check"><div class="section-title"><h3>${esc(player.player)} - ${esc(player.position)}</h3><span class="badge ${pass?'green':'red'}">${pass?'Selection legal':'Selection blocked'}</span></div><div class="notice"><strong>Salary used:</strong> ${money(player.startPrice||player.price)} official opening price.</div>${checks.map(c=>`<div class="rule-check"><span>${esc(c.label)}</span><span class="${c.pass?'check-pass':'check-fail'}">${c.pass?'PASS':'FAIL'} - ${esc(c.detail)}</span></div>`).join('')}<div class="button-row"><button class="primary-button" id="submit-draft-proposal" ${pass&&canSubmit&&!alreadyPending?'':'disabled'}>${buttonText}</button></div></div>`;
+  function draftCheckOutput(teamKey,player,contract,status,canSubmit=false,alreadyPending=false,fixedPosition='') {
+    const checks=validateDraft(teamKey,player,contract,status,fixedPosition),pass=checks.length&&checks.every(c=>c.pass),buttonText=alreadyPending?'Selection already submitted':canSubmit?'Submit my pick':'Only team on clock can submit';
+    return `<div class="draft-check"><div class="section-title"><h3>${esc(player.player)} - ${esc(player.position)}</h3><span class="badge ${pass?'green':'red'}">${pass?'Selection legal':'Selection blocked'}</span></div><div class="notice"><strong>Draft salary:</strong> ${money(player.price||player.startPrice)} — frozen from the current-price player pool captured before this draft.</div>${checks.map(c=>`<div class="rule-check"><span>${esc(c.label)}</span><span class="${c.pass?'check-pass':'check-fail'}">${c.pass?'PASS':'FAIL'} - ${esc(c.detail)}</span></div>`).join('')}<div class="button-row"><button class="primary-button" id="submit-draft-proposal" ${pass&&canSubmit&&!alreadyPending?'':'disabled'}>${buttonText}</button></div></div>`;
   }
 
   function transactionItem(x) {
@@ -1104,108 +1257,51 @@
   }
   function proposalCards(items,commissioner=false){
     if(!items.length)return '<div class="empty">No proposals here.</div>';
-    return items.map(p=>`<article class="proposal-card"><div class="proposal-card-head"><div>${teamIdentity(p.proposerTeam,'sm')}<span class="badge ${p.status==='PENDING'?'amber':p.status==='APPROVED'?'green':'red'}">${esc(p.status)}</span></div><time>${fmtDate(p.createdAt)}</time></div><strong>${esc(proposalTypeLabel(p))}${p.phase?' · '+esc(p.phase):''}</strong><p>${esc(proposalSummary(p))}</p>${commissioner&&p.status==='PENDING'?`<div class="button-row"><button class="primary-button" data-proposal-approve="${esc(p.id)}">Approve</button><button class="secondary-button" data-proposal-reject="${esc(p.id)}">Reject</button></div>`:''}</article>`).join('');
+    const tone=status=>['APPROVED'].includes(status)?'green':['REJECTED','DECLINED','CANCELLED'].includes(status)?'red':'amber';
+    return items.map(p=>`<article class="proposal-card"><div class="proposal-card-head"><div>${teamIdentity(p.proposerTeam,'sm')}<span class="badge ${tone(p.status)}">${esc(String(p.status||'').replaceAll('_',' '))}</span></div><time>${fmtDate(p.createdAt)}</time></div><strong>${esc(proposalTypeLabel(p))}${p.phase?' · '+esc(p.phase):''}</strong><p>${esc(proposalSummary(p))}</p>${commissioner&&p.status==='AWAITING_COMMISSIONER'?`<div class="button-row"><button class="primary-button" data-proposal-approve="${esc(p.id)}">Approve</button><button class="secondary-button" data-proposal-reject="${esc(p.id)}">Reject</button></div>`:''}</article>`).join('');
   }
 
   function renderTransactions() {
     const adminTx=getCommissionerActions().filter(x=>x.status==='CONFIRMED').map(x=>({timestamp:x.timestamp,type:x.type,team:x.team||x.teamA,detail:x.detail||'',status:x.status}));
-    const allTx=[...adminTx,...D.transactions].sort((a,b)=>String(b.timestamp||'').localeCompare(String(a.timestamp||'')));
-    const types=['All',...new Set(allTx.map(x=>x.type))];
-    const selected=(new URLSearchParams(location.hash.split('?')[1]||'')).get('type')||'All';
-    const rows=allTx.filter(x=>selected==='All'||x.type===selected).slice(0,250);
-    const windows=getProposalWindows(),tradeOpen=Boolean(windows.trade.open),delistOpen=Boolean(windows.delist.open),tradePhase=windows.trade.phase||'Pre-Season',delistPhase=windows.delist.phase||'Pre-Season';
-    const teamSelect=`<option value="">Select your team…</option>${teamOptions('')}`;
-    const playerSlots=(side,key='')=>[1,2,3].map(i=>`<div class="field-group"><label for="proposal-player-${side}-${i}">Player ${i} (optional)</label><select class="select proposal-player" id="proposal-player-${side}-${i}" data-side="${side}" ${key&&tradeOpen?'':'disabled'}>${playerOptions(key,null,'No player')}</select></div>`).join('');
-    const pickSlots=(side,key='',phase=tradePhase)=>[1,2,3].map(i=>`<div class="field-group"><label for="proposal-pick-${side}-${i}">Draft pick ${i} (optional)</label><select class="select proposal-pick" id="proposal-pick-${side}-${i}" data-side="${side}" ${key&&tradeOpen?'':'disabled'}>${pickOptions(key,phase,'No pick')}</select></div>`).join('');
-    const pending=proposalCache.filter(p=>p.status==='PENDING'&&p.type!=='DRAFT_PICK');
-    const tradeStatus=tradeOpen?`<span class="badge green">OPEN · ${esc(tradePhase)}</span>`:'<span class="badge red">CLOSED</span>';
-    const delistStatus=delistOpen?`<span class="badge green">OPEN · ${esc(delistPhase)}</span>`:'<span class="badge red">CLOSED</span>';
-    main.innerHTML = `${pageHeader('League moves','Propose a Move','Teams submit requests here. Trading, drafting and delisting only accept submissions when the Commissioner has opened the relevant window; every move remains provisional until approved.')}
-      <section class="move-window-strip"><div><span>Trading</span>${tradeStatus}</div><div><span>Draft</span><span class="badge ${getDraftState().active?'green':'red'}">${getDraftState().active?'OPEN · '+esc(getDraftState().type||'Draft'):'CLOSED'}</span></div><div><span>Delisting</span>${delistStatus}</div></section>
-      <section class="proposal-grid">
-        <article class="card card-pad"><div class="section-title"><div><span class="eyebrow">Team initiated</span><h2>Trade proposal</h2></div>${tradeStatus}</div>
-          ${tradeOpen?`<div class="notice"><strong>${esc(tradePhase)} trading is open.</strong> Select your franchise first; only players and draft picks currently owned by each side can be offered.</div>`:`<div class="notice danger"><strong>Trading is closed.</strong> The Commissioner must open a Pre-Season or Mid-Season trading window before teams can submit trades.</div>`}
-          <input type="hidden" id="proposal-phase" value="${esc(tradePhase)}">
-          <div class="form-grid" style="margin-top:14px"><div class="field-group"><label for="proposal-team-a">Your team</label><select class="select" id="proposal-team-a" ${tradeOpen?'':'disabled'}>${teamSelect}</select></div><div class="field-group"><label for="proposal-team-b">Trade partner</label><select class="select" id="proposal-team-b" disabled><option value="">Select your team first…</option></select></div><div id="proposal-pick-owner-note" class="field-help"></div></div>
-          <div class="trade-sides"><div class="trade-side"><h3 id="proposal-side-a-title">Your team sends</h3><div id="proposal-side-a-players">${playerSlots('a')}</div><div id="proposal-side-a-picks">${pickSlots('a')}</div></div><div class="trade-arrow">⇄</div><div class="trade-side"><h3 id="proposal-side-b-title">Trade partner sends</h3><div id="proposal-side-b-players">${playerSlots('b')}</div><div id="proposal-side-b-picks">${pickSlots('b')}</div></div></div>
-          <div id="proposal-trade-validation" style="margin-top:14px"><div class="notice">${tradeOpen?'Select your team to load the players and draft picks you currently own.':'Trading submissions are currently disabled.'}</div></div><div class="button-row"><button class="primary-button" id="submit-trade-proposal" disabled>Submit trade for approval</button></div>
-        </article>
-        <div class="proposal-side-stack">
-          <article class="card card-pad"><div class="section-title"><div><span class="eyebrow">Team initiated</span><h2>Field / Rookie swap</h2></div><span class="badge neutral">Commissioner approval</span></div><p class="muted-copy">Move one Interchange player onto the Field and one Field player to Interchange. Contracts and salaries stay unchanged.</p>
-            <div class="form-grid"><div class="field-group"><label for="proposal-swap-team">Your team</label><select class="select" id="proposal-swap-team"><option value="">Select your team…</option>${teamOptions('')}</select></div><div></div><div class="field-group"><label for="proposal-swap-in">Interchange → Field</label><select class="select" id="proposal-swap-in" disabled><option value="">Select team first</option></select></div><div class="field-group"><label for="proposal-swap-out">Field → Interchange</label><select class="select" id="proposal-swap-out" disabled><option value="">Select team first</option></select></div></div>
-            <div id="proposal-swap-validation" style="margin-top:14px"><div class="notice">Select your team to load eligible swap players.</div></div><div class="button-row"><button class="primary-button" id="submit-swap-proposal" disabled>Submit swap for approval</button></div>
-          </article>
-          <article class="card card-pad"><div class="section-title"><div><span class="eyebrow">Team initiated</span><h2>Delisting request</h2></div>${delistStatus}</div>
-            ${delistOpen?`<div class="notice"><strong>${esc(delistPhase)} delisting is open.</strong> Select your franchise, then choose one or more currently-owned players to delist.</div>`:`<div class="notice danger"><strong>Delisting is closed.</strong> The Commissioner must open a delisting window before requests can be submitted.</div>`}
-            <div class="field-group" style="margin-top:14px"><label for="proposal-delist-team">Your team</label><select class="select" id="proposal-delist-team" ${delistOpen?'':'disabled'}><option value="">Select your team…</option>${teamOptions('')}</select></div>
-            <div id="proposal-delist-players" class="delist-player-grid"><div class="empty">${delistOpen?'Select your team to load its current roster.':'Delisting submissions are currently disabled.'}</div></div>
-            <div id="proposal-delist-validation" style="margin-top:12px"></div><div class="button-row"><button class="primary-button" id="submit-delist-proposal" disabled>Submit delisting for approval</button></div>
-          </article>
-        </div>
-      </section>
-      <section class="card card-pad" style="margin-top:16px"><div class="section-title"><div><span class="eyebrow">Awaiting decision</span><h2>Pending proposals</h2></div><span class="badge amber">${pending.length} pending</span></div><div class="proposal-list">${proposalCards(pending)}</div></section>
-      <section style="margin-top:24px">${pageHeader('Audit trail','Confirmed Transactions','Only approved moves appear in the official transaction history.')}
-      <div class="transaction-toolbar">${types.map(t=>`<button class="tab-button ${selected===t?'active':''}" data-action="tx-filter" data-type="${esc(t)}">${esc(t)}</button>`).join('')}</div>
-      <div class="card card-pad transaction-table"><div class="transaction-list">${rows.map(transactionItem).join('')}</div></div></section>`;
-
-    const phase=document.getElementById('proposal-phase'),ta=document.getElementById('proposal-team-a'),tb=document.getElementById('proposal-team-b'),tv=document.getElementById('proposal-trade-validation'),submitTrade=document.getElementById('submit-trade-proposal'),ownerNote=document.getElementById('proposal-pick-owner-note');
-    const sidePlayers=side=>[1,2,3].map(i=>document.getElementById(`proposal-player-${side}-${i}`)?.value||'').filter(Boolean);
-    const sidePicks=side=>[1,2,3].map(i=>document.getElementById(`proposal-pick-${side}-${i}`)?.value||'').filter(Boolean);
-    const tradeAction=()=>{const a=ta?.value||'',b=tb?.value||'',moves=[];sidePlayers('a').forEach(player=>moves.push({player,from:a,to:b}));sidePlayers('b').forEach(player=>moves.push({player,from:b,to:a}));return {type:'Trade',status:'CONFIRMED',teamA:a,teamB:b,moves};};
-    const validateTrade=()=>{
-      if(!tradeOpen){if(tv)tv.innerHTML='<div class="notice danger">Trading is closed by the Commissioner.</div>';if(submitTrade)submitTrade.disabled=true;return false;}
-      const a=ta.value,b=tb.value,type=phase.value,pa=sidePlayers('a'),pb=sidePlayers('b'),pka=sidePicks('a'),pkb=sidePicks('b');
-      if(!a){tv.innerHTML='<div class="notice">Select your team first.</div>';submitTrade.disabled=true;return false;}
-      if(!b){tv.innerHTML='<div class="notice">Select a trade partner.</div>';submitTrade.disabled=true;return false;}
-      const duplicatePlayers=new Set([...pa,...pb]).size!==pa.length+pb.length,duplicatePicks=new Set([...pka,...pkb]).size!==pka.length+pkb.length;
-      const assetsA=pa.length+pka.length,assetsB=pb.length+pkb.length,ownA=picksOwnedBy(a,pka,type),ownB=picksOwnedBy(b,pkb,type);
-      const rosters=effectiveRosters(tradeAction()),legal=rosterIsLegal(rosters[a]||[])&&rosterIsLegal(rosters[b]||[]);
-      const ok=a!==b&&!duplicatePlayers&&!duplicatePicks&&assetsA>0&&assetsB>0&&ownA&&ownB&&legal;
-      tv.innerHTML=capReadout(a,rosters)+capReadout(b,rosters)+(duplicatePlayers?'<div class="notice danger">A player cannot appear twice in the same trade.</div>':'')+(duplicatePicks?'<div class="notice danger">A draft pick cannot appear twice in the same trade.</div>':'')+(assetsA===0||assetsB===0?'<div class="notice danger">Each team must send at least one player or draft pick.</div>':'')+(!ownA||!ownB?'<div class="notice danger">One of the selected draft picks is no longer owned by the team offering it.</div>':'')+(!legal?'<div class="notice danger">This proposal would leave at least one roster outside the league rules.</div>':'');
-      submitTrade.disabled=!ok; return ok;
-    };
-    const bindTradeAssets=()=>{document.querySelectorAll('.proposal-player,.proposal-pick').forEach(x=>{x.addEventListener('change',validateTrade);});};
-    const renderTradeAssets=()=>{
-      if(!tradeOpen)return;
-      const a=ta.value,b=tb.value,type=phase.value;
-      document.getElementById('proposal-side-a-title').textContent=a?team(a).name+' sends':'Your team sends';
-      document.getElementById('proposal-side-b-title').textContent=b?team(b).name+' sends':'Trade partner sends';
-      document.getElementById('proposal-side-a-players').innerHTML=playerSlots('a',a); document.getElementById('proposal-side-a-picks').innerHTML=pickSlots('a',a,type);
-      document.getElementById('proposal-side-b-players').innerHTML=playerSlots('b',b); document.getElementById('proposal-side-b-picks').innerHTML=pickSlots('b',b,type);
-      if(a){const own=ownedDraftPicks(a,type);ownerNote.innerHTML=`<strong>${esc(team(a).owner)}</strong> currently owns ${own.length?own.map(p=>'Pick '+p.pick).join(', '):'no available '+esc(type)+' picks'}${a==='CAMA'&&type==='Pre-Season'?'. Based on the 2026 final ladder, Game of Sloanes starts with Pick 2, Pick 14, Pick 26, Pick 38 and Pick 50.':''}`;}else ownerNote.textContent='';
-      bindTradeAssets(); validateTrade();
-    };
-    const refreshPartner=()=>{
-      if(!tradeOpen)return;
-      const a=ta.value,current=tb.value; tb.innerHTML='<option value="">Select trade partner…</option>'+D.teams.filter(t=>t.key!==a).map(t=>`<option value="${t.key}" ${t.key===current?'selected':''}>${esc(t.name)} (${esc(t.owner)})</option>`).join(''); tb.disabled=!a; if(current===a)tb.value=''; renderTradeAssets();
-    };
-    if(tradeOpen){ta.addEventListener('change',refreshPartner);tb.addEventListener('change',renderTradeAssets);refreshPartner();}
-    submitTrade?.addEventListener('click',async()=>{if(!proposalWindowOpen('TRADE',phase.value)){toast('The Commissioner has closed trading.');renderTransactions();return;}if(!validateTrade()){toast('Fix the trade proposal before submitting.');return;}const a=ta.value,b=tb.value,assetsA={players:sidePlayers('a'),picks:sidePicks('a')},assetsB={players:sidePlayers('b'),picks:sidePicks('b')};try{await submitProposal({type:'TRADE',phase:phase.value,proposerTeam:a,counterpartyTeam:b,payload:{assetsA,assetsB}});toast('Trade submitted to the Commissioner.');renderTransactions();}catch(e){toast(e.message||'Could not submit the trade.');}});
-
-    const st=document.getElementById('proposal-swap-team'),si=document.getElementById('proposal-swap-in'),so=document.getElementById('proposal-swap-out'),sv=document.getElementById('proposal-swap-validation'),submitSwap=document.getElementById('submit-swap-proposal');
-    const usedCount=k=>D.transactions.filter(x=>x.type==='Rookie swap'&&x.team===k).length+getCommissionerActions().filter(x=>x.type==='Rookie swap'&&x.team===k&&x.status==='CONFIRMED').length;
-    const validateSwap=()=>{if(!st.value){submitSwap.disabled=true;return false;}const action={type:'Rookie swap',status:'CONFIRMED',team:st.value,playerIn:si.value,playerOut:so.value};const rosters=effectiveRosters(action),ok=Boolean(si.value&&so.value)&&usedCount(st.value)<D.rules.maxSwaps&&rosterIsLegal(rosters[st.value]||[]);sv.innerHTML=capReadout(st.value,rosters)+`<div class="notice"><strong>Season swaps:</strong> ${usedCount(st.value)} / ${D.rules.maxSwaps} already confirmed.</div>`+(!ok?'<div class="notice danger">Select both players and make sure all roster rules pass.</div>':'');submitSwap.disabled=!ok;return ok;};
-    const refreshSwap=()=>{const k=st.value;if(!k){si.disabled=true;so.disabled=true;si.innerHTML=so.innerHTML='<option value="">Select team first</option>';sv.innerHTML='<div class="notice">Select your team to load eligible swap players.</div>';submitSwap.disabled=true;return;}si.disabled=false;so.disabled=false;si.innerHTML=playerOptions(k,'Interchange','Select interchange player');so.innerHTML=playerOptions(k,'Field','Select field player');validateSwap();};st.addEventListener('change',refreshSwap);si.addEventListener('change',validateSwap);so.addEventListener('change',validateSwap);refreshSwap();
-    submitSwap.addEventListener('click',async()=>{if(!validateSwap()){toast('That swap cannot be submitted.');return;}try{await submitProposal({type:'SWAP',phase:'In-Season',proposerTeam:st.value,payload:{playerIn:si.value,playerOut:so.value}});toast('Swap submitted to the Commissioner.');renderTransactions();}catch(e){toast(e.message||'Could not submit the swap.');}});
-
-    const dt=document.getElementById('proposal-delist-team'),dp=document.getElementById('proposal-delist-players'),dv=document.getElementById('proposal-delist-validation'),submitDelist=document.getElementById('submit-delist-proposal');
-    const pendingDelistedPlayers=k=>new Set(proposalCache.filter(p=>p.status==='PENDING'&&p.type==='DELIST'&&p.proposerTeam===k).flatMap(p=>p.payload?.players||[]));
-    const selectedDelists=()=>[...document.querySelectorAll('.proposal-delist-player:checked')].map(x=>x.value);
-    const validateDelist=()=>{
-      if(!delistOpen||!dt?.value){if(submitDelist)submitDelist.disabled=true;return false;}
-      const chosen=selectedDelists(),roster=effectiveRosters()[dt.value]||[],owned=new Set(roster.map(p=>p.player)),ok=chosen.length>0&&chosen.every(x=>owned.has(x));
-      if(dv)dv.innerHTML=chosen.length?`<div class="notice"><strong>${chosen.length} player${chosen.length===1?'':'s'} selected.</strong> If approved, they are immediately removed from ${esc(team(dt.value).name)} and its salary-cap totals.</div>`:'<div class="notice">Select at least one player to delist.</div>';
-      submitDelist.disabled=!ok;return ok;
-    };
-    const refreshDelists=()=>{
-      if(!delistOpen||!dt?.value){if(dp)dp.innerHTML=`<div class="empty">${delistOpen?'Select your team to load its current roster.':'Delisting submissions are currently disabled.'}</div>`;if(submitDelist)submitDelist.disabled=true;return;}
-      const pendingNames=pendingDelistedPlayers(dt.value),roster=(effectiveRosters()[dt.value]||[]).slice().sort((a,b)=>String(a.position).localeCompare(String(b.position))||String(a.player).localeCompare(String(b.player)));
-      dp.innerHTML=roster.map(p=>`<label class="delist-check ${pendingNames.has(p.player)?'pending':''}"><input type="checkbox" class="proposal-delist-player" value="${esc(p.player)}" ${pendingNames.has(p.player)?'disabled':''}><span><strong>${esc(p.player)}</strong><small>${esc(p.position)} · ${esc(p.contract)} · ${esc(p.status)} · ${money(p.salary)}${pendingNames.has(p.player)?' · already pending':''}</small></span></label>`).join('')||'<div class="empty">No players on this roster.</div>';
-      document.querySelectorAll('.proposal-delist-player').forEach(x=>x.addEventListener('change',validateDelist));validateDelist();
-    };
-    if(delistOpen)dt?.addEventListener('change',refreshDelists);refreshDelists();
-    submitDelist?.addEventListener('click',async()=>{if(!proposalWindowOpen('DELIST',delistPhase)){toast('The Commissioner has closed delisting.');renderTransactions();return;}if(!validateDelist()){toast('Select at least one current player to delist.');return;}const players=selectedDelists();try{await submitProposal({type:'DELIST',phase:delistPhase,proposerTeam:dt.value,payload:{players}});toast(`${players.length} delisting request${players.length===1?'':'s'} submitted to the Commissioner.`);renderTransactions();}catch(e){toast(e.message||'Could not submit the delisting request.');}});
+    const allTx=[...adminTx,...D.transactions].sort((a,b)=>String(b.timestamp||'').localeCompare(String(a.timestamp||''))),types=['All',...new Set(allTx.map(x=>x.type))],selected=(new URLSearchParams(location.hash.split('?')[1]||'')).get('type')||'All',rows=allTx.filter(x=>selected==='All'||x.type===selected).slice(0,250);
+    const windows=getProposalWindows(),tradeOpen=Boolean(windows.trade.open),delistOpen=Boolean(windows.delist.open),tradePhase=windows.trade.phase||'Pre-Season',delistPhase=windows.delist.phase||'Pre-Season',myTeam=loggedTeamKey(),logged=teamLoggedIn();
+    const tradeStatus=tradeOpen?`<span class="badge green">OPEN · ${esc(tradePhase)}</span>`:'<span class="badge red">CLOSED</span>',delistStatus=delistOpen?`<span class="badge green">OPEN · ${esc(delistPhase)}</span>`:'<span class="badge red">CLOSED</span>';
+    const pendingMine=logged?proposalCache.filter(p=>activeProposalStatus(p.status)&&(p.proposerTeam===myTeam||p.counterpartyTeam===myTeam)&&p.type!=='DRAFT_PICK'):[],incoming=logged?incomingTradeRequests():[];
+    const playerSlots=(side,key='')=>[1,2,3].map(i=>`<div class="field-group"><label>Player ${i} (optional)</label><select class="select proposal-player" id="proposal-player-${side}-${i}" data-side="${side}" ${key&&tradeOpen?'':'disabled'}>${playerOptions(key,null,'No player')}</select></div>`).join('');
+    const pickSlots=(side,key='',phase=tradePhase)=>[1,2,3].map(i=>`<div class="field-group"><label>Draft pick ${i} (optional)</label><select class="select proposal-pick" id="proposal-pick-${side}-${i}" data-side="${side}" ${key&&tradeOpen?'':'disabled'}>${pickOptions(key,phase,'No pick')}</select></div>`).join('');
+    const incomingCards=incoming.map(p=>{const x=p.payload||{},a=x.assetsA||{players:[],picks:[]},b=x.assetsB||{players:[],picks:[]},after=effectiveRosters(tradeActionFor(p.proposerTeam,p.counterpartyTeam,a,b)),legalNow=rosterIsLegal(after[p.proposerTeam]||[])&&rosterIsLegal(after[p.counterpartyTeam]||[]);return `<article class="proposal-card incoming-trade-card"><div class="proposal-card-head"><div>${teamIdentity(p.proposerTeam,'sm')}<span class="badge ${legalNow?'amber':'red'}">${legalNow?'YOUR DECISION':'NOW BLOCKED'}</span></div><time>${fmtDate(p.createdAt)}</time></div><strong>Trade request from ${esc(team(p.proposerTeam).owner)}</strong><p>${esc(proposalSummary(p))}</p>${tradeImpactHtml(p.proposerTeam,p.counterpartyTeam,a,b)}${legalNow?'':`<div class="notice danger"><strong>This trade cannot currently be accepted.</strong> One or both franchises would breach a salary, list or Field-position rule.</div>`}<div class="button-row"><button class="primary-button" data-trade-accept="${esc(p.id)}" ${legalNow?'':'disabled'}>${legalNow?'Accept & send to Commissioner':'Cannot accept'}</button><button class="secondary-button" data-trade-decline="${esc(p.id)}">Decline</button></div></article>`;}).join('');
+    const teamTools=logged?`<section class="team-moves-banner card card-pad"><div>${teamIdentity(myTeam,'sm')}<div><span class="eyebrow">Signed in as coach</span><h2>${esc(team(myTeam).owner)}</h2><p>Every form below is locked to ${esc(team(myTeam).name)}.</p></div></div><button class="secondary-button" id="moves-team-logout">Log out</button></section>
+      ${incoming.length?`<section class="card card-pad incoming-trades"><div class="section-title"><div><span class="eyebrow">Action required</span><h2>Trade requests</h2></div><span class="badge amber">${incoming.length}</span></div><div class="proposal-list">${incomingCards}</div></section>`:''}
+      <section class="proposal-grid"><article class="card card-pad"><div class="section-title"><div><span class="eyebrow">${esc(team(myTeam).owner)} proposes</span><h2>Trade proposal</h2></div>${tradeStatus}</div>
+      ${tradeOpen?`<div class="notice"><strong>${esc(tradePhase)} trading is open.</strong> PEGS checks both franchises before allowing submission. The other coach must accept before the Commissioner sees it.</div>`:`<div class="notice danger"><strong>Trading is closed.</strong></div>`}<input type="hidden" id="proposal-phase" value="${esc(tradePhase)}"><input type="hidden" id="proposal-team-a" value="${esc(myTeam)}">
+      <div class="form-grid" style="margin-top:14px"><div class="field-group"><label>Your team</label><input class="search-input" value="${esc(team(myTeam).name)} (${esc(team(myTeam).owner)})" disabled></div><div class="field-group"><label for="proposal-team-b">Trade partner</label><select class="select" id="proposal-team-b" ${tradeOpen?'':'disabled'}><option value="">Select trade partner…</option>${D.teams.filter(t=>t.key!==myTeam).map(t=>`<option value="${t.key}">${esc(t.name)} (${esc(t.owner)})</option>`).join('')}</select></div><div id="proposal-pick-owner-note" class="field-help"></div></div>
+      <div class="trade-sides"><div class="trade-side"><h3 id="proposal-side-a-title">${esc(team(myTeam).name)} sends</h3><div id="proposal-side-a-players">${playerSlots('a',myTeam)}</div><div id="proposal-side-a-picks">${pickSlots('a',myTeam)}</div></div><div class="trade-arrow">⇄</div><div class="trade-side"><h3 id="proposal-side-b-title">Trade partner sends</h3><div id="proposal-side-b-players">${playerSlots('b')}</div><div id="proposal-side-b-picks">${pickSlots('b')}</div></div></div>
+      <div id="proposal-trade-validation" style="margin-top:14px"><div class="notice">Choose a trade partner and assets. PEGS will show both teams' before/after salary, list and field-position impact.</div></div><div class="button-row"><button class="primary-button" id="submit-trade-proposal" disabled>Send trade request</button></div></article>
+      <div class="proposal-side-stack"><article class="card card-pad"><div class="section-title"><div><span class="eyebrow">My team</span><h2>Field / Rookie swap</h2></div><span class="badge neutral">Commissioner approval</span></div><p class="muted-copy">Move one Interchange player onto the Field and one Field player to Interchange. Contracts and salaries stay unchanged.</p><input type="hidden" id="proposal-swap-team" value="${esc(myTeam)}"><div class="form-grid"><div class="field-group"><label>Interchange → Field</label><select class="select" id="proposal-swap-in">${playerOptions(myTeam,'Interchange','Select interchange player')}</select></div><div class="field-group"><label>Field → Interchange</label><select class="select" id="proposal-swap-out">${playerOptions(myTeam,'Field','Select field player')}</select></div></div><div id="proposal-swap-validation" style="margin-top:14px"></div><div class="button-row"><button class="primary-button" id="submit-swap-proposal" disabled>Submit my swap</button></div></article>
+      <article class="card card-pad"><div class="section-title"><div><span class="eyebrow">My team</span><h2>Delisting request</h2></div>${delistStatus}</div>${delistOpen?`<div class="notice"><strong>${esc(delistPhase)} delisting is open.</strong> Choose one or more players from your roster.</div>`:`<div class="notice danger"><strong>Delisting is closed.</strong></div>`}<input type="hidden" id="proposal-delist-team" value="${esc(myTeam)}"><div id="proposal-delist-players" class="delist-player-grid"></div><div id="proposal-delist-validation" style="margin-top:12px"></div><div class="button-row"><button class="primary-button" id="submit-delist-proposal" disabled>Submit my delisting</button></div></article></div></section>
+      <section class="card card-pad" style="margin-top:16px"><div class="section-title"><div><span class="eyebrow">My requests</span><h2>Pending team actions</h2></div><span class="badge amber">${pendingMine.length}</span></div><div class="proposal-list">${proposalCards(pendingMine)}</div></section>`:`<section class="card card-pad team-login-required"><div class="section-title"><div><span class="eyebrow">Franchise controls</span><h2>Team Login required</h2></div><button class="primary-button" id="moves-open-team-login">Team Login</button></div><p>League moves remain publicly visible, but only the authenticated coach can propose trades, swaps, delistings or submit draft picks for their franchise.</p></section>`;
+    main.innerHTML=`${pageHeader('League moves','Moves & Trades','Team accounts control submissions. A trade must be legal for both teams, accepted by the other coach, then approved by the Commissioner.')}
+      <section class="move-window-strip"><div><span>Trading</span>${tradeStatus}</div><div><span>Draft</span><span class="badge ${getDraftState().active?'green':'red'}">${getDraftState().active?'OPEN · '+esc(getDraftState().type||'Draft'):'CLOSED'}</span></div><div><span>Delisting</span>${delistStatus}</div></section>${teamTools}
+      <section style="margin-top:24px">${pageHeader('Audit trail','Confirmed Transactions','Only fully approved moves appear in the official transaction history.')}<div class="transaction-toolbar">${types.map(t=>`<button class="tab-button ${selected===t?'active':''}" data-action="tx-filter" data-type="${esc(t)}">${esc(t)}</button>`).join('')}</div><div class="card card-pad transaction-table"><div class="transaction-list">${rows.map(transactionItem).join('')}</div></div></section>`;
+    document.getElementById('moves-open-team-login')?.addEventListener('click',()=>{void teamLoginUI();teamDialog.showModal();});document.getElementById('moves-team-logout')?.addEventListener('click',()=>{teamCredentialCache=[];clearBackendSession();proposalCache=[];void syncProposals().then(()=>renderTransactions());toast('Team logged out.');});
+    document.querySelectorAll('[data-trade-accept]').forEach(btn=>btn.addEventListener('click',async()=>{try{await respondTrade(btn.dataset.tradeAccept,true);toast('Trade accepted and sent to the Commissioner.');renderTransactions();}catch(e){toast(e.message||'Trade could not be accepted.');}}));
+    document.querySelectorAll('[data-trade-decline]').forEach(btn=>btn.addEventListener('click',async()=>{try{await respondTrade(btn.dataset.tradeDecline,false);toast('Trade declined.');renderTransactions();}catch(e){toast(e.message||'Trade could not be declined.');}}));
+    if(!logged)return;
+    const phase=document.getElementById('proposal-phase'),ta={value:myTeam},tb=document.getElementById('proposal-team-b'),tv=document.getElementById('proposal-trade-validation'),submitTrade=document.getElementById('submit-trade-proposal'),ownerNote=document.getElementById('proposal-pick-owner-note');
+    const sidePlayers=side=>[1,2,3].map(i=>document.getElementById(`proposal-player-${side}-${i}`)?.value||'').filter(Boolean),sidePicks=side=>[1,2,3].map(i=>document.getElementById(`proposal-pick-${side}-${i}`)?.value||'').filter(Boolean);
+    const tradeValidation=()=>{if(!tradeOpen){tv.innerHTML='<div class="notice danger">Trading is closed.</div>';submitTrade.disabled=true;return false;}const a=myTeam,b=tb.value,type=phase.value,pa=sidePlayers('a'),pb=sidePlayers('b'),pka=sidePicks('a'),pkb=sidePicks('b');if(!b){tv.innerHTML='<div class="notice">Choose a trade partner to calculate impact.</div>';submitTrade.disabled=true;return false;}const duplicate=pa.length!==new Set(pa).size||pb.length!==new Set(pb).size||pka.length!==new Set(pka).size||pkb.length!==new Set(pkb).size,assetsA={players:pa,picks:pka},assetsB={players:pb,picks:pkb},action=tradeActionFor(a,b,assetsA,assetsB),after=effectiveRosters(action),legalA=rosterIsLegal(after[a]||[]),legalB=rosterIsLegal(after[b]||[]),ownA=picksOwnedBy(a,pka,type),ownB=picksOwnedBy(b,pkb,type),hasEach=(pa.length+pka.length)>0&&(pb.length+pkb.length)>0,ok=!duplicate&&hasEach&&ownA&&ownB&&legalA&&legalB;
+      tv.innerHTML=`<div class="trade-impact-intro"><strong>Trade impact before submission</strong><span>Both teams must remain within every salary, list and Field-position cap.</span></div>${tradeImpactHtml(a,b,assetsA,assetsB)}${duplicate?'<div class="notice danger">The same asset cannot be selected twice.</div>':''}${!hasEach?'<div class="notice danger">Each team must send at least one player or draft pick.</div>':''}${!ownA||!ownB?'<div class="notice danger">A selected draft pick is no longer owned by the offering team.</div>':''}${!legalA?`<div class="notice danger"><strong>${esc(team(a).name)} cannot accommodate this trade.</strong> Adjust assets until every rule is green.</div>`:''}${!legalB?`<div class="notice danger"><strong>${esc(team(b).name)} cannot accommodate this trade.</strong> The receiving coach could not legally accept this trade.</div>`:''}`;submitTrade.disabled=!ok;submitTrade.textContent=ok?`Send request to ${team(b).owner}`:'Trade blocked';return ok;};
+    const bindTradeAssets=()=>document.querySelectorAll('.proposal-player,.proposal-pick').forEach(x=>x.addEventListener('change',tradeValidation));
+    const renderPartnerAssets=()=>{const b=tb.value,type=phase.value;document.getElementById('proposal-side-b-title').textContent=b?team(b).name+' sends':'Trade partner sends';document.getElementById('proposal-side-b-players').innerHTML=playerSlots('b',b);document.getElementById('proposal-side-b-picks').innerHTML=pickSlots('b',b,type);ownerNote.innerHTML=`<strong>${esc(team(myTeam).owner)}</strong> owns ${ownedDraftPicks(myTeam,type).map(p=>'Pick '+p.pick).join(', ')||'no available '+esc(type)+' picks'}.`;bindTradeAssets();tradeValidation();};
+    tb?.addEventListener('change',renderPartnerAssets);bindTradeAssets();tradeValidation();
+    submitTrade?.addEventListener('click',async()=>{if(!tradeValidation()){toast('Fix the blocked trade before submitting.');return;}const b=tb.value,assetsA={players:sidePlayers('a'),picks:sidePicks('a')},assetsB={players:sidePlayers('b'),picks:sidePicks('b')};try{await submitProposal({type:'TRADE',phase:phase.value,proposerTeam:myTeam,counterpartyTeam:b,payload:{assetsA,assetsB}});toast(`Trade request sent to ${team(b).owner}.`);renderTransactions();}catch(e){toast(e.message||'Could not submit the trade.');}});
+    const st=document.getElementById('proposal-swap-team'),si=document.getElementById('proposal-swap-in'),so=document.getElementById('proposal-swap-out'),sv=document.getElementById('proposal-swap-validation'),submitSwap=document.getElementById('submit-swap-proposal'),usedCount=k=>D.transactions.filter(x=>x.type==='Rookie swap'&&x.team===k).length+getCommissionerActions().filter(x=>x.type==='Rookie swap'&&x.team===k&&x.status==='CONFIRMED').length;
+    const validateSwap=()=>{const action={type:'Rookie swap',status:'CONFIRMED',team:myTeam,playerIn:si.value,playerOut:so.value},after=effectiveRosters(action),ok=Boolean(si.value&&so.value)&&usedCount(myTeam)<D.rules.maxSwaps&&rosterIsLegal(after[myTeam]||[]);sv.innerHTML=capReadout(myTeam,after)+`<div class="notice"><strong>Season swaps:</strong> ${usedCount(myTeam)} / ${D.rules.maxSwaps} already confirmed.</div>`+(!ok?'<div class="notice danger">Select both players and make sure all roster rules pass.</div>':'');submitSwap.disabled=!ok;return ok;};si?.addEventListener('change',validateSwap);so?.addEventListener('change',validateSwap);validateSwap();submitSwap?.addEventListener('click',async()=>{if(!validateSwap())return;try{await submitProposal({type:'SWAP',phase:'In-Season',proposerTeam:myTeam,payload:{playerIn:si.value,playerOut:so.value}});toast('Swap sent to the Commissioner.');renderTransactions();}catch(e){toast(e.message||'Could not submit the swap.');}});
+    const dp=document.getElementById('proposal-delist-players'),dv=document.getElementById('proposal-delist-validation'),submitDelist=document.getElementById('submit-delist-proposal'),pendingNames=new Set(proposalCache.filter(p=>activeProposalStatus(p.status)&&p.type==='DELIST'&&p.proposerTeam===myTeam).flatMap(p=>p.payload?.players||[]));
+    const roster=(effectiveRosters()[myTeam]||[]).slice().sort((a,b)=>String(a.position).localeCompare(String(b.position))||String(a.player).localeCompare(String(b.player)));dp.innerHTML=delistOpen?(roster.map(p=>`<label class="delist-check ${pendingNames.has(p.player)?'pending':''}"><input type="checkbox" class="proposal-delist-player" value="${esc(p.player)}" ${pendingNames.has(p.player)?'disabled':''}><span><strong>${esc(p.player)}</strong><small>${esc(p.position)} · ${esc(p.contract)} · ${esc(p.status)} · ${money(p.salary)}${pendingNames.has(p.player)?' · already pending':''}</small></span></label>`).join('')||'<div class="empty">No players on this roster.</div>'):'<div class="empty">Delisting is closed.</div>';
+    const selectedDelists=()=>[...document.querySelectorAll('.proposal-delist-player:checked')].map(x=>x.value),validateDelist=()=>{const chosen=selectedDelists(),owned=new Set(roster.map(p=>p.player)),ok=delistOpen&&chosen.length>0&&chosen.every(x=>owned.has(x));dv.innerHTML=chosen.length?`<div class="notice"><strong>${chosen.length} player${chosen.length===1?'':'s'} selected.</strong> If approved, they are removed from ${esc(team(myTeam).name)}.</div>`:'<div class="notice">Select at least one player.</div>';submitDelist.disabled=!ok;return ok;};document.querySelectorAll('.proposal-delist-player').forEach(x=>x.addEventListener('change',validateDelist));validateDelist();submitDelist?.addEventListener('click',async()=>{if(!validateDelist())return;const players=selectedDelists();try{await submitProposal({type:'DELIST',phase:delistPhase,proposerTeam:myTeam,payload:{players}});toast('Delisting request sent to the Commissioner.');renderTransactions();}catch(e){toast(e.message||'Could not submit delisting.');}});
   }
+
   function renderHistory() {
     const current=D.honours.find(h=>h.year===2026) || D.honours[D.honours.length-1];
     const history=[...D.honours].sort((a,b)=>b.year-a.year);
@@ -1218,8 +1314,8 @@
 
   async function commissionerUI() {
     if (backendConfigured() && !commissionerLoggedIn()) {
-      commissionerContent.innerHTML=`<div class="commissioner-body commissioner-login"><div class="commissioner-lock">C</div><span class="eyebrow">Private administration</span><h3>Commissioner login</h3><p>The entire league site is public and login-free. This is the only account required.</p><div class="form-grid" style="margin-top:16px"><div class="field-group"><label for="comm-backend-email">Commissioner email</label><input class="search-input" id="comm-backend-email" type="email" autocomplete="username" value="${esc(CONFIG.commissionerEmail||'')}" placeholder="commissioner@example.com"></div><div class="field-group"><label for="comm-backend-password">Password</label><input class="search-input" id="comm-backend-password" type="password" autocomplete="current-password"></div></div><div class="button-row"><button class="primary-button" id="commissioner-backend-login">Login</button></div><div class="notice" style="margin-top:16px"><strong>Free shared mode:</strong> the hosted site uses one Commissioner account. League members never need an account.</div></div>`;
-      const login=async()=>{try{await backendLogin(document.getElementById('comm-backend-email').value,document.getElementById('comm-backend-password').value);await pullSharedState();await syncProposals();toast('Commissioner logged in.');renderCommissionerControls();render();}catch(e){toast(e.message||'Login failed.');}};
+      commissionerContent.innerHTML=`<div class="commissioner-body commissioner-login"><div class="commissioner-lock">C</div><span class="eyebrow">Private administration</span><h3>Commissioner login</h3><p>Public browsing remains open. Commissioner authentication controls league administration and team-account management.</p><div class="form-grid" style="margin-top:16px"><div class="field-group"><label for="comm-backend-email">Commissioner email</label><input class="search-input" id="comm-backend-email" type="email" autocomplete="username" value="${esc(CONFIG.commissionerEmail||'')}" placeholder="commissioner@example.com"></div><div class="field-group"><label for="comm-backend-password">Password</label><input class="search-input" id="comm-backend-password" type="password" autocomplete="current-password"></div></div><div class="button-row"><button class="primary-button" id="commissioner-backend-login">Login</button></div><div class="notice" style="margin-top:16px"><strong>Team accounts:</strong> coaches use separate franchise logins; this Commissioner account retains final approval and administration.</div></div>`;
+      const login=async()=>{try{await backendLogin(document.getElementById('comm-backend-email').value,document.getElementById('comm-backend-password').value,'commissioner');await pullSharedState();await syncProposals();await loadDraftPool();await syncServerAuthority();toast('Commissioner logged in.');renderCommissionerControls();render();}catch(e){toast(e.message||'Login failed.');}};
       document.getElementById('commissioner-backend-login').addEventListener('click',login);
       document.getElementById('comm-backend-password').addEventListener('keydown',e=>{if(e.key==='Enter') login();});
       return;
@@ -1243,9 +1339,10 @@
   }
 
   function commissionerTabs(){
-    const tabs=[['scores','Scores & live'],['season','Season setup'],['finals','Finals'],['windows','League windows'],['approvals','Approvals'],['draft','Draft control'],['figureheads','Figureheads'],['data','Data']];
+    const tabs=[['scores','Scores & live'],['season','Season setup'],['finals','Finals'],['windows','League windows'],['approvals','Approvals'],['draft','Draft control'],['accounts','Team accounts'],['figureheads','Figureheads'],['backups','Backups'],['data','Legacy data']];
     return `<div class="admin-tabs">${tabs.map(([id,label])=>`<button class="tab-button ${commissionerTab===id?'active':''}" data-admin-tab="${id}">${label}</button>`).join('')}<button class="tab-button admin-logout" id="commissioner-logout">Log out</button></div>`;
   }
+
   function teamOptions(selected=''){return D.teams.map(t=>`<option value="${t.key}" ${t.key===selected?'selected':''}>${esc(t.name)} (${esc(t.owner)})</option>`).join('');}
   function playerOptions(teamKey,status=null,blank='No player'){const rows=(effectiveRosters()[teamKey]||[]).filter(p=>!status||p.status===status);return `<option value="">${blank}</option>`+rows.sort((a,b)=>a.player.localeCompare(b.player)).map(p=>`<option value="${esc(p.player)}">${esc(p.player)} · ${esc(p.position)} · ${money(p.salary)}</option>`).join('');}
   function capReadout(teamKey,rosters=effectiveRosters()){
@@ -1312,7 +1409,7 @@
   }
   function pendingPickRefs(teamKey,type){
     type=normalizedDraftType(type); const refs=new Set();
-    for(const p of proposalCache.filter(x=>x.status==='PENDING'&&x.type==='TRADE'&&normalizedDraftType(x.phase)===type)){
+    for(const p of proposalCache.filter(x=>activeProposalStatus(x.status)&&x.type==='TRADE'&&normalizedDraftType(x.phase)===type)){
       const assets=p.payload||{};
       const side=p.proposerTeam===teamKey?assets.assetsA:p.counterpartyTeam===teamKey?assets.assetsB:null;
       for(const ref of side?.picks||[]) refs.add(decodePickRef(ref,type).id);
@@ -1352,65 +1449,57 @@
   }
   function approvalDetail(p){
     if(p.type==='TRADE'){
-      const x=p.payload||{},a=x.assetsA||{},b=x.assetsB||{},moves=[];
-      (a.players||[]).forEach(player=>moves.push({player,from:p.proposerTeam,to:p.counterpartyTeam}));
-      (b.players||[]).forEach(player=>moves.push({player,from:p.counterpartyTeam,to:p.proposerTeam}));
-      const rosters=effectiveRosters({type:'Trade',status:'CONFIRMED',moves});
-      return capReadout(p.proposerTeam,rosters)+capReadout(p.counterpartyTeam,rosters);
+      const x=p.payload||{},a=x.assetsA||{players:[],picks:[]},b=x.assetsB||{players:[],picks:[]};
+      return `<div class="notice"><strong>Counterparty:</strong> ${p.counterpartyDecidedAt?'Accepted '+fmtDate(p.counterpartyDecidedAt):'Awaiting team acceptance'}</div>${tradeImpactHtml(p.proposerTeam,p.counterpartyTeam,a,b)}`;
     }
     if(p.type==='SWAP'){
-      const x=p.payload||{},action={type:'Rookie swap',status:'CONFIRMED',team:p.proposerTeam,playerIn:x.playerIn,playerOut:x.playerOut},rosters=effectiveRosters(action);
-      return capReadout(p.proposerTeam,rosters);
+      const x=p.payload||{},action={type:'Rookie swap',status:'CONFIRMED',team:p.proposerTeam,playerIn:x.playerIn,playerOut:x.playerOut},rosters=effectiveRosters(action);return capReadout(p.proposerTeam,rosters);
     }
     if(p.type==='DELIST'){
-      const x=p.payload||{},players=x.players||[],action={type:'Delisted',status:'CONFIRMED',team:p.proposerTeam,players},rosters=effectiveRosters(action);
-      return `<div class="notice"><strong>Players to remove:</strong> ${esc(players.join(', '))}</div>`+capReadout(p.proposerTeam,rosters);
+      const x=p.payload||{},players=x.players||[],action={type:'Delisted',status:'CONFIRMED',team:p.proposerTeam,players},rosters=effectiveRosters(action);return `<div class="notice"><strong>Players to remove:</strong> ${esc(players.join(', '))}</div>`+capReadout(p.proposerTeam,rosters);
     }
     if(p.type==='DRAFT_PICK'){
-      const x=p.payload||{},pl=D.playerPool.find(q=>q.player===x.player),checks=validateDraft(p.proposerTeam,pl,x.contract||'Main',x.listStatus||'Field',x.position||'');
-      return checks.map(c=>`<div class="rule-check"><span>${esc(c.label)}</span><span class="${c.pass?'check-pass':'check-fail'}">${c.pass?'PASS':'FAIL'} · ${esc(c.detail)}</span></div>`).join('');
+      const x=p.payload||{},pl={player:x.player,club:x.club||'',position:x.position||'',price:Number(x.salary||0),startPrice:Number(x.salary||0)},checks=validateDraft(p.proposerTeam,pl,x.contract||'Main',x.listStatus||'Field',x.position||'');
+      return `<div class="notice"><strong>Frozen draft salary:</strong> ${money(x.salary||0)} · ${esc(x.position||'')}</div>`+checks.map(c=>`<div class="rule-check"><span>${esc(c.label)}</span><span class="${c.pass?'check-pass':'check-fail'}">${c.pass?'PASS':'FAIL'} · ${esc(c.detail)}</span></div>`).join('');
     }
     return '';
   }
+
   function commissionerProposalCards(items){
     if(!items.length)return '<div class="empty">No proposals awaiting approval.</div>';
-    return items.map(p=>`<article class="proposal-card commissioner-proposal"><div class="proposal-card-head"><div>${teamIdentity(p.proposerTeam,'sm')}<span class="badge amber">PENDING</span></div><time>${fmtDate(p.createdAt)}</time></div><strong>${esc(proposalTypeLabel(p))}${p.phase?' · '+esc(p.phase):''}</strong><p>${esc(proposalSummary(p))}</p>${approvalDetail(p)}<div class="button-row"><button class="primary-button" data-proposal-approve="${esc(p.id)}">Approve</button><button class="secondary-button" data-proposal-reject="${esc(p.id)}">Reject</button></div></article>`).join('');
+    return items.map(p=>`<article class="proposal-card commissioner-proposal"><div class="proposal-card-head"><div>${teamIdentity(p.proposerTeam,'sm')}<span class="badge amber">AWAITING COMMISSIONER</span></div><time>${fmtDate(p.createdAt)}</time></div><strong>${esc(proposalTypeLabel(p))}${p.phase?' · '+esc(p.phase):''}</strong><p>${esc(proposalSummary(p))}</p>${approvalDetail(p)}<div class="button-row"><button class="primary-button" data-proposal-approve="${esc(p.id)}">Approve</button><button class="secondary-button" data-proposal-reject="${esc(p.id)}">Reject</button></div></article>`).join('');
   }
+
   async function approveProposal(id){
-    const p=proposalCache.find(x=>String(x.id)===String(id)); if(!p){toast('Proposal no longer exists.');return;}
+    const p=proposalCache.find(x=>String(x.id)===String(id));if(!p){toast('Proposal no longer exists.');return;}
+    if(String(p.status)!=='AWAITING_COMMISSIONER'){toast('This proposal is not ready for Commissioner approval.');return;}
     let action=null;
     if(p.type==='TRADE'){
+      if(!p.counterpartyDecidedAt){toast('Trade approval blocked until the other coach accepts it.');return;}
       const x=p.payload||{},a=x.assetsA||{players:[],picks:[]},b=x.assetsB||{players:[],picks:[]},moves=[],phase=normalizedDraftType(p.phase);
       (a.players||[]).forEach(player=>moves.push({player,from:p.proposerTeam,to:p.counterpartyTeam}));(b.players||[]).forEach(player=>moves.push({player,from:p.counterpartyTeam,to:p.proposerTeam}));
+      if(backendConfigured()){
+        try{const serverCheck=await backendFetch('/rest/v1/rpc/pegs_validate_trade_payload',{method:'POST',body:JSON.stringify({p_team_a:p.proposerTeam,p_team_b:p.counterpartyTeam,p_phase:p.phase,p_payload:p.payload})});if(!serverCheck?.legal){toast('Trade approval blocked by current server roster rules.');return;}}catch(e){toast(e.message||'Trade validation failed.');return;}
+      }
       const currentRosters=effectiveRosters(),ownsPlayers=(key,names)=>(names||[]).every(name=>(currentRosters[key]||[]).some(r=>r.player===name));
       if(!ownsPlayers(p.proposerTeam,a.players||[])||!ownsPlayers(p.counterpartyTeam,b.players||[])){toast('Trade approval blocked: a player is no longer owned by the team offering them.');return;}
       if(!picksOwnedBy(p.proposerTeam,a.picks||[],phase)||!picksOwnedBy(p.counterpartyTeam,b.picks||[],phase)){toast('Trade approval blocked: a draft pick is no longer owned by the team offering it.');return;}
-      const test={type:'Trade',status:'CONFIRMED',moves},rosters=effectiveRosters(test);
-      if(!rosterIsLegal(rosters[p.proposerTeam]||[])||!rosterIsLegal(rosters[p.counterpartyTeam]||[])){toast('Trade approval blocked by current roster rules.');return;}
-      const fmt=v=>[...(v.players||[]),...(v.picks||[]).map(n=>pickLabel(n,phase))].join(', ')||'No assets';
-      const pickTransfers=[...buildPickTransfers(p.proposerTeam,p.counterpartyTeam,a.picks||[],phase),...buildPickTransfers(p.counterpartyTeam,p.proposerTeam,b.picks||[],phase)];
+      const test={type:'Trade',status:'CONFIRMED',moves},rosters=effectiveRosters(test);if(!rosterIsLegal(rosters[p.proposerTeam]||[])||!rosterIsLegal(rosters[p.counterpartyTeam]||[])){toast('Trade approval blocked by current salary/list/position rules.');return;}
+      const fmt=v=>[...(v.players||[]),...(v.picks||[]).map(n=>pickLabel(n,phase))].join(', ')||'No assets',pickTransfers=[...buildPickTransfers(p.proposerTeam,p.counterpartyTeam,a.picks||[],phase),...buildPickTransfers(p.counterpartyTeam,p.proposerTeam,b.picks||[],phase)];
       action={...test,teamA:p.proposerTeam,teamB:p.counterpartyTeam,phase,timestamp:new Date().toISOString(),picks:{[p.proposerTeam]:a.picks||[],[p.counterpartyTeam]:b.picks||[]},pickTransfers,detail:`${phase}: ${team(p.proposerTeam).owner} sends ${fmt(a)} · ${team(p.counterpartyTeam).owner} sends ${fmt(b)}`};
-    } else if(p.type==='SWAP'){
-      const x=p.payload||{},used=D.transactions.filter(v=>v.type==='Rookie swap'&&v.team===p.proposerTeam).length+getCommissionerActions().filter(v=>v.type==='Rookie swap'&&v.team===p.proposerTeam&&v.status==='CONFIRMED').length;
-      action={type:'Rookie swap',status:'CONFIRMED',team:p.proposerTeam,playerIn:x.playerIn,playerOut:x.playerOut,season:currentSeason(),effectiveFromRound:nextUnfinalizedScoringRound(),timestamp:new Date().toISOString(),detail:`${x.playerIn} → Field; ${x.playerOut} → Interchange`};
-      const rosters=effectiveRosters(action); if(used>=D.rules.maxSwaps||!rosterIsLegal(rosters[p.proposerTeam]||[])){toast('Swap approval blocked by current roster rules or swap limit.');return;}
-    } else if(p.type==='DELIST'){
-      const x=p.payload||{},players=[...new Set((x.players||[]).filter(Boolean))],rows=effectiveRosters()[p.proposerTeam]||[],owned=new Set(rows.map(r=>r.player));
-      if(!players.length||!players.every(name=>owned.has(name))){toast('Delisting approval blocked: one or more players are no longer owned by this team.');return;}
-      action={type:'Delisted',status:'CONFIRMED',team:p.proposerTeam,phase:p.phase||'',players,timestamp:new Date().toISOString(),detail:`${p.phase||'Delisting'}: ${players.join(', ')}`};
-    } else if(p.type==='DRAFT_PICK'){
-      const x=p.payload||{},pl=D.playerPool.find(q=>q.player===x.player),checks=validateDraft(p.proposerTeam,pl,x.contract||'Main',x.listStatus||'Field',x.position||'');
-      if(!pl||!checks.length||!checks.every(c=>c.pass)){toast('Draft pick approval blocked by current roster rules.');return;}
-      action={type:'Drafted',status:'CONFIRMED',phase:p.phase||'Draft',draftSeason:Number(x.draftSeason||getDraftState().season||D.meta.season),sessionId:x.sessionId||'',pick:Number(x.pick||0),team:p.proposerTeam,player:pl.player,position:x.position||String(pl.position||'').split('/')[0],club:pl.club,contract:x.contract||'Main',listStatus:x.listStatus||'Field',salary:Number(pl.startPrice||pl.price||0),timestamp:new Date().toISOString(),detail:`${p.phase||'Draft'} pick ${Number(x.pick||0)}: ${pl.player} (${pl.position}) · ${money(pl.startPrice||pl.price)}`};
+    }else if(p.type==='SWAP'){
+      const x=p.payload||{},used=D.transactions.filter(v=>v.type==='Rookie swap'&&v.team===p.proposerTeam).length+getCommissionerActions().filter(v=>v.type==='Rookie swap'&&v.team===p.proposerTeam&&v.status==='CONFIRMED').length;action={type:'Rookie swap',status:'CONFIRMED',team:p.proposerTeam,playerIn:x.playerIn,playerOut:x.playerOut,season:currentSeason(),effectiveFromRound:nextUnfinalizedScoringRound(),timestamp:new Date().toISOString(),detail:`${x.playerIn} → Field; ${x.playerOut} → Interchange`};const rosters=effectiveRosters(action);if(used>=D.rules.maxSwaps||!rosterIsLegal(rosters[p.proposerTeam]||[])){toast('Swap approval blocked by current roster rules or swap limit.');return;}
+    }else if(p.type==='DELIST'){
+      const x=p.payload||{},players=[...new Set((x.players||[]).filter(Boolean))],rows=effectiveRosters()[p.proposerTeam]||[],owned=new Set(rows.map(r=>r.player));if(!players.length||!players.every(name=>owned.has(name))){toast('Delisting approval blocked: one or more players are no longer owned by this team.');return;}action={type:'Delisted',status:'CONFIRMED',team:p.proposerTeam,phase:p.phase||'',players,timestamp:new Date().toISOString(),detail:`${p.phase||'Delisting'}: ${players.join(', ')}`};
+    }else if(p.type==='DRAFT_PICK'){
+      const x=p.payload||{},pl={player:x.player,club:x.club||'',position:x.position||'',price:Number(x.salary||0),startPrice:Number(x.salary||0)},checks=validateDraft(p.proposerTeam,pl,x.contract||'Main',x.listStatus||'Field',x.position||'');if(!checks.length||!checks.every(c=>c.pass)){toast('Draft pick approval blocked by current roster rules.');return;}action={type:'Drafted',status:'CONFIRMED',phase:p.phase||'Draft',draftSeason:Number(x.draftSeason||getDraftState().season||D.meta.season),sessionId:x.sessionId||'',pick:Number(x.pick||0),team:p.proposerTeam,player:x.player,position:x.position||'',club:x.club||'',contract:x.contract||'Main',listStatus:x.listStatus||'Field',salary:Number(x.salary||0),timestamp:new Date().toISOString(),detail:`${p.phase||'Draft'} pick ${Number(x.pick||0)}: ${x.player} (${x.position||''}) · ${money(x.salary||0)}`};
     }
-    if(!action)return;
-    const all=getCommissionerActions();all.unshift(action);saveCommissionerActions(all);await decideProposal(id,'APPROVED');
-    if(p.type==='DRAFT_PICK'){
-      const state=getDraftState();if(state.active&&Number(state.currentPick||1)===Number(p.payload?.pick||0)&&currentDraftTeam(state)===p.proposerTeam)advanceDraftLocal('APPROVED');
-    }
-    await syncProposals();toast('Proposal approved and applied.');render();renderCommissionerControls();
+    if(!action)return;const all=getCommissionerActions();all.unshift(action);saveCommissionerActions(all);await decideProposal(id,'APPROVED');await syncServerAuthority();await logCommissioner('PROPOSAL_APPROVED','proposal',id,{type:p.type,team:p.proposerTeam,counterparty:p.counterpartyTeam||null});await syncProposals();toast('Proposal approved and applied.');render();renderCommissionerControls();
   }
-  async function rejectProposal(id){await decideProposal(id,'REJECTED');await syncProposals();toast('Proposal rejected.');render();renderCommissionerControls();}
+
+  async function rejectProposal(id){
+    const p=proposalCache.find(x=>String(x.id)===String(id));if(!p||p.status!=='AWAITING_COMMISSIONER'){toast('Proposal is not awaiting Commissioner approval.');return;}await decideProposal(id,'REJECTED');await logCommissioner('PROPOSAL_REJECTED','proposal',id,{type:p.type,team:p.proposerTeam});await syncProposals();toast('Proposal rejected.');render();renderCommissionerControls();
+  }
 
   function liveFeedSummary(){
     const f=getLiveFeed(),players=Object.values(f.players||{}),counts={}; players.forEach(p=>{const k=String(p.status||'TBC').toUpperCase();counts[k]=(counts[k]||0)+1;});
@@ -1460,7 +1549,7 @@
       if(matchedGameCount<expectedGameCount)warnings.push(`Only ${matchedGameCount}/${expectedGameCount} AFL games were retrieved for Round ${round}.`);
       else if(completedGameCount<expectedGameCount)warnings.push(`${completedGameCount}/${expectedGameCount} AFL games are final for Round ${round}.`);
       const feed={season:currentSeason(),round:Number(round),source:'Supercoach.live (split free-tier sync)',updatedAt:new Date().toISOString(),players,games,warnings,expectedGameCount,matchedGameCount,completedGameCount,complete};
-      saveLiveFeed(feed,{share:Boolean(backendToken())});toast(`Live SuperCoach data synced for Round ${feed.round}: ${matchedGameCount}/${expectedGameCount} AFL games.`);render();if(commissionerDialog.open)renderCommissionerControls();
+      saveLiveFeed(feed,{share:commissionerLoggedIn()});toast(`Live SuperCoach data synced for Round ${feed.round}: ${matchedGameCount}/${expectedGameCount} AFL games.`);render();if(commissionerDialog.open)renderCommissionerControls();
     }catch(e){console.warn(e);toast('Live score sync failed. Commissioner overrides remain available.');}
   }
   function captureOpeningRoundBank(){
@@ -1468,17 +1557,19 @@
     const players={}; for(const [key,p] of Object.entries(feed.players||{})){if(p.actual!==null&&p.actual!==undefined&&String(p.gameStatus||'').toUpperCase()==='FT')players[key]={player:p.player,club:p.club,actual:Number(p.actual),source:p.source||feed.source};}
     const all=getOpeningBank(); all[String(currentSeason())]={season:currentSeason(),capturedAt:new Date().toISOString(),players}; saveOpeningBank(all); toast(`${Object.keys(players).length} Opening Round scores banked.`); render(); renderCommissionerControls();
   }
-  function finalizeRound(round,force=false){
-    let setup=activeSeasonSetup(); if(!setup){toast('Activate a season setup first.');return;}
+  async function finalizeRound(round,force=false){
+    let setup=activeSeasonSetup();if(!setup){toast('Activate a season setup first.');return;}
     const feed=getLiveFeed(),expected=Number(feed.expectedGameCount||0),matched=Number(feed.matchedGameCount||feed.games?.length||0),completed=Number(feed.completedGameCount||0);
-    if(!force&&Number(feed.season)===currentSeason()&&Number(feed.round)===Number(round)&&expected>0&&(matched<expected||completed<expected)){
-      toast(`Round ${round} is incomplete: ${matched}/${expected} games retrieved and ${completed}/${expected} final. Sync again or use Finalise anyway.`);return;
-    }
-    const teamScores={},players={}; D.teams.forEach(t=>{const c=calcTeamRound(round,t.key);teamScores[t.key]=c.actual;players[t.key]=c.players.map(p=>({player:p.player,position:p.position,status:'Field',club:p.club,score:p.score,projected:p.liveValue,scoreSource:'Finalised live round',availability:'FT',gameStatus:'FT'}));});
-    const all=getSeasonResults(),season=String(currentSeason()); all[season]=all[season]||{}; all[season][String(round)]={round:Number(round),teamScores,players,finalizedAt:new Date().toISOString(),topPlayers:topPlayersForRound(round),feedGames:{expected,matched,completed,forced:Boolean(force)}}; saveSeasonResults(all);
+    if(!force&&Number(feed.season)===currentSeason()&&Number(feed.round)===Number(round)&&expected>0&&(matched<expected||completed<expected)){toast(`Round ${round} is incomplete: ${matched}/${expected} games retrieved and ${completed}/${expected} final. Sync again or use Finalise anyway.`);return;}
+    const teamScores={},players={};D.teams.forEach(t=>{const c=calcTeamRound(round,t.key);teamScores[t.key]=c.actual;players[t.key]=c.players.map(p=>({player:p.player,position:p.position,status:'Field',club:p.club,score:p.score,projected:p.liveValue,scoreSource:'Finalised live round',availability:'FT',gameStatus:'FT'}));});
+    const all=getSeasonResults(),season=String(currentSeason());all[season]=all[season]||{};all[season][String(round)]={round:Number(round),teamScores,players,finalizedAt:new Date().toISOString(),topPlayers:topPlayersForRound(round),feedGames:{expected,matched,completed,forced:Boolean(force)}};saveSeasonResults(all);
     setup={...setup,completedThroughRound:Math.max(Number(setup.completedThroughRound||0),Number(round)),currentRound:Number(round)+1,updatedAt:new Date().toISOString()};saveSeasonSetup(setup);
-    toast(`${roundLabel(round)} finalised${force?' by Commissioner override':''}.`); render(); renderCommissionerControls();
+    if(backendConfigured()&&commissionerLoggedIn()){
+      try{await Promise.all([pushSharedState('season_results',all),pushSharedState('season_setup',setup)]);await syncServerAuthority();const backupId=await createServerBackup('ROUND_FINALIZED',`${roundLabel(round)} finalised`);await logCommissioner('ROUND_FINALIZED','round',round,{forced:Boolean(force),backupId});toast(`${roundLabel(round)} finalised and backup #${backupId} created.`);}catch(e){console.warn(e);toast(`${roundLabel(round)} finalised, but automatic backup needs attention.`);}
+    }else toast(`${roundLabel(round)} finalised${force?' by Commissioner override':''}.`);
+    render();renderCommissionerControls();
   }
+
   function seasonRoundPreview(setup){
     const rounds=setup.rounds||[]; if(!rounds.length)return '<div class="notice"><strong>No AFL fixture loaded yet.</strong> Retrieve it by season, or paste/upload a fixture manually as a fallback.</div>';
     const byeRounds=rounds.filter(r=>(r.byeClubs||[]).length),rows=rounds.slice(0,Math.max(1,Math.min(30,rounds.length))).map(r=>`<tr><td>${r.round}</td><td><strong>${scoreCountForRoundRecord(r)}</strong></td><td>${(r.byeClubs||[]).join(', ')||'—'}</td><td>${(r.bankClubs||[]).join(', ')||'—'}</td></tr>`).join('');
@@ -1514,10 +1605,10 @@
         <article class="window-admin-card"><div class="section-title"><div><span class="eyebrow">Drafting</span><h3>Draft window</h3></div><span class="badge ${draft.active?'green':'red'}">${draft.active?'OPEN':'CLOSED'}</span></div><p class="muted-copy">Drafting is opened by starting a Pre-Season or Mid-Season Draft in Draft Control. When live, only the franchise on the clock can submit the current pick. Each pick gets 3:00; expiry creates OVERTIME but does not automatically skip anyone. The Commissioner may push an overdue pick back one slot.</p><div class="notice"><strong>${draft.active?'Live now':'Currently closed'}:</strong> ${draft.active?`${esc(draft.type||'Draft')} · Pick ${Number(draft.currentPick||1)} · ${esc(team(currentDraftTeam(draft)).name)}`:'Use Draft Control to open drafting.'}</div><div class="button-row"><button class="secondary-button" id="go-draft-control">Open Draft Control</button></div></article>
       </div><div class="notice" style="margin-top:14px"><strong>Field / Rookie swaps:</strong> these remain available for teams to propose at any time, but every swap still requires Commissioner approval and must pass the swap-limit/roster checks.</div>`;
     } else if(commissionerTab==='approvals'){
-      const pending=proposalCache.filter(p=>p.status==='PENDING'&&p.type!=='DRAFT_PICK');
+      const pending=proposalCache.filter(p=>p.status==='AWAITING_COMMISSIONER'&&p.type!=='DRAFT_PICK');
       panel=`<div class="notice"><strong>Approval inbox:</strong> team proposals do not change any roster until you approve them. All rules are re-checked against the current roster at approval time.</div><div class="proposal-list" style="margin-top:14px">${commissionerProposalCards(pending)}</div>`;
     } else if(commissionerTab==='draft'){
-      const pending=proposalCache.filter(p=>p.status==='PENDING'&&p.type==='DRAFT_PICK');
+      const pending=proposalCache.filter(p=>p.status==='AWAITING_COMMISSIONER'&&p.type==='DRAFT_PICK');
       const current=currentDraftTeam(ds),defaultType=normalizedDraftType(ds.type||'Pre-Season');
       const liveRec=Array.isArray(ds.picks)?ds.picks.find(p=>Number(p.pick)===Number(ds.currentPick||1)):null;
       const nextKey=nextDraftTeam(ds),over=draftIsOvertime(ds),pickNo=Number(ds.currentPick||1);
@@ -1526,9 +1617,17 @@
       ${scoringLockStatusHtml()}
       <div class="form-grid" style="margin-top:16px"><div class="field-group"><label for="admin-draft-type">Draft type</label><select class="select" id="admin-draft-type" ${ds.active?'disabled':''}><option ${defaultType==='Pre-Season'?'selected':''}>Pre-Season</option><option ${defaultType==='Mid-Season'?'selected':''}>Mid-Season</option></select></div><div class="field-group"><label>Pick clock</label><input class="search-input" value="3:00 + Commissioner overtime control" disabled></div></div>
       <div id="admin-draft-order-preview" style="margin-top:14px">${draftOrderPreviewHtml(defaultType)}</div>
-      <div class="button-row"><button class="primary-button" id="start-draft" ${ds.active?'disabled':''}>Start draft</button><button class="secondary-button" id="push-draft-back" ${ds.active&&over&&nextKey?'':'disabled'}>Push overdue pick back 1</button><button class="secondary-button" id="end-draft" ${ds.active?'':'disabled'}>End draft</button></div>
+      <div id="admin-draft-pool-status" style="margin-top:14px">${draftPoolStatusHtml(defaultType)}</div>
+      <div class="button-row"><button class="secondary-button" id="refresh-draft-pool" ${ds.active?'disabled':''}>Refresh current AFL player pool</button><button class="primary-button" id="start-draft" ${ds.active?'disabled':''}>Start draft</button><button class="secondary-button" id="push-draft-back" ${ds.active&&over&&nextKey?'':'disabled'}>Push overdue pick back 1</button><button class="secondary-button" id="end-draft" ${ds.active?'':'disabled'}>End draft</button></div>
       ${(ds.reorders||[]).length?`<div class="notice" style="margin-top:14px"><strong>Overtime reorder history:</strong><br>${[...(ds.reorders||[])].slice(-5).reverse().map(r=>`Pick ${Number(r.pick)}: ${esc(team(r.promotedTeam).name)} promoted; ${esc(team(r.lateTeam).name)} moved to Pick ${Number(r.pushedTo||Number(r.pick)+1)} · ${fmtDate(r.timestamp)}`).join('<br>')}</div>`:''}
       <hr style="border:0;border-top:1px solid var(--line);margin:22px 0"><div class="section-title"><div><span class="eyebrow">Team selections</span><h3>Draft approval inbox</h3></div><span class="badge amber">${pending.length} pending</span></div><div class="proposal-list">${commissionerProposalCards(pending)}</div>`;
+    } else if(commissionerTab==='accounts'){
+      const rows=D.teams.map(t=>{const a=teamAccountsCache.find(x=>x.teamKey===t.key)||{};return `<tr><td>${teamIdentity(t.key,'sm')}</td><td><strong>${esc(t.owner)}</strong></td><td><code>${esc(a.username||String(t.owner).toLowerCase())}</code></td><td><span class="badge ${a.provisioned&&a.active!==false?'green':'amber'}">${a.provisioned&&a.active!==false?'ACTIVE':'NOT PROVISIONED'}</span></td><td><button class="secondary-button compact-button" data-reset-team-password="${t.key}">${a.provisioned?'Reset password':'Create account'}</button></td></tr>`;}).join('');
+      panel=`<div class="notice"><strong>12 franchise logins:</strong> each coach account is permanently tied to one team. Passwords are six random letters and are never stored or displayed again after creation/reset.</div><div class="button-row" style="margin-top:14px"><button class="primary-button" id="provision-team-accounts">Provision missing team accounts</button><button class="secondary-button" id="reload-team-accounts">Refresh status</button></div><div id="team-credential-output" style="margin-top:14px">${teamCredentialCache.length?credentialsTable(teamCredentialCache):''}</div><div class="table-wrap" style="margin-top:16px"><table class="data-table"><thead><tr><th>Franchise</th><th>Coach</th><th>Username</th><th>Status</th><th>Password</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    } else if(commissionerTab==='backups'){
+      const rows=backupCache.map(b=>`<tr><td><strong>#${b.id}</strong></td><td>${fmtDate(b.created_at)}</td><td>${b.season||'—'}</td><td>${b.round||'—'}</td><td>${esc(b.reason||'')}</td><td>${esc(b.label||'')}</td><td><div class="backup-actions"><button class="secondary-button compact-button" data-backup-json="${b.id}">JSON</button><button class="secondary-button compact-button" data-backup-excel="${b.id}">Excel</button><button class="secondary-button compact-button danger-button" data-backup-restore="${b.id}">Restore</button></div></td></tr>`).join('');
+      const audit=auditCache.slice(0,15).map(a=>`<div class="audit-row"><time>${fmtDate(a.created_at)}</time><strong>${esc(a.action)}</strong><span>${esc(a.actor_team||a.actor_role||'')}</span><small>${esc(a.entity_type||'')} ${esc(a.entity_id||'')}</small></div>`).join('');
+      panel=`<div class="notice"><strong>Recovery system:</strong> finalising a round creates an immutable server backup automatically. You can also create one manually. Restore first creates an emergency pre-restore safeguard, and team login credentials are deliberately excluded from rollback.</div><div class="button-row" style="margin-top:14px"><button class="primary-button" id="create-manual-backup">Create backup now</button><button class="secondary-button" id="reload-backups">Refresh list</button></div><div class="table-wrap" style="margin-top:16px"><table class="data-table"><thead><tr><th>ID</th><th>Created</th><th>Season</th><th>Round</th><th>Reason</th><th>Label</th><th>Actions</th></tr></thead><tbody>${rows||'<tr><td colspan="7">No backups yet.</td></tr>'}</tbody></table></div><div class="section-title" style="margin-top:22px"><div><span class="eyebrow">Audit trail</span><h3>Recent official activity</h3></div></div><div class="audit-list">${audit||'<div class="empty">No audit entries loaded.</div>'}</div>`;
     } else if(commissionerTab==='figureheads'){
       const overrides=getFigureheadOverrides();
       panel=`<div class="notice"><strong>Team figureheads:</strong> PEGS automatically uses each franchise's highest-averaging current SuperCoach player. The average is used only behind the scenes and is not displayed anywhere with the figurehead. You can pin a different current roster player here.</div><div class="figurehead-admin-grid">${D.teams.map(t=>{const fh=figureheadPlayer(t.key),rows=(effectiveRosters()[t.key]||[]).slice().sort((a,b)=>a.player.localeCompare(b.player));return `<div class="figurehead-admin-card"><div class="figurehead-admin-identity">${figurehead(t.key,'md')}<div><strong>${esc(t.name)}</strong><span>${esc(fh.player)}</span><small>${fh.manual?'Commissioner override':'Automatic figurehead'}</small></div></div><div class="field-group"><label for="figurehead-${t.key}">Figurehead</label><select class="select" id="figurehead-${t.key}" data-figurehead-select="${t.key}"><option value="">Automatic · highest average</option>${rows.map(p=>`<option value="${esc(p.player)}" ${canonicalPlayerName(overrides[t.key]||'')===canonicalPlayerName(p.player)?'selected':''}>${esc(p.player)}</option>`).join('')}</select></div></div>`;}).join('')}</div>`;
@@ -1536,8 +1635,8 @@
       panel=`<div class="notice"><strong>Commissioner data:</strong> export a backup of overrides, confirmed transactions, proposals and draft state, or restore one later.</div><div class="button-row" style="margin-top:16px"><button class="secondary-button" id="export-admin-state">Export Commissioner data</button><label class="secondary-button" for="import-admin-state" style="cursor:pointer">Import Commissioner data</label><input class="screen-reader-only" id="import-admin-state" type="file" accept="application/json"></div>${backendConfigured()?'<div class="notice" style="margin-top:14px"><strong>Shared mode enabled.</strong> Team proposals and Commissioner decisions are stored in the configured free backend.</div>':'<div class="notice" style="margin-top:14px"><strong>Local preview mode.</strong> Team proposals and Commissioner decisions stay in this browser until the free shared backend is configured.</div>'}`;
     }
     commissionerContent.innerHTML=`<div class="commissioner-body"><div class="commissioner-title-row"><div><span class="eyebrow">Private administration</span><h3>Commissioner Control Centre</h3></div><span class="badge green">Unlocked</span></div>${commissionerTabs()}<div class="admin-panel">${panel}</div></div>`;
-    document.querySelectorAll('[data-admin-tab]').forEach(btn=>btn.addEventListener('click',()=>{commissionerTab=btn.dataset.adminTab;renderCommissionerControls();}));
-    document.getElementById('commissioner-logout')?.addEventListener('click',()=>{sessionStorage.removeItem(COMM_SESSION_KEY);sessionStorage.removeItem(BACKEND_TOKEN_KEY);commissionerUI();toast('Commissioner logged out.');});
+    document.querySelectorAll('[data-admin-tab]').forEach(btn=>btn.addEventListener('click',async()=>{commissionerTab=btn.dataset.adminTab;if(commissionerTab==='accounts')await loadTeamAccounts();if(commissionerTab==='backups')await Promise.all([syncBackups(),syncAudit()]);renderCommissionerControls();}));
+    document.getElementById('commissioner-logout')?.addEventListener('click',()=>{teamCredentialCache=[];clearBackendSession();commissionerUI();toast('Commissioner logged out.');});
     document.querySelectorAll('[data-proposal-approve]').forEach(btn=>btn.addEventListener('click',()=>void approveProposal(btn.dataset.proposalApprove)));
     document.querySelectorAll('[data-proposal-reject]').forEach(btn=>btn.addEventListener('click',()=>void rejectProposal(btn.dataset.proposalReject)));
 
@@ -1545,8 +1644,8 @@
       document.getElementById('sync-live-feed')?.addEventListener('click',()=>void syncLiveProvider(true));
       document.getElementById('sync-opening-feed')?.addEventListener('click',()=>void syncLiveProvider(true,0));
       document.getElementById('capture-opening-bank')?.addEventListener('click',()=>captureOpeningRoundBank());
-      document.getElementById('finalise-current-round')?.addEventListener('click',()=>finalizeRound(effectiveCurrentRound(),false));
-      document.getElementById('force-finalise-current-round')?.addEventListener('click',()=>{if(confirm('Finalise this round even though the live-feed game check may be incomplete?'))finalizeRound(effectiveCurrentRound(),true);});
+      document.getElementById('finalise-current-round')?.addEventListener('click',()=>void finalizeRound(effectiveCurrentRound(),false));
+      document.getElementById('force-finalise-current-round')?.addEventListener('click',()=>{if(confirm('Finalise this round even though the live-feed game check may be incomplete?'))void finalizeRound(effectiveCurrentRound(),true);});
       const roundEl=document.getElementById('comm-round'),teamEl=document.getElementById('comm-team'),playerEl=document.getElementById('comm-player'),scoreEl=document.getElementById('comm-score'),selectionEl=document.getElementById('comm-selection');
       const load=()=>{const v=scoreOverride(Number(roundEl.value),teamEl.value,playerEl.value);scoreEl.value=v===undefined?'':v;selectionEl.value=selectionOverride(Number(roundEl.value),teamEl.value,playerEl.value)||'';};
       const refreshPlayers=()=>{const rd=Number(roundEl.value),key=teamEl.value;playerEl.innerHTML=teamRoundPlayers(rd,key).map(p=>`<option value="${esc(p.player)}">${esc(p.player)}${p.scoreSource==='Opening Round banked'?' · OR bank':''}</option>`).join('');load();};
@@ -1609,8 +1708,9 @@
     if(commissionerTab==='draft'){
       startDraftTicker();
       const adminTick=()=>{const el=document.getElementById('admin-draft-countdown');if(el)el.textContent=clockText(draftSecondsRemaining(getDraftState()));};adminTick();
-      document.getElementById('admin-draft-type')?.addEventListener('change',e=>{const box=document.getElementById('admin-draft-order-preview');if(box)box.innerHTML=draftOrderPreviewHtml(e.target.value);});
-      document.getElementById('start-draft')?.addEventListener('click',()=>{const type=normalizedDraftType(document.getElementById('admin-draft-type').value),ladderSnapshot=draftLadderOrder(type),picks=draftPickLedger(type,{ladderOrder:ladderSnapshot}),order=picks.map(p=>p.owner),now=new Date().toISOString(),value={active:true,type,season:draftSeasonFor(type),rounds:draftRoundsFor(type),timerSeconds:180,currentIndex:0,currentPick:1,ladderSnapshot,baseOrder:picks.map(p=>p.originalOwner),picks,order,sessionId:'draft-'+Date.now(),startedAt:now,pickStartedAt:now,updatedAt:now,reorders:[]};saveDraftState(value);toast(`${value.season} ${value.type} draft is live. Pick 1 has 3 minutes.`);render();renderCommissionerControls();});
+      document.getElementById('admin-draft-type')?.addEventListener('change',e=>{const box=document.getElementById('admin-draft-order-preview'),poolBox=document.getElementById('admin-draft-pool-status');if(box)box.innerHTML=draftOrderPreviewHtml(e.target.value);if(poolBox)poolBox.innerHTML=draftPoolStatusHtml(e.target.value);});
+      document.getElementById('refresh-draft-pool')?.addEventListener('click',async()=>{const btn=document.getElementById('refresh-draft-pool'),type=normalizedDraftType(document.getElementById('admin-draft-type').value),box=document.getElementById('admin-draft-pool-status');btn.disabled=true;try{await syncServerAuthority();await refreshCurrentDraftPool(type,(i,club)=>{if(box)box.innerHTML=`<div class="notice"><strong>Refreshing AFL player pool…</strong> ${Math.min(i,18)}/18 clubs${club&&club!=='DONE'?` · ${esc(club)}`:''}</div>`;});toast('Current AFL player pool captured and frozen-ready.');}catch(e){toast(e.message||'Draft pool refresh failed.');}finally{btn.disabled=false;renderCommissionerControls();}});
+      document.getElementById('start-draft')?.addEventListener('click',async()=>{const type=normalizedDraftType(document.getElementById('admin-draft-type').value),pool=draftPoolRecord(),season=draftSeasonFor(type);if(!pool?.complete||Number(pool.season)!==season||normalizedDraftType(pool.phase)!==type){toast('Refresh a complete 18-club current-price player pool before starting this draft.');return;}await syncServerAuthority();const ladderSnapshot=draftLadderOrder(type),picks=draftPickLedger(type,{ladderOrder:ladderSnapshot}),order=picks.map(p=>p.owner),now=new Date().toISOString(),value={active:true,type,season,rounds:draftRoundsFor(type),timerSeconds:180,currentIndex:0,currentPick:1,ladderSnapshot,baseOrder:picks.map(p=>p.originalOwner),picks,order,poolSessionId:pool.session_id,sessionId:'draft-'+Date.now(),startedAt:now,pickStartedAt:now,updatedAt:now,reorders:[]};saveDraftState(value);await logCommissioner('DRAFT_STARTED','draft',value.sessionId,{type,season,poolSessionId:pool.session_id,playerCount:pool.player_count});toast(`${value.season} ${value.type} draft is live. Pick 1 has 3 minutes.`);render();renderCommissionerControls();});
       document.getElementById('push-draft-back')?.addEventListener('click',async()=>{
         const before=getDraftState(),pick=Number(before.currentPick||1),lateTeam=currentDraftTeam(before),promotedTeam=nextDraftTeam(before);
         if(!before.active||!draftIsOvertime(before)||!promotedTeam){toast('That pick cannot currently be pushed back.');return;}
@@ -1632,6 +1732,18 @@
         else toast('Draft ended.');
         render();renderCommissionerControls();
       });
+    }
+    if(commissionerTab==='accounts'){
+      document.getElementById('reload-team-accounts')?.addEventListener('click',async()=>{await loadTeamAccounts();renderCommissionerControls();});
+      document.getElementById('provision-team-accounts')?.addEventListener('click',async()=>{try{const x=await teamAccountAdmin('provision_missing');teamCredentialCache=x.credentials||[];await loadTeamAccounts();toast(`${teamCredentialCache.length} team account${teamCredentialCache.length===1?'':'s'} created.`);renderCommissionerControls();}catch(e){toast(e.message||'Could not provision team accounts.');}});
+      document.querySelectorAll('[data-reset-team-password]').forEach(btn=>btn.addEventListener('click',async()=>{const k=btn.dataset.resetTeamPassword;if(!confirm(`Generate a new six-letter password for ${team(k).owner}? Their old password will stop working.`))return;try{const x=await teamAccountAdmin('reset',k);teamCredentialCache=x.credential?[x.credential]:[];await loadTeamAccounts();toast(`${team(k).owner} password reset.`);renderCommissionerControls();}catch(e){toast(e.message||'Password reset failed.');}}));
+    }
+    if(commissionerTab==='backups'){
+      document.getElementById('create-manual-backup')?.addEventListener('click',async()=>{try{const id=await createServerBackup('MANUAL','Commissioner manual backup');await syncAudit();toast(`Backup #${id} created.`);renderCommissionerControls();}catch(e){toast(e.message||'Backup failed.');}});
+      document.getElementById('reload-backups')?.addEventListener('click',async()=>{await Promise.all([syncBackups(),syncAudit()]);renderCommissionerControls();});
+      document.querySelectorAll('[data-backup-json]').forEach(btn=>btn.addEventListener('click',()=>void exportBackupJson(btn.dataset.backupJson).catch(e=>toast(e.message))));
+      document.querySelectorAll('[data-backup-excel]').forEach(btn=>btn.addEventListener('click',()=>void exportBackupExcel(btn.dataset.backupExcel).catch(e=>toast(e.message))));
+      document.querySelectorAll('[data-backup-restore]').forEach(btn=>btn.addEventListener('click',async()=>{try{if(await restoreServerBackup(btn.dataset.backupRestore)){await syncAudit();toast('Backup restored. A pre-restore safeguard was created automatically.');render();renderCommissionerControls();}}catch(e){toast(e.message||'Restore failed.');}}));
     }
     if(commissionerTab==='figureheads'){
       document.querySelectorAll('[data-figurehead-select]').forEach(el=>el.addEventListener('change',()=>{const all=getFigureheadOverrides(),key=el.dataset.figureheadSelect;if(el.value)all[key]=el.value;else delete all[key];saveFigureheadOverrides(all);toast(el.value?`${team(key).name} figurehead pinned to ${el.value}.`:`${team(key).name} returned to automatic figurehead.`);render();renderCommissionerControls();}));
@@ -1660,10 +1772,10 @@
 
   function refreshDraftCheck() {
     const out=document.getElementById('draft-check-output'); if(!out) return;
-    const p=draftSelection?D.playerPool.find(x=>x.player===draftSelection):null;
+    const p=draftSelection?draftPlayerByName(draftSelection):null;
     if(!p){out.innerHTML='<div class="notice" style="margin-top:16px">Select an available player to run the salary-cap and positional checks.</div>';return;}
-    const state=getDraftState(),key=currentDraftTeam(state),pending=proposalCache.some(x=>x.type==='DRAFT_PICK'&&x.status==='PENDING'&&Number(x.payload?.pick)===Number(state.currentPick||1)&&x.proposerTeam===key);
-    out.innerHTML=draftCheckOutput(key,p,document.getElementById('draft-contract').value,document.getElementById('draft-status').value,Boolean(state.active),pending,document.getElementById('draft-fixed-position')?.value||String(p.position||'').split('/')[0]);
+    const state=getDraftState(),key=currentDraftTeam(state),pending=proposalCache.some(x=>x.type==='DRAFT_PICK'&&activeProposalStatus(x.status)&&Number(x.payload?.pick)===Number(state.currentPick||1)&&x.proposerTeam===key),canSubmit=Boolean(state.active&&teamLoggedIn()&&loggedTeamKey()===key);
+    out.innerHTML=draftCheckOutput(key,p,document.getElementById('draft-contract').value,document.getElementById('draft-status').value,canSubmit,pending,document.getElementById('draft-fixed-position')?.value||String(p.position||'').split('/')[0]);
   }
 
   document.addEventListener('click', e => {
@@ -1689,25 +1801,26 @@
     if(e.target.id==='draft-search'){
       draftSearch=e.target.value;
       const results=document.getElementById('draft-search-results');
-      if(results){results.innerHTML=availablePlayers().map(p=>`<button class="player-option ${draftSelection===p.player?'selected':''}" data-action="select-draft-player" data-player="${esc(p.player)}"><span><strong>${esc(p.player)}</strong><small>${esc(p.position)} - ${esc(p.club)} - Avg ${p.average}</small></span><span class="money"><strong>${money(p.startPrice||p.price)}</strong><small>opening</small></span></button>`).join('')||'<div class="empty">No available players match.</div>';}
+      if(results){results.innerHTML=availablePlayers().map(p=>`<button class="player-option ${draftSelection===p.player?'selected':''}" data-action="select-draft-player" data-player="${esc(p.player)}"><span><strong>${esc(p.player)}</strong><small>${esc(p.position)} - ${esc(p.club)} - Avg ${p.average}</small></span><span class="money"><strong>${money(p.startPrice||p.price)}</strong><small>${getDraftState().active?'frozen':'price'}</small></span></button>`).join('')||'<div class="empty">No available players match.</div>';}
     }
   });
 
+  document.getElementById('open-team-login')?.addEventListener('click',()=>{void teamLoginUI();teamDialog.showModal();});
   document.getElementById('open-commissioner').addEventListener('click',()=>{commissionerUI();commissionerDialog.showModal();});
   document.addEventListener('click',e=>{if(e.target.id==='score-editor-shortcut'){commissionerUI();commissionerDialog.showModal();}});
   window.addEventListener('hashchange', render);
-  window.addEventListener('storage',e=>{if([OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,DRAFT_STATE_KEY,PROPOSALS_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY].includes(e.key)){if(e.key===PROPOSALS_KEY)proposalCache=getLocalProposals();render();}});
+  window.addEventListener('storage',e=>{if([OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,DRAFT_STATE_KEY,PROPOSALS_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,DRAFT_POOL_KEY].includes(e.key)){if(e.key===PROPOSALS_KEY)proposalCache=getLocalProposals();render();}});
 
   // Lightweight non-UI test surface used by the bundled QA script.
-  window.__PEGS_TEST__={render,parseAflFixtureCsv,generatePegsFixture,validatePegsFixture,saveSeasonSetup,getSeasonSetup,saveLiveFeed,getLiveFeed,getSelectionOverrides,saveSelectionOverrides,saveOpeningBank,getOpeningBank,calcTeamRound,effectiveRoundRecord,scoreCountForRoundRecord,topPlayersForRound,effectiveLadder,projectedLadderForRound,liveRoundBadge,liveFeedCompleteForRound,normalizeAvailabilityStatus,unavailableForProjection,mergeProviderTeamRecord,preSeasonDraftOrder,draftPickLedger,teamRoundPlayers,availabilityInfo,currentSeason,effectiveCurrentRound,getProposalWindows,saveProposalWindows,proposalWindowOpen,getScoringSnapshots,saveScoringSnapshots,captureScoringSnapshot,scoringSnapshotForRound,scoringRostersForRound,nextUnfinalizedScoringRound,effectiveRosters,submitProposal,approveProposal,getDraftState,saveDraftState,draftOrder,currentDraftTeam,nextDraftTeam,draftSecondsRemaining,draftIsOvertime,pushDraftPickBackLocal,advanceDraftLocal,getFigureheadOverrides,saveFigureheadOverrides,figureheadPlayer,figureheadAverage,playerPhotoUrl,finalsConfig,calculatedFinalsBracket,effectiveFinals,roundLabel,finalizeRound};
+  window.__PEGS_TEST__={render,parseAflFixtureCsv,generatePegsFixture,validatePegsFixture,saveSeasonSetup,getSeasonSetup,saveLiveFeed,getLiveFeed,getSelectionOverrides,saveSelectionOverrides,saveOpeningBank,getOpeningBank,calcTeamRound,effectiveRoundRecord,scoreCountForRoundRecord,topPlayersForRound,effectiveLadder,projectedLadderForRound,liveRoundBadge,liveFeedCompleteForRound,normalizeAvailabilityStatus,unavailableForProjection,mergeProviderTeamRecord,preSeasonDraftOrder,draftPickLedger,teamRoundPlayers,availabilityInfo,currentSeason,effectiveCurrentRound,getProposalWindows,saveProposalWindows,proposalWindowOpen,getScoringSnapshots,saveScoringSnapshots,captureScoringSnapshot,scoringSnapshotForRound,scoringRostersForRound,nextUnfinalizedScoringRound,effectiveRosters,rosterSummary,rosterIsLegal,tradeActionFor,tradeImpactHtml,activeProposalStatus,submitProposal,respondTrade,approveProposal,getDraftState,saveDraftState,draftOrder,currentDraftTeam,nextDraftTeam,draftSecondsRemaining,draftIsOvertime,pushDraftPickBackLocal,advanceDraftLocal,getFigureheadOverrides,saveFigureheadOverrides,figureheadPlayer,figureheadAverage,playerPhotoUrl,finalsConfig,calculatedFinalsBracket,effectiveFinals,roundLabel,finalizeRound};
 
   if('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('./sw.js').catch(()=>{});
   proposalCache=getLocalProposals();
   const seasonPill=document.getElementById('season-pill-year'); if(seasonPill)seasonPill.textContent=String(currentSeason());
-  render();
+  updateSessionUI();render();
   if(backendConfigured()){
-    Promise.all([pullSharedState(),syncProposals()]).then(()=>{const pill=document.getElementById('season-pill-year');if(pill)pill.textContent=String(currentSeason());render();}).catch(()=>{});
-    setInterval(()=>Promise.all([pullSharedState(),syncProposals()]).then(()=>{const pill=document.getElementById('season-pill-year');if(pill)pill.textContent=String(currentSeason());render();}).catch(()=>{}),10000);
+    (async()=>{await refreshIdentity();await Promise.all([pullSharedState(),syncProposals(),loadDraftPool()]);if(commissionerLoggedIn())await syncServerAuthority();const pill=document.getElementById('season-pill-year');if(pill)pill.textContent=String(currentSeason());updateSessionUI();render();})().catch(()=>{});
+    setInterval(()=>Promise.all([pullSharedState(),syncProposals(),loadDraftPool()]).then(()=>{const pill=document.getElementById('season-pill-year');if(pill)pill.textContent=String(currentSeason());updateSessionUI();render();}).catch(()=>{}),10000);
     const refreshSeconds=Math.max(60,Number(CONFIG.liveRefreshSeconds||90));
     setInterval(()=>{if(activeSeasonSetup()?.liveScoringEnabled!==false)void syncLiveProvider(false);},refreshSeconds*1000);
   }

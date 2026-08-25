@@ -488,13 +488,23 @@
     const res=await fetch(CONFIG.supabaseUrl.replace(/\/$/,'')+'/auth/v1/token?grant_type=refresh_token',{method:'POST',headers:{apikey:CONFIG.supabaseAnonKey,'Content-Type':'application/json'},body:JSON.stringify({refresh_token:refresh})});
     if(!res.ok){clearBackendSession();return false;}const data=await res.json();sessionStorage.setItem(BACKEND_TOKEN_KEY,data.access_token||'');if(data.refresh_token)sessionStorage.setItem(BACKEND_REFRESH_KEY,data.refresh_token);return true;
   }
+  function backendErrorText(raw,status=0) {
+    const text=String(raw||'').trim();
+    if(!text)return 'HTTP '+status;
+    try{
+      const x=JSON.parse(text);
+      const parts=[x.message,x.details,x.hint].filter(Boolean);
+      const code=x.code?` [${x.code}]`:'';
+      return (parts.join(' - ')||text)+code;
+    }catch(_){return text;}
+  }
   async function backendFetch(path, options={}, retry=true) {
     const token=backendToken();
     const headers={apikey:CONFIG.supabaseAnonKey,'Content-Type':'application/json',...(options.headers||{})};
     headers.Authorization='Bearer '+(token||CONFIG.supabaseAnonKey);
     const res=await fetch(CONFIG.supabaseUrl.replace(/\/$/,'')+path,{...options,headers});
     if(res.status===401&&retry&&backendRefreshToken()&&await refreshBackendToken())return backendFetch(path,options,false);
-    if(!res.ok) throw new Error((await res.text()) || ('HTTP '+res.status));
+    if(!res.ok){const raw=await res.text();throw new Error(backendErrorText(raw,res.status));}
     return res.status===204 ? null : res.json();
   }
   async function refreshIdentity(){
@@ -650,9 +660,17 @@
 
   async function syncServerAuthority(){
     if(!backendConfigured()||!commissionerLoggedIn())return;
-    const rosters=effectiveRosters(),picks=[...draftPickLedger('Pre-Season'),...draftPickLedger('Mid-Season')];
-    await backendFetch('/rest/v1/rpc/pegs_sync_roster_authority',{method:'POST',body:JSON.stringify({p_rosters:rosters})});
-    await backendFetch('/rest/v1/rpc/pegs_sync_pick_authority',{method:'POST',body:JSON.stringify({p_picks:picks})});
+    const rosters=effectiveRosters();
+    const rawPicks=[...draftPickLedger('Pre-Season'),...draftPickLedger('Mid-Season')];
+    const pickMap=new Map();
+    for(const p of rawPicks){const id=String(p?.id||'').trim();if(id)pickMap.set(id,p);}
+    const picks=[...pickMap.values()];
+    try{
+      await backendFetch('/rest/v1/rpc/pegs_sync_roster_authority',{method:'POST',body:JSON.stringify({p_rosters:rosters})});
+    }catch(e){throw new Error(`Roster authority sync failed: ${e.message||e}`);}
+    try{
+      await backendFetch('/rest/v1/rpc/pegs_sync_pick_authority',{method:'POST',body:JSON.stringify({p_picks:picks})});
+    }catch(e){throw new Error(`Draft-pick authority sync failed: ${e.message||e}`);}
   }
   async function logCommissioner(action,entityType='',entityId='',detail={}){if(!commissionerLoggedIn())return;try{await backendFetch('/rest/v1/rpc/pegs_log_commissioner_action',{method:'POST',body:JSON.stringify({p_action:action,p_entity_type:entityType,p_entity_id:String(entityId||''),p_detail:detail||{}})});}catch(e){console.warn('Audit log write failed',e);}}
 
@@ -1769,7 +1787,7 @@
       startDraftTicker();
       const adminTick=()=>{const el=document.getElementById('admin-draft-countdown');if(el)el.textContent=clockText(draftSecondsRemaining(getDraftState()));};adminTick();
       document.getElementById('admin-draft-type')?.addEventListener('change',e=>{const box=document.getElementById('admin-draft-order-preview'),poolBox=document.getElementById('admin-draft-pool-status');if(box)box.innerHTML=draftOrderPreviewHtml(e.target.value);if(poolBox)poolBox.innerHTML=draftPoolStatusHtml(e.target.value);});
-      document.getElementById('refresh-draft-pool')?.addEventListener('click',async()=>{const btn=document.getElementById('refresh-draft-pool'),type=normalizedDraftType(document.getElementById('admin-draft-type').value),box=document.getElementById('admin-draft-pool-status');btn.disabled=true;try{await syncServerAuthority();await refreshCurrentDraftPool(type,(i,club)=>{if(box)box.innerHTML=`<div class="notice"><strong>Refreshing AFL player pool…</strong> ${Math.min(i,18)}/18 clubs${club&&club!=='DONE'?` · ${esc(club)}`:''}</div>`;});toast('Current AFL player pool captured and frozen-ready.');}catch(e){toast(e.message||'Draft pool refresh failed.');}finally{btn.disabled=false;renderCommissionerControls();}});
+      document.getElementById('refresh-draft-pool')?.addEventListener('click',async()=>{const btn=document.getElementById('refresh-draft-pool'),type=normalizedDraftType(document.getElementById('admin-draft-type').value),box=document.getElementById('admin-draft-pool-status');btn.disabled=true;try{await refreshCurrentDraftPool(type,(i,club)=>{if(box)box.innerHTML=`<div class="notice"><strong>Refreshing AFL player pool…</strong> ${Math.min(i,18)}/18 clubs${club&&club!=='DONE'?` · ${esc(club)}`:''}</div>`;});toast('Current AFL player pool captured and frozen-ready.');}catch(e){toast(e.message||'Draft pool refresh failed.');}finally{btn.disabled=false;renderCommissionerControls();}});
       document.getElementById('start-draft')?.addEventListener('click',async()=>{const type=normalizedDraftType(document.getElementById('admin-draft-type').value),pool=draftPoolRecord(),season=draftSeasonFor(type);if(!pool?.complete||Number(pool.season)!==season||normalizedDraftType(pool.phase)!==type){toast('Refresh a complete 18-club current-price player pool before starting this draft.');return;}await syncServerAuthority();const ladderSnapshot=draftLadderOrder(type),picks=draftPickLedger(type,{ladderOrder:ladderSnapshot}),order=picks.map(p=>p.owner),now=new Date().toISOString(),value={active:true,type,season,rounds:draftRoundsFor(type),timerSeconds:180,currentIndex:0,currentPick:1,ladderSnapshot,baseOrder:picks.map(p=>p.originalOwner),picks,order,poolSessionId:pool.session_id,sessionId:'draft-'+Date.now(),startedAt:now,pickStartedAt:now,updatedAt:now,reorders:[]};saveDraftState(value);await logCommissioner('DRAFT_STARTED','draft',value.sessionId,{type,season,poolSessionId:pool.session_id,playerCount:pool.player_count});toast(`${value.season} ${value.type} draft is live. Pick 1 has 3 minutes.`);render();renderCommissionerControls();});
       document.getElementById('push-draft-back')?.addEventListener('click',async()=>{
         const before=getDraftState(),pick=Number(before.currentPick||1),lateTeam=currentDraftTeam(before),promotedTeam=nextDraftTeam(before);

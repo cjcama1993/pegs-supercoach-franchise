@@ -217,14 +217,58 @@
     const seasonData=getScoringSnapshots()?.[String(currentSeason())]||{},candidates=[seasonData.preSeason,seasonData.midSeason].filter(Boolean).filter(x=>Number(x.effectiveFromRound||1)<=Number(round));
     if(!candidates.length)return null;return [...candidates].sort((a,b)=>Number(b.effectiveFromRound||1)-Number(a.effectiveFromRound||1))[0];
   }
+  function legacyScoringEffectiveRound(action){
+    // PEGS phase windows are roster periods. A Pre-Season or Mid-Season trade,
+    // delisting or elevation belongs to that scoring lock even if the action was
+    // approved later while testing/replaying the season. This also repairs older
+    // confirmed actions that were stamped with the then-current round.
+    const phase=String(action?.phase||'').toLowerCase(),seasonData=getScoringSnapshots()?.[String(currentSeason())]||{};
+    if(phase.startsWith('pre')){
+      const locked=Number(seasonData.preSeason?.effectiveFromRound||0);if(locked>0)return locked;
+    }
+    if(phase.startsWith('mid')){
+      const locked=Number(seasonData.midSeason?.effectiveFromRound||0);if(locked>0)return locked;
+    }
+    const explicit=Number(action?.effectiveFromRound||0);if(explicit>0)return explicit;
+    const actionTime=Date.parse(action?.timestamp||'');if(!Number.isFinite(actionTime))return nextUnfinalizedScoringRound();
+    const locks=[seasonData.preSeason,seasonData.midSeason].filter(Boolean).map(x=>({...x,time:Date.parse(x.capturedAt||'')})).filter(x=>Number.isFinite(x.time)).sort((a,b)=>a.time-b.time);
+    const nextLock=locks.find(x=>x.time>=actionTime);if(nextLock)return Number(nextLock.effectiveFromRound||1);
+    const results=getSeasonResults()?.[String(currentSeason())]||{};
+    const finalizedBefore=Object.entries(results).filter(([,rec])=>{const t=Date.parse(rec?.finalizedAt||'');return Number.isFinite(t)&&t<=actionTime;}).map(([r])=>Number(r)).filter(Number.isFinite);
+    if(finalizedBefore.length)return Math.max(...finalizedBefore)+1;
+    return nextUnfinalizedScoringRound();
+  }
+  function applyScoringAction(rosters,a){
+    if(a.type==='Trade'){
+      for(const move of a.moves||[]){const from=rosters[move.from]||[],idx=from.findIndex(p=>p.player===move.player);if(idx>=0){const [rec]=from.splice(idx,1);(rosters[move.to]||(rosters[move.to]=[])).push(rec);}}
+    }else if(a.type==='Rookie swap'){
+      const rows=rosters[a.team]||[],pin=rows.find(p=>p.player===a.playerIn),pout=rows.find(p=>p.player===a.playerOut);if(pin){pin.status='Field';if(a.playerInPosition)pin.position=String(a.playerInPosition).toUpperCase();}if(pout)pout.status='Interchange';
+    }else if(a.type==='Rookie elevation'&&a.team&&a.player){
+      const rows=rosters[a.team]||[],rec=rows.find(p=>p.player===a.player);if(rec){rec.contract='Main';rec.salary=Number(a.newSalary||rec.salary||0);rec.position=String(a.newPosition||rec.position||'').toUpperCase();if(a.contractEnd)rec.contractEnd=Number(a.contractEnd);}
+    }else if(a.type==='Delisted'&&a.team){
+      const names=new Set((a.players||[a.player]).filter(Boolean));if(names.size)rosters[a.team]=(rosters[a.team]||[]).filter(p=>!names.has(p.player));
+    }
+  }
+  function scoringActionsForRound(round){
+    const allowed=new Set(['Trade','Rookie swap','Rookie elevation','Delisted']);
+    return getCommissionerActions().filter(a=>a.status==='CONFIRMED'&&allowed.has(a.type)&&(!a.season||Number(a.season)===currentSeason())).map(a=>({...a,_scoringFrom:legacyScoringEffectiveRound(a)})).filter(a=>Number(a._scoringFrom)<=Number(round)).sort((a,b)=>Number(a._scoringFrom)-Number(b._scoringFrom)||String(a.timestamp||'').localeCompare(String(b.timestamp||'')));
+  }
+  function scoringActionTouchesTeam(action,teamKey){
+    if(action.type==='Trade')return (action.moves||[]).some(m=>m.from===teamKey||m.to===teamKey);
+    return action.team===teamKey;
+  }
   function scoringRostersForRound(round){
     const snap=scoringSnapshotForRound(round); if(!snap)return effectiveRosters();
-    const rosters=cloneRosters(snap.rosters);
-    // Field/Rookie swaps are the only in-season roster-status change allowed to affect scoring between draft locks.
-    // Apply only swaps that became effective on/before this round; trades/delists/drafts wait for the next scoring snapshot.
-    const swaps=getCommissionerActions().filter(a=>a.status==='CONFIRMED'&&a.type==='Rookie swap'&&(!a.season||Number(a.season)===currentSeason())&&Number(a.effectiveFromRound||1)<=Number(round)).sort((a,b)=>Number(a.effectiveFromRound||1)-Number(b.effectiveFromRound||1)||String(a.timestamp||'').localeCompare(String(b.timestamp||'')));
-    for(const a of swaps){const rows=rosters[a.team]||[];const pin=rows.find(p=>p.player===a.playerIn),pout=rows.find(p=>p.player===a.playerOut);if(pin){pin.status='Field';if(a.playerInPosition)pin.position=String(a.playerInPosition).toUpperCase();}if(pout)pout.status='Interchange';}
+    const rosters=cloneRosters(snap.rosters),actions=scoringActionsForRound(round);
+    for(const a of actions)applyScoringAction(rosters,a);
     return rosters;
+  }
+  function legacyRoundPlayer(round,name){
+    const canon=canonicalPlayerName(name),roundRows=D.roundScores?.[String(round)]||{};
+    for(const rows of Object.values(roundRows)){
+      const rec=(rows||[]).find(p=>canonicalPlayerName(p.player)===canon);if(rec)return rec;
+    }
+    return null;
   }
   function proposalWindowOpen(type,phase=''){
     const kind=String(type||'').toUpperCase(),w=getProposalWindows();
@@ -809,6 +853,10 @@
   function topPlayersForRound(round) {
     return scoreCountForRoundRecord(effectiveRoundRecord(round));
   }
+  function futureScoringRound(round){
+    const setup=activeSeasonSetup();
+    return Boolean(setup)&&!roundFinalized(round)&&Number(round)>Number(setup.currentRound||effectiveCurrentRound()||1);
+  }
   function roundContext(round){
     const rec=effectiveRoundRecord(round),banks=rec.bankClubs||[],byes=rec.byeClubs||[],count=topPlayersForRound(round);
     if(banks.length) return `${rec.aflTeamsPlaying} AFL clubs play and ${banks.length} Opening Round club${banks.length===1?' is':'s are'} banked, so the top ${count} PEGS Field scores count.`;
@@ -821,10 +869,32 @@
     if(finalized?.players?.[teamKey]) return finalized.players[teamKey].map(p=>({...p,scoreSource:p.scoreSource||'Finalised round'}));
     const usingNewSeason=Boolean(activeSeasonSetup()&&currentSeason()!==Number(D.meta.season));
     const legacy=(D.roundScores[String(round)]?.[teamKey]||[]).filter(p=>p.status==='Field');
-    if(!usingNewSeason&&legacy.length)return legacy;
-    return (scoringRostersForRound(round)[teamKey]||[]).filter(p=>p.status==='Field').map(p=>({
-      player:p.player,position:p.position,status:'Field',score:0,projected:baselineProjection(p.player,0),club:p.club,scoreSource:scoringSnapshotForRound(round)?`${scoringSnapshotForRound(round).stage} scoring lock`:'Season roster'
-    }));
+    const hasScoringChanges=scoringActionsForRound(round).some(a=>scoringActionTouchesTeam(a,teamKey));
+    const future=futureScoringRound(round);
+    // Future PEGS rounds are roster previews only. The workbook contains later-
+    // round historical scores, but those must never leak into a round that has
+    // not opened yet. We still use the locked trade-aware roster so approved
+    // moves are visible before the round starts, while actual scores stay at 0.
+    if(future){
+      return (scoringRostersForRound(round)[teamKey]||[]).filter(p=>p.status==='Field').map(p=>({
+        ...p,
+        player:p.player,position:p.position,status:'Field',score:0,projected:Number(baselineProjection(p.player,0)),club:p.club||'',scoreSource:'Future round roster preview'
+      }));
+    }
+    // Imported workbook rounds remain the source of truth until a roster action
+    // applies to that scoring period. Once a trade/swap/delist/elevation applies,
+    // membership comes from the locked scoring roster instead of the old workbook
+    // team list. Historical scores are then re-attached by player name so a traded
+    // player's Round score follows the player to the receiving franchise.
+    if(!usingNewSeason&&legacy.length&&!hasScoringChanges)return legacy;
+    return (scoringRostersForRound(round)[teamKey]||[]).filter(p=>p.status==='Field').map(p=>{
+      const historical=!usingNewSeason?legacyRoundPlayer(round,p.player):null;
+      return {
+        ...p,
+        player:p.player,position:p.position,status:'Field',score:Number(historical?.score||0),projected:Number(historical?.projected??baselineProjection(p.player,0)),club:p.club||historical?.club||'',
+        scoreSource:historical?'Workbook result · roster adjusted':(scoringSnapshotForRound(round)?`${scoringSnapshotForRound(round).stage} scoring lock`:'Season roster')
+      };
+    });
   }
   function normalizeAvailabilityStatus(value){
     const raw=String(value||'TBC').trim().toUpperCase();
@@ -857,6 +927,8 @@
   }
   function availabilityInfo(p,round,teamKey){
     const finalized=roundFinalized(round); if(finalized)return {status:'FT',gameStatus:'FT',source:'Finalised',projection:Number(p.score||0),actual:Number(p.score||0)};
+    if(futureScoringRound(round))return {status:'TBC',gameStatus:'PRE',source:'Future round - scoring locked',projection:Number(p.projected||baselineProjection(p.player,0)),actual:null};
+    if(p.scoreSource==='Workbook result · roster adjusted')return {status:'FT',gameStatus:'FT',source:p.scoreSource,projection:Number(p.projected||p.score||0),actual:Number(p.score||0)};
     if(!activeSeasonSetup() && currentSeason()===Number(D.meta.season) && D.roundScores[String(round)]?.[teamKey]) return {status:'FT',gameStatus:'FT',source:p.scoreSource||'Workbook result',projection:Number(p.projected||p.score||0),actual:Number(p.score||0)};
     const over=scoreOverride(round,teamKey,p.player); if(over!==undefined)return {status:'OVERRIDE',gameStatus:'FT',source:'Commissioner score override',projection:Number(over),actual:Number(over)};
     if(p.scoreSource==='Opening Round banked')return {status:'BANKED',gameStatus:'FT',source:'OR bank',projection:Number(p.score||0),actual:Number(p.score||0)};
@@ -1083,10 +1155,11 @@
     const h = calcTeamRound(round, home); const a = calcTeamRound(round, away);
     const hp = winProbability(h.projected, a.projected); const ap = 100 - hp;
     const playedH = h.players.filter(p=>p.played).length; const playedA = a.players.filter(p=>p.played).length;
+    const future=futureScoringRound(round);
     return `<article class="card matchup-detail">
       <div class="matchup-header">
         <div class="section-title"><div><span class="eyebrow">Round ${round}</span><h2>${roundLabel(round)==='Round '+round?'Head to head':roundLabel(round)}</h2></div><button class="secondary-button" id="score-editor-shortcut">Commissioner score override</button></div>
-        <div class="notice round-rule-note"><strong>${topPlayersForRound(round)} players count.</strong> ${esc(roundContext(round))}</div>
+        ${future?`<div class="notice round-rule-note"><strong>Future round preview.</strong> Round ${round} scoring is locked until Round ${effectiveCurrentRound()} is finalised. Approved roster moves are shown, but no scores are imported or counted yet.</div>`:`<div class="notice round-rule-note"><strong>${topPlayersForRound(round)} players count.</strong> ${esc(roundContext(round))}</div>`}
         <div class="matchup-hero">
           <div class="team-score">${teamIdentity(home,'lg')}<div class="score-big">${h.actual}</div><div class="score-proj">Live projection <strong>${h.projected}</strong> - ${playedH} scores</div></div>
           <div class="vs-dot">VS</div>
@@ -1610,13 +1683,13 @@
       if(!picksOwnedBy(p.proposerTeam,a.picks||[],phase)||!picksOwnedBy(p.counterpartyTeam,b.picks||[],phase)){toast('Trade approval blocked: a draft pick is no longer owned by the team offering it.');return;}
       const test={type:'Trade',status:'CONFIRMED',moves},rosters=effectiveRosters(test);if(!rosterIsLegal(rosters[p.proposerTeam]||[])||!rosterIsLegal(rosters[p.counterpartyTeam]||[])){toast('Trade approval blocked by current salary/list/position rules.');return;}
       const fmt=v=>[...(v.players||[]),...(v.picks||[]).map(n=>pickLabel(n,phase))].join(', ')||'No assets',pickTransfers=[...buildPickTransfers(p.proposerTeam,p.counterpartyTeam,a.picks||[],phase),...buildPickTransfers(p.counterpartyTeam,p.proposerTeam,b.picks||[],phase)];
-      action={...test,teamA:p.proposerTeam,teamB:p.counterpartyTeam,phase,timestamp:new Date().toISOString(),picks:{[p.proposerTeam]:a.picks||[],[p.counterpartyTeam]:b.picks||[]},pickTransfers,detail:`${phase}: ${team(p.proposerTeam).owner} sends ${fmt(a)} · ${team(p.counterpartyTeam).owner} sends ${fmt(b)}`};
+      action={...test,teamA:p.proposerTeam,teamB:p.counterpartyTeam,phase,season:currentSeason(),effectiveFromRound:nextUnfinalizedScoringRound(),timestamp:new Date().toISOString(),picks:{[p.proposerTeam]:a.picks||[],[p.counterpartyTeam]:b.picks||[]},pickTransfers,detail:`${phase}: ${team(p.proposerTeam).owner} sends ${fmt(a)} · ${team(p.counterpartyTeam).owner} sends ${fmt(b)}`};
     }else if(p.type==='SWAP'){
       const x=p.payload||{},used=D.transactions.filter(v=>v.type==='Rookie swap'&&v.team===p.proposerTeam).length+getCommissionerActions().filter(v=>v.type==='Rookie swap'&&v.team===p.proposerTeam&&v.status==='CONFIRMED').length,rows=effectiveRosters()[p.proposerTeam]||[],pin=rows.find(r=>r.player===x.playerIn),choices=positionChoices(pin?.position||'');
       const fieldPosition=String(x.fieldPosition||pin?.position||'').toUpperCase();if(!pin||!choices.includes(fieldPosition)){toast('Swap approval blocked: choose a valid PEGS Field position for the incoming player.');return;}
       action={type:'Rookie swap',status:'CONFIRMED',team:p.proposerTeam,playerIn:x.playerIn,playerOut:x.playerOut,playerInPosition:fieldPosition,season:currentSeason(),effectiveFromRound:nextUnfinalizedScoringRound(),timestamp:new Date().toISOString(),detail:`${x.playerIn} → Field (${fieldPosition}); ${x.playerOut} → Interchange`};const rosters=effectiveRosters(action);if(used>=D.rules.maxSwaps||!rosterIsLegal(rosters[p.proposerTeam]||[])){toast('Swap approval blocked by current roster rules or swap limit.');return;}
     }else if(p.type==='DELIST'){
-      const x=p.payload||{},players=[...new Set((x.players||[]).filter(Boolean))],rows=effectiveRosters()[p.proposerTeam]||[],owned=new Set(rows.map(r=>r.player));if(!players.length||!players.every(name=>owned.has(name))){toast('Delisting approval blocked: one or more players are no longer owned by this team.');return;}action={type:'Delisted',status:'CONFIRMED',team:p.proposerTeam,phase:p.phase||'',players,timestamp:new Date().toISOString(),detail:`${p.phase||'Delisting'}: ${players.join(', ')}`};
+      const x=p.payload||{},players=[...new Set((x.players||[]).filter(Boolean))],rows=effectiveRosters()[p.proposerTeam]||[],owned=new Set(rows.map(r=>r.player));if(!players.length||!players.every(name=>owned.has(name))){toast('Delisting approval blocked: one or more players are no longer owned by this team.');return;}action={type:'Delisted',status:'CONFIRMED',team:p.proposerTeam,phase:p.phase||'',season:currentSeason(),effectiveFromRound:nextUnfinalizedScoringRound(),players,timestamp:new Date().toISOString(),detail:`${p.phase||'Delisting'}: ${players.join(', ')}`};
     }else if(p.type==='ELEVATION'){
       if(!backendConfigured()){toast('Rookie elevations require the shared Supabase backend.');return;}
       let approved;try{approved=normalizeProposal(await backendFetch('/rest/v1/rpc/pegs_approve_rookie_elevation',{method:'POST',body:JSON.stringify({p_proposal_id:Number(p.id)})}));}catch(e){toast(e.message||'Rookie elevation approval failed.');return;}
@@ -1954,7 +2027,7 @@
   window.addEventListener('storage',e=>{if([OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,DRAFT_STATE_KEY,PROPOSALS_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,DRAFT_POOL_KEY].includes(e.key)){if(e.key===PROPOSALS_KEY)proposalCache=getLocalProposals();backgroundRefreshUi();}});
 
   // Lightweight non-UI test surface used by the bundled QA script.
-  window.__PEGS_TEST__={render,markInteractionDraft,clearInteractionDraft,backgroundRefreshUi,parseAflFixtureCsv,generatePegsFixture,validatePegsFixture,saveSeasonSetup,getSeasonSetup,saveLiveFeed,getLiveFeed,getSelectionOverrides,saveSelectionOverrides,saveOpeningBank,getOpeningBank,calcTeamRound,effectiveRoundRecord,scoreCountForRoundRecord,topPlayersForRound,effectiveLadder,projectedLadderForRound,liveRoundBadge,liveFeedCompleteForRound,normalizeAvailabilityStatus,unavailableForProjection,mergeProviderTeamRecord,preSeasonDraftOrder,draftPickLedger,teamRoundPlayers,availabilityInfo,currentSeason,effectiveCurrentRound,getProposalWindows,saveProposalWindows,proposalWindowOpen,getScoringSnapshots,saveScoringSnapshots,captureScoringSnapshot,scoringSnapshotForRound,scoringRostersForRound,nextUnfinalizedScoringRound,effectiveRosters,rosterSummary,rosterIsLegal,tradeActionFor,tradeImpactHtml,activeProposalStatus,submitProposal,respondTrade,approveProposal,getDraftState,saveDraftState,draftOrder,currentDraftTeam,nextDraftTeam,draftSecondsRemaining,draftIsOvertime,pushDraftPickBackLocal,advanceDraftLocal,getFigureheadOverrides,saveFigureheadOverrides,figureheadPlayer,figureheadAverage,playerPhotoUrl,finalsConfig,calculatedFinalsBracket,effectiveFinals,roundLabel,finalizeRound};
+  window.__PEGS_TEST__={render,markInteractionDraft,clearInteractionDraft,backgroundRefreshUi,parseAflFixtureCsv,generatePegsFixture,validatePegsFixture,saveSeasonSetup,getSeasonSetup,saveLiveFeed,getLiveFeed,getSelectionOverrides,saveSelectionOverrides,saveOpeningBank,getOpeningBank,calcTeamRound,effectiveRoundRecord,scoreCountForRoundRecord,topPlayersForRound,effectiveLadder,projectedLadderForRound,liveRoundBadge,liveFeedCompleteForRound,normalizeAvailabilityStatus,unavailableForProjection,mergeProviderTeamRecord,preSeasonDraftOrder,draftPickLedger,teamRoundPlayers,availabilityInfo,currentSeason,effectiveCurrentRound,getProposalWindows,saveProposalWindows,proposalWindowOpen,getScoringSnapshots,saveScoringSnapshots,captureScoringSnapshot,scoringSnapshotForRound,scoringRostersForRound,futureScoringRound,nextUnfinalizedScoringRound,effectiveRosters,rosterSummary,rosterIsLegal,tradeActionFor,tradeImpactHtml,activeProposalStatus,submitProposal,respondTrade,approveProposal,getDraftState,saveDraftState,draftOrder,currentDraftTeam,nextDraftTeam,draftSecondsRemaining,draftIsOvertime,pushDraftPickBackLocal,advanceDraftLocal,getFigureheadOverrides,saveFigureheadOverrides,figureheadPlayer,figureheadAverage,playerPhotoUrl,finalsConfig,calculatedFinalsBracket,effectiveFinals,roundLabel,finalizeRound};
 
   if('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('./sw.js').catch(()=>{});
   proposalCache=getLocalProposals();

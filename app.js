@@ -2018,6 +2018,38 @@
     }
   });
 
+  const introLoader={el:document.getElementById('intro-loading-screen'),fill:document.getElementById('intro-loading-fill'),percent:document.getElementById('intro-loading-percent'),label:document.getElementById('intro-loading-label'),skip:document.getElementById('intro-loading-skip'),startedAt:Date.now(),hidden:false};
+
+  function setIntroProgress(value,label){
+    if(!introLoader.el||introLoader.hidden)return;
+    const pct=Math.max(0,Math.min(100,Math.round(Number(value)||0)));
+    if(introLoader.fill)introLoader.fill.style.width=`${pct}%`;
+    if(introLoader.percent)introLoader.percent.textContent=`${pct}%`;
+    if(label&&introLoader.label)introLoader.label.textContent=label;
+  }
+
+  function finishIntroLoader({label='Ready to play',immediate=false}={}){
+    if(!introLoader.el||introLoader.hidden)return Promise.resolve();
+    // Update the visible bar before marking the loader hidden; otherwise
+    // setIntroProgress intentionally ignores the final 100% update.
+    setIntroProgress(100,label);
+    introLoader.hidden=true;
+    if(window.__pegsIntroFailsafe){clearTimeout(window.__pegsIntroFailsafe);window.__pegsIntroFailsafe=0;}
+    const elapsed=Date.now()-introLoader.startedAt;
+    const wait=immediate?0:Math.max(0,1700-elapsed);
+    return new Promise(resolve=>setTimeout(resolve,wait)).then(()=>{
+      introLoader.el.classList.add('is-exiting');
+      setTimeout(()=>introLoader.el?.remove(),700);
+    });
+  }
+
+  setIntroProgress(7,'Warming up stadium lights…');
+  const introAppFailsafe=setTimeout(()=>{void finishIntroLoader({label:'League hub ready',immediate:true});},5500);
+  const finishIntroOriginal=finishIntroLoader;
+  // Keep a local failsafe handle so every normal finish path cancels it.
+  const finishIntroSafely=(options)=>{clearTimeout(introAppFailsafe);return finishIntroOriginal(options);};
+  introLoader.skip?.addEventListener('click',()=>{void finishIntroSafely({label:'Skipping intro…',immediate:true});});
+
   document.getElementById('open-team-login')?.addEventListener('click',()=>{void teamLoginUI();teamDialog.showModal();});
   document.getElementById('open-commissioner').addEventListener('click',()=>{commissionerUI();commissionerDialog.showModal();});
   commissionerDialog?.addEventListener('close',clearInteractionDraft);
@@ -2030,13 +2062,29 @@
   window.__PEGS_TEST__={render,markInteractionDraft,clearInteractionDraft,backgroundRefreshUi,parseAflFixtureCsv,generatePegsFixture,validatePegsFixture,saveSeasonSetup,getSeasonSetup,saveLiveFeed,getLiveFeed,getSelectionOverrides,saveSelectionOverrides,saveOpeningBank,getOpeningBank,calcTeamRound,effectiveRoundRecord,scoreCountForRoundRecord,topPlayersForRound,effectiveLadder,projectedLadderForRound,liveRoundBadge,liveFeedCompleteForRound,normalizeAvailabilityStatus,unavailableForProjection,mergeProviderTeamRecord,preSeasonDraftOrder,draftPickLedger,teamRoundPlayers,availabilityInfo,currentSeason,effectiveCurrentRound,getProposalWindows,saveProposalWindows,proposalWindowOpen,getScoringSnapshots,saveScoringSnapshots,captureScoringSnapshot,scoringSnapshotForRound,scoringRostersForRound,futureScoringRound,nextUnfinalizedScoringRound,effectiveRosters,rosterSummary,rosterIsLegal,tradeActionFor,tradeImpactHtml,activeProposalStatus,submitProposal,respondTrade,approveProposal,getDraftState,saveDraftState,draftOrder,currentDraftTeam,nextDraftTeam,draftSecondsRemaining,draftIsOvertime,pushDraftPickBackLocal,advanceDraftLocal,getFigureheadOverrides,saveFigureheadOverrides,figureheadPlayer,figureheadAverage,playerPhotoUrl,finalsConfig,calculatedFinalsBracket,effectiveFinals,roundLabel,finalizeRound};
 
   if('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('./sw.js').catch(()=>{});
+  setIntroProgress(18,'Loading local league settings…');
   proposalCache=getLocalProposals();
+  setIntroProgress(36,'Rendering franchises and fixtures…');
   const seasonPill=document.getElementById('season-pill-year'); if(seasonPill)seasonPill.textContent=String(currentSeason());
   updateSessionUI();render();
+  setIntroProgress(58,'Base site ready…');
   if(backendConfigured()){
-    (async()=>{await refreshIdentity();await Promise.all([pullSharedState(),syncProposals(),loadDraftPool()]);if(commissionerLoggedIn())await syncServerAuthority();const pill=document.getElementById('season-pill-year');if(pill)pill.textContent=String(currentSeason());updateSessionUI();render();})().catch(()=>{});
+    (async()=>{
+      try{
+        setIntroProgress(68,'Connecting to league server…');
+        await refreshIdentity();
+        setIntroProgress(82,'Syncing scores, trades and draft state…');
+        await Promise.all([pullSharedState(),syncProposals(),loadDraftPool()]);
+        if(commissionerLoggedIn()){setIntroProgress(92,'Authorising commissioner controls…');await syncServerAuthority();}
+        const pill=document.getElementById('season-pill-year');if(pill)pill.textContent=String(currentSeason());
+        updateSessionUI();render();
+        await finishIntroSafely({label:'League hub ready'});
+      }catch(_){
+        await finishIntroSafely({label:'Loaded in offline mode'});
+      }
+    })();
     setInterval(()=>Promise.all([pullSharedState(),syncProposals(),loadDraftPool()]).then(()=>{const pill=document.getElementById('season-pill-year');if(pill)pill.textContent=String(currentSeason());backgroundRefreshUi();}).catch(()=>{}),10000);
     const refreshSeconds=Math.max(60,Number(CONFIG.liveRefreshSeconds||90));
     setInterval(()=>{if(activeSeasonSetup()?.liveScoringEnabled!==false)void syncLiveProvider(false);},refreshSeconds*1000);
-  }
+  } else void finishIntroSafely({label:'League hub ready'});
 })();

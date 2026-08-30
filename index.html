@@ -61,6 +61,7 @@
       </nav>
       <div class="header-actions">
         <span class="season-pill"><span class="status-dot"></span><span id="season-pill-year">2026</span></span>
+        <button class="team-login-button" id="open-team-login" aria-label="Team login"><span id="team-login-label">Team Login</span><span id="team-notification-dot" class="notification-dot" hidden></span></button>
         <button class="icon-button" id="open-commissioner" aria-label="Commissioner login" title="Commissioner login">
           <span aria-hidden="true">C</span>
         </button>
@@ -81,6 +82,17 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
+  <dialog id="team-dialog" class="commissioner-dialog team-dialog" aria-labelledby="team-login-title">
+    <form method="dialog" class="dialog-head">
+      <div>
+        <span class="eyebrow">Franchise access</span>
+        <h2 id="team-login-title">Team Login</h2>
+      </div>
+      <button class="icon-button" aria-label="Close team login">X</button>
+    </form>
+    <div id="team-login-content"></div>
+  </dialog>
+
   <dialog id="commissioner-dialog" class="commissioner-dialog" aria-labelledby="commissioner-title">
     <form method="dialog" class="dialog-head">
       <div>
@@ -91,6 +103,16 @@
     </form>
     <div id="commissioner-content"></div>
   </dialog>
+
+
+  <script>
+    window.__pegsIntroFailsafe = window.setTimeout(function(){
+      var el=document.getElementById('intro-loading-screen');
+      if(!el)return;
+      el.classList.add('is-exiting');
+      window.setTimeout(function(){if(el&&el.parentNode)el.parentNode.removeChild(el);},800);
+    },7000);
+  </script>
 
   <script src="config.js"></script>
   <script src="league-data.js"></script>

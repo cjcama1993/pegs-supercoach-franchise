@@ -147,7 +147,7 @@
     if(!backendConfigured())return '';
     const teamCode=AFL_CLUB_TO_CODE[String(club||'').toUpperCase()]||AFL_NAME_TO_CODE[String(club||'').toUpperCase()]||String(club||'').toUpperCase();
     const fn=CONFIG.playerPhotoFunction||'supercoach-photo';
-    return `${CONFIG.supabaseUrl.replace(/\/$/,'')}/functions/v1/${encodeURIComponent(fn)}?player=${encodeURIComponent(player)}&team=${encodeURIComponent(teamCode)}`;
+    return `${CONFIG.supabaseUrl.replace(/\/$/,'')}/functions/v1/${encodeURIComponent(fn)}?player=${encodeURIComponent(player)}&team=${encodeURIComponent(teamCode)}&v=3`;
   }
   function figurehead(key,size=''){
     const t=team(key),p=figureheadPlayer(key),src=playerPhotoUrl(p.player,p.club),initials=String(p.player||t.owner).split(/\s+/).slice(0,2).map(x=>x[0]||'').join('').toUpperCase();
@@ -241,6 +241,7 @@
   function applyScoringAction(rosters,a){
     if(a.type==='Trade'){
       for(const move of a.moves||[]){const from=rosters[move.from]||[],idx=from.findIndex(p=>p.player===move.player);if(idx>=0){const [rec]=from.splice(idx,1);(rosters[move.to]||(rosters[move.to]=[])).push(rec);}}
+      for(const [teamKey,names] of Object.entries(a.conditionalDelists||{})){const remove=new Set((names||[]).filter(Boolean));if(remove.size)rosters[teamKey]=(rosters[teamKey]||[]).filter(p=>!remove.has(p.player));}
     }else if(a.type==='Rookie swap'){
       const rows=rosters[a.team]||[],pin=rows.find(p=>p.player===a.playerIn),pout=rows.find(p=>p.player===a.playerOut);if(pin){pin.status='Field';if(a.playerInPosition)pin.position=String(a.playerInPosition).toUpperCase();}if(pout)pout.status='Interchange';
     }else if(a.type==='Rookie elevation'&&a.team&&a.player){
@@ -645,9 +646,12 @@
     document.getElementById('team-login-password')?.addEventListener('keydown',e=>{if(e.key==='Enter')void login();});
   }
 
-  function tradeActionFor(teamA,teamB,assetsA,assetsB){
+  function tradeActionFor(teamA,teamB,assetsA,assetsB,conditionalDelistsA=[],conditionalDelistsB=[]){
     const moves=[];(assetsA?.players||[]).forEach(player=>moves.push({player,from:teamA,to:teamB}));(assetsB?.players||[]).forEach(player=>moves.push({player,from:teamB,to:teamA}));
-    return {type:'Trade',status:'CONFIRMED',teamA,teamB,moves};
+    const conditionalDelists={};
+    if(teamA)conditionalDelists[teamA]=[...new Set((conditionalDelistsA||[]).filter(Boolean))];
+    if(teamB)conditionalDelists[teamB]=[...new Set((conditionalDelistsB||[]).filter(Boolean))];
+    return {type:'Trade',status:'CONFIRMED',teamA,teamB,moves,conditionalDelists};
   }
   function rosterImpactTeamHtml(teamKey,beforeRows,afterRows,label='After proposed move'){
     const b=rosterSummary(beforeRows||[]),a=rosterSummary(afterRows||[]),legal=rosterIsLegal(afterRows||[]);
@@ -656,9 +660,9 @@
     return `<article class="trade-impact-card ${legal?'legal':'blocked'}"><div class="section-title"><div class="trade-team-label" style="--trade-accent:${esc(team(teamKey).accent)}"><span class="trade-team-dot"></span><div><strong>${esc(team(teamKey).name)}</strong><small>${esc(team(teamKey).owner)}</small></div></div><span class="eyebrow">${esc(label)}</span><span class="badge ${legal?'green':'red'}">${legal?'CAN ACCOMMODATE':'BLOCKED'}</span></div><div class="trade-impact-head"><span>Rule</span><span>Before</span><span></span><span>After</span></div>${item('Main salary',b.caps.main,a.caps.main,D.rules.mainContractCap)}${item('Field salary',b.caps.field,a.caps.field,D.rules.fieldCap)}${item('Rookie salary',b.caps.rookie,a.caps.rookie,D.rules.rookieContractCap)}${item('Main contracts',b.counts.main||0,a.counts.main||0,28,'count')}${item('Field players',b.counts.field,a.counts.field,D.rules.maxFieldPlayers,'count')}<div class="trade-position-impact">${Object.entries(D.rules.positionMax).map(([pos,max])=>`<span class="${Number(a.counts[pos]||0)>Number(max)?'impact-bad':''}">${pos} <b>${b.counts[pos]||0} → ${a.counts[pos]||0}</b> / ${max}</span>`).join('')}${invalid?`<span class="impact-bad">Invalid field position <b>${invalid}</b></span>`:''}</div></article>`;
   }
   function tradeImpactTeamHtml(teamKey,beforeRows,afterRows){return rosterImpactTeamHtml(teamKey,beforeRows,afterRows,'After proposed trade');}
-  function tradeImpactHtml(teamA,teamB,assetsA,assetsB){
+  function tradeImpactHtml(teamA,teamB,assetsA,assetsB,conditionalDelistsA=[],conditionalDelistsB=[]){
     if(!teamA||!teamB)return '<div class="notice">Choose both franchises to see the trade impact.</div>';
-    const before=effectiveRosters(),after=effectiveRosters(tradeActionFor(teamA,teamB,assetsA,assetsB));
+    const before=effectiveRosters(),after=effectiveRosters(tradeActionFor(teamA,teamB,assetsA,assetsB,conditionalDelistsA,conditionalDelistsB));
     return `<div class="trade-impact-grid">${tradeImpactTeamHtml(teamA,before[teamA]||[],after[teamA]||[])}${tradeImpactTeamHtml(teamB,before[teamB]||[],after[teamB]||[])}</div>`;
   }
 
@@ -681,15 +685,20 @@
     const rec=tradeAssetPickRecord(ref,type),t=team(teamKey),origin=rec.originalOwner&&teamMap[rec.originalOwner]?team(rec.originalOwner).owner:'Original owner';
     return `<article class="trade-visual-pick" style="--trade-accent:${esc(t.accent)}"><div class="trade-pick-number"><span>R${Number(rec.round||0)}</span><strong>${Number(rec.pick||0)}</strong></div><div><span class="eyebrow">${esc(rec.season)} ${esc(rec.type)}</span><h4>PICK ${Number(rec.pick||0)}</h4><small>${esc(origin)}${rec.owner&&rec.originalOwner&&rec.owner!==rec.originalOwner?' · acquired pick':''}</small></div></article>`;
   }
-  function tradeVisualSide(teamKey,targetKey,assets,type='Pre-Season'){
-    if(!teamKey)return '<div class="trade-visual-empty">Select a franchise.</div>';
-    const t=team(teamKey),players=assets?.players||[],picks=assets?.picks||[],cards=[...players.map(x=>tradeVisualPlayerCard(teamKey,x)),...picks.map(x=>tradeVisualPickCard(teamKey,x,type))];
-    const sum=rosterSummary(effectiveRosters()[teamKey]||[]),count=[players.length?`${players.length} player${players.length===1?'':'s'}`:'',picks.length?`${picks.length} pick${picks.length===1?'':'s'}`:''].filter(Boolean).join(' · ')||'No assets selected';
-    return `<section class="trade-visual-side" style="--trade-accent:${esc(t.accent)}"><div class="trade-visual-side-head"><div class="trade-team-label large" style="--trade-accent:${esc(t.accent)}"><span class="trade-team-dot"></span><div><span class="eyebrow">Sends to ${esc(targetKey?team(targetKey).name:'trade partner')}</span><h3>${esc(t.name)}</h3><small>${esc(t.owner)}</small></div></div><span class="badge neutral">${esc(count)}</span></div><div class="trade-visual-cap-chips"><span>Main room ${compactMoney(D.rules.mainContractCap-sum.caps.main)}</span><span>Field room ${compactMoney(D.rules.fieldCap-sum.caps.field)}</span><span>Rookie room ${compactMoney(D.rules.rookieContractCap-sum.caps.rookie)}</span></div><div class="trade-visual-assets">${cards.join('')||'<div class="trade-visual-empty">Select players or draft picks to preview them here.</div>'}</div></section>`;
+  function tradeVisualDelistCard(teamKey,name){
+    const rec=tradeAssetPlayerRecord(teamKey,name);if(!rec)return '';
+    const t=team(teamKey),src=playerPhotoUrl(rec.player,rec.club),initials=String(rec.player||'').split(/\s+/).slice(0,2).map(x=>x[0]||'').join('').toUpperCase();
+    return `<article class="trade-visual-player trade-visual-delist" style="--trade-accent:${esc(t.accent)}"><div class="trade-visual-headshot"><span>${esc(initials||t.code)}</span>${src?`<img src="${esc(src)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.remove()">`:''}</div><div class="trade-visual-copy"><div class="trade-visual-player-top"><strong>${esc(rec.player)}</strong><b>− ${money(rec.salary)}</b></div><div class="trade-visual-position-row"><span>CONDITIONAL DELIST</span></div><small>Removed only if this trade is accepted and Commissioner-approved.</small></div></article>`;
   }
-  function tradeVisualAssetsHtml(teamA,teamB,assetsA,assetsB,type='Pre-Season'){
+  function tradeVisualSide(teamKey,targetKey,assets,type='Pre-Season',conditionalDelists=[]){
+    if(!teamKey)return '<div class="trade-visual-empty">Select a franchise.</div>';
+    const t=team(teamKey),players=assets?.players||[],picks=assets?.picks||[],delists=(conditionalDelists||[]).filter(Boolean),cards=[...players.map(x=>tradeVisualPlayerCard(teamKey,x)),...picks.map(x=>tradeVisualPickCard(teamKey,x,type)),...delists.map(x=>tradeVisualDelistCard(teamKey,x))];
+    const sum=rosterSummary(effectiveRosters()[teamKey]||[]),count=[players.length?`${players.length} player${players.length===1?'':'s'}`:'',picks.length?`${picks.length} pick${picks.length===1?'':'s'}`:'',delists.length?`${delists.length} delist${delists.length===1?'':'s'}`:''].filter(Boolean).join(' · ')||'No assets selected';
+    return `<section class="trade-visual-side" style="--trade-accent:${esc(t.accent)}"><div class="trade-visual-side-head"><div class="trade-team-label large" style="--trade-accent:${esc(t.accent)}"><span class="trade-team-dot"></span><div><span class="eyebrow">Sends to ${esc(targetKey?team(targetKey).name:'trade partner')}</span><h3>${esc(t.name)}</h3><small>${esc(t.owner)}</small></div></div><span class="badge neutral">${esc(count)}</span></div><div class="trade-visual-cap-chips"><span>Main room ${compactMoney(D.rules.mainContractCap-sum.caps.main)}</span><span>Field room ${compactMoney(D.rules.fieldCap-sum.caps.field)}</span><span>Rookie room ${compactMoney(D.rules.rookieContractCap-sum.caps.rookie)}</span></div><div class="trade-visual-assets">${cards.join('')||'<div class="trade-visual-empty">Select players, draft picks or conditional delistings to preview them here.</div>'}</div></section>`;
+  }
+  function tradeVisualAssetsHtml(teamA,teamB,assetsA,assetsB,type='Pre-Season',conditionalDelistsA=[],conditionalDelistsB=[]){
     if(!teamA||!teamB)return '<div class="trade-visual-empty trade-visual-empty-wide">Choose a trade partner to open the visual trade board.</div>';
-    return `<div class="trade-visual-board">${tradeVisualSide(teamA,teamB,assetsA,type)}<div class="trade-visual-swap">⇄</div>${tradeVisualSide(teamB,teamA,assetsB,type)}</div>`;
+    return `<div class="trade-visual-board">${tradeVisualSide(teamA,teamB,assetsA,type,conditionalDelistsA)}<div class="trade-visual-swap">⇄</div>${tradeVisualSide(teamB,teamA,assetsB,type,conditionalDelistsB)}</div>`;
   }
 
 
@@ -818,6 +827,7 @@
     for(const a of actions){
       if(a.type==='Trade'){
         for(const move of a.moves||[]){const from=out[move.from]||[];const idx=from.findIndex(p=>p.player===move.player);if(idx>=0){const [rec]=from.splice(idx,1);(out[move.to]||(out[move.to]=[])).push(rec);}}
+        for(const [teamKey,names] of Object.entries(a.conditionalDelists||{})){const remove=new Set((names||[]).filter(Boolean));if(remove.size)out[teamKey]=(out[teamKey]||[]).filter(p=>!remove.has(p.player));}
       } else if(a.type==='Rookie swap'){
         const rows=out[a.team]||[]; const pin=rows.find(p=>p.player===a.playerIn); const pout=rows.find(p=>p.player===a.playerOut); if(pin){pin.status='Field';if(a.playerInPosition)pin.position=String(a.playerInPosition).toUpperCase();} if(pout) pout.status='Interchange';
       } else if(a.type==='Rookie elevation' && a.team && a.player){
@@ -1000,10 +1010,13 @@
     return `<div class="page-head"><div><span class="eyebrow">${esc(eyebrow)}</span><h1>${esc(title)}</h1><p>${esc(sub)}</p></div>${extra}</div>`;
   }
 
-  function capMeter(label, value, cap, tone = 'green') {
-    const pct = Math.min(100, Math.max(0, Number(value || 0) / Number(cap || 1) * 100));
-    const meter = pct > 98 ? '#f0b54b' : tone === 'blue' ? '#4d91ff' : '#59ca65';
-    return `<div class="cap-row"><div class="cap-label"><span>${esc(label)}</span><strong>${compactMoney(value)} / ${compactMoney(cap)}</strong></div><div class="meter" aria-label="${esc(label)} ${pct.toFixed(1)} percent used"><span style="--pct:${pct.toFixed(1)}%;--meter:${meter}"></span></div></div>`;
+  function capMeter(label, value, cap) {
+    const used = Number(value || 0), limit = Number(cap || 1);
+    const rawPct = Math.max(0, used / limit * 100);
+    const pct = Math.min(100, rawPct);
+    const legal = used <= limit;
+    const meter = legal ? '#59ca65' : '#e32636';
+    return `<div class="cap-row ${legal?'cap-legal':'cap-illegal'}"><div class="cap-label"><span>${esc(label)}</span><strong>${compactMoney(value)} / ${compactMoney(cap)}</strong></div><div class="meter" aria-label="${esc(label)} ${rawPct.toFixed(1)} percent used · ${legal?'legal':'illegal'}"><span style="--pct:${pct.toFixed(1)}%;--meter:${meter}"></span></div></div>`;
   }
 
   function routeTo(route) {
@@ -1182,7 +1195,7 @@
     if (!selected) selected = roundFixtures.find(f => f.away) || roundFixtures[0];
     const opts = [...new Set(fixtures.map(f=>Number(f.round)))].sort((a,b)=>a-b).map(r=>`<option value="${r}" ${r===round?'selected':''}>${roundLabel(r)}</option>`).join('');
     main.innerHTML = `${pageHeader('Match centre','Head-to-head matchups','Opening Round banks scores only. PEGS head-to-head fixtures begin in Round 1, with the counted-player total matching the number of AFL clubs playing.',`<div class="filters"><label class="screen-reader-only" for="round-select">Round</label><select class="select" id="round-select">${opts}</select></div>`)}
-      ${(()=>{const setup=activeSeasonSetup(),op=setup?.openingRound||D.openingRound;if(op?.enabled===false)return '<section class="card opening-bank-card no-opening"><div><span class="eyebrow kicker">Season format</span><h2>No Opening Round this season</h2><p>PEGS scoring begins with Round 1. Bye-round player counts are calculated directly from the AFL fixture.</p></div></section>';const banks=(setup?.rounds||[]).filter(r=>(r.bankClubs||[]).length).map(r=>'R'+r.round).join(' / ')||'early bye rounds';return `<section class="card opening-bank-card"><div><span class="eyebrow kicker">${esc(op?.label||'Opening Round')}</span><h2>Score bank only - no head-to-head matchup</h2><p>Opening Round scores are banked only for clubs that later have a bye in configured early rounds.</p></div><div class="opening-bank-flow"><span>Opening Round</span><b>→</b><span>${banks}</span></div></section>`;})()}
+      ${(()=>{const setup=activeSeasonSetup(),op=setup?.openingRound||D.openingRound;if(op?.enabled===false)return '<section class="card opening-bank-card no-opening"><div><span class="eyebrow kicker">Season format</span><h2>No Opening Round this season</h2><p>PEGS scoring begins with Round 1. Bye-round player counts are calculated directly from the AFL fixture.</p></div></section>';const setupBankRounds=(setup?.rounds||[]).filter(r=>(r.bankClubs||[]).length).map(r=>Number(r.round)).filter(Number.isFinite),fallbackBankRounds=Object.entries(D.openingRound?.byeBanks||{}).filter(([,clubs])=>Array.isArray(clubs)&&clubs.length).map(([r])=>Number(r)).filter(Number.isFinite),bankRounds=setupBankRounds.length?setupBankRounds:fallbackBankRounds,lastBankRound=bankRounds.length?Math.max(...bankRounds):0,completed=Number(setup?.completedThroughRound||0),current=Number(setup?.currentRound||effectiveCurrentRound()||1);if(!lastBankRound||completed>=lastBankRound||current>lastBankRound)return '';const banks=bankRounds.sort((a,b)=>a-b).map(r=>'R'+r).join(' / ');return `<section class="card opening-bank-card"><div><span class="eyebrow kicker">${esc(op?.label||'Opening Round')}</span><h2>Score bank only - no head-to-head matchup</h2><p>Opening Round scores are banked only for clubs that later have a bye in configured early rounds.</p></div><div class="opening-bank-flow"><span>Opening Round</span><b>→</b><span>${banks}</span></div></section>`;})()}
       <div class="fixture-grid">${roundFixtures.map(f=>fixtureCard(round,f,selected===f)).join('')}</div>
       ${selected ? renderMatchupDetail(round,selected.home,selected.away) : '<div class="card empty">No fixtures in this round.</div>'}`;
   }
@@ -1216,7 +1229,7 @@
       ${teamIdentity(t.key)}
       <div class="badge ${teamValidity(t)?'green':'red'}">${teamValidity(t)?'Roster legal':'Review roster'}</div>
       ${capMeter('Main contracts',t.caps.main,D.rules.mainContractCap)}
-      ${capMeter('Field',t.caps.field,D.rules.fieldCap,'blue')}
+      ${capMeter('Field',t.caps.field,D.rules.fieldCap)}
       ${capMeter('Rookie contracts',t.caps.rookie,D.rules.rookieContractCap)}
       <div class="position-chips">${Object.entries(D.rules.positionMax).map(([p,max])=>`<span class="position-chip ${(t.counts[p]||0)===max?'complete':''}">${p} ${t.counts[p]||0}/${max}</span>`).join('')}<span class="position-chip">INT ${t.counts.interchange||0}</span></div>
     </button>`;
@@ -1225,6 +1238,48 @@
   function renderTeams() {
     main.innerHTML = `${pageHeader('Franchises','Teams','Current 2026 lists from the workbook, with contract and salary-cap validation built in.')}
       <div class="team-grid">${D.teams.map(t=>teamCard(effectiveTeam(t.key))).join('')}</div>`;
+  }
+
+  function directPlayerPortrait(player,size=''){
+    const src=playerPhotoUrl(player.player,player.club),initials=String(player.player||'').split(/\s+/).slice(0,2).map(x=>x[0]||'').join('').toUpperCase();
+    return `<span class="field-player-portrait ${size}" title="${esc(player.player)}"><span>${esc(initials||'?')}</span>${src?`<img src="${esc(src)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" onload="this.parentElement.classList.add('photo-ready')" onerror="this.remove()">`:''}</span>`;
+  }
+
+  function aflFieldPlayerCard(player){
+    return `<article class="afl-field-player" title="${esc(player.player)} · ${money(player.salary)} · contract ends ${esc(player.contractEnd||'—')}">
+      ${directPlayerPortrait(player,'field')}
+      <div class="afl-field-player-copy"><strong>${esc(player.player)}</strong><span>${money(player.salary)}</span><small>Ends ${esc(player.contractEnd||'—')}</small></div>
+    </article>`;
+  }
+
+  function aflFieldZone(label,players,zoneClass){
+    return `<section class="afl-field-zone ${zoneClass}"><span class="afl-field-zone-label">${esc(label)}</span><div class="afl-field-zone-players">${players.map(aflFieldPlayerCard).join('')||'<span class="afl-field-empty">No players</span>'}</div></section>`;
+  }
+
+  function teamAflField(roster){
+    const field=roster.filter(p=>String(p.status).toLowerCase()==='field');
+    const groups={DEF:[],MID:[],FWD:[],RUC:[]};
+    field.forEach(p=>{const pos=String(p.position||'').toUpperCase();if(groups[pos])groups[pos].push(p);});
+    Object.values(groups).forEach(rows=>rows.sort((a,b)=>a.player.localeCompare(b.player)));
+    return `<div class="afl-field-shell">
+      <div class="afl-field-goals top" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+      <div class="afl-field-markings" aria-hidden="true"><span class="afl-field-centre-square"></span><span class="afl-field-centre-circle"></span><span class="afl-field-arc top"></span><span class="afl-field-arc bottom"></span></div>
+      <div class="afl-field-zones">
+        ${aflFieldZone('DEF',groups.DEF,'defenders')}
+        ${aflFieldZone('MID',groups.MID,'mids')}
+        ${aflFieldZone('RUC',groups.RUC,'rucks')}
+        ${aflFieldZone('FWD',groups.FWD,'forwards')}
+      </div>
+      <div class="afl-field-goals bottom" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+    </div>`;
+  }
+
+  function rosterListRow(player){
+    return `<div class="team-roster-list-row ${String(player.status).toLowerCase()==='field'?'is-field':'is-interchange'}">
+      <div class="team-roster-list-player">${directPlayerPortrait(player,'list')}<span><strong>${esc(player.player)}</strong><small>${esc(player.club)} · ${esc(player.position)}</small></span></div>
+      <span class="team-roster-contract"><b>${esc(player.contract)}</b><small>Ends ${esc(player.contractEnd||'—')}</small></span>
+      <span class="team-roster-salary">${money(player.salary)}<small>${esc(player.status)}</small></span>
+    </div>`;
   }
 
   function renderTeamDetail(key) {
@@ -1239,12 +1294,19 @@
       <section class="card team-detail-head">
         <div class="team-figurehead-hero">${figurehead(t.key,'lg')}<span>${esc(figureheadPlayer(t.key).player)}</span></div>
         <div><span class="badge ${teamValidity(t)?'green':'red'}">${teamValidity(t)?'All cap tests passed':'Roster requires review'}</span><h1>${esc(t.owner)}</h1><p>${esc(t.name)} - ${esc(t.code)}</p><div class="stat-strip" style="grid-template-columns:repeat(3,1fr);margin-bottom:0"><div class="stat-box"><span>Team score avg</span><strong>${avg}</strong></div><div class="stat-box"><span>Field players</span><strong>${t.counts.field}</strong></div><div class="stat-box"><span>Interchange</span><strong>${t.counts.interchange}</strong></div></div></div>
-        <div class="cap-stack">${capMeter('Main contract cap',t.caps.main,D.rules.mainContractCap)}${capMeter('Field cap',t.caps.field,D.rules.fieldCap,'blue')}${capMeter('Rookie contract cap',t.caps.rookie,D.rules.rookieContractCap)}</div>
+        <div class="cap-stack">${capMeter('Main contract cap',t.caps.main,D.rules.mainContractCap)}${capMeter('Field cap',t.caps.field,D.rules.fieldCap)}${capMeter('Rookie contract cap',t.caps.rookie,D.rules.rookieContractCap)}</div>
       </section>
-      <div class="roster-tabs" role="group" aria-label="Roster filter">${filters.map(f=>`<button class="tab-button ${selectedRosterFilter===f?'active':''}" data-action="roster-filter" data-filter="${f}">${f==='INTERCHANGE'?'Interchange':f}</button>`).join('')}</div>
-      <div class="table-wrap"><table class="data-table"><caption>${esc(t.name)} roster - ${visible.length} shown</caption><thead><tr><th>Player</th><th>AFL club</th><th>Pos</th><th>Contract</th><th>Salary</th><th>Expires</th><th>Status</th></tr></thead><tbody>
-        ${rows.map(p=>`<tr><td><strong>${esc(p.player)}</strong></td><td>${esc(p.club)}</td><td><span class="badge neutral">${esc(p.position)}</span></td><td>${esc(p.contract)}</td><td class="money">${money(p.salary)}</td><td>${esc(p.contractEnd)}</td><td class="status-text ${p.status==='Field'?'status-field':'status-interchange'}">${esc(p.status)}</td></tr>`).join('')}
-      </tbody></table></div>`;
+      <section class="team-roster-field-layout">
+        <div class="team-roster-list-panel">
+          <div class="team-roster-panel-head"><div><span class="eyebrow">Contracted list</span><h2>Player list</h2></div><span class="badge neutral">${visible.length} shown</span></div>
+          <div class="roster-tabs" role="group" aria-label="Roster filter">${filters.map(f=>`<button class="tab-button ${selectedRosterFilter===f?'active':''}" data-action="roster-filter" data-filter="${f}">${f==='INTERCHANGE'?'Interchange':f}</button>`).join('')}</div>
+          <div class="team-roster-list">${rows.map(rosterListRow).join('')||'<div class="empty">No players match this filter.</div>'}</div>
+        </div>
+        <div class="team-afl-field-panel">
+          <div class="team-roster-panel-head"><div><span class="eyebrow">Starting field</span><h2>On-field 28</h2></div><span class="badge green">${roster.filter(p=>String(p.status).toLowerCase()==='field').length} players</span></div>
+          ${teamAflField(roster)}
+        </div>
+      </section>`;
   }
 
   function recentTeamScores(teamKey, n=5) {
@@ -1252,9 +1314,22 @@
     return Object.entries(D.roundTotals).filter(([r])=>Number(r)<=20).sort((a,b)=>Number(a[0])-Number(b[0])).map(([,v])=>Number(v[teamKey]||0)).filter(Boolean).slice(-n);
   }
 
+  function recentTeamForm(teamKey,n=5){
+    const setup=activeSeasonSetup(),regular=Number(setup?.pegsRegularRounds||20),fixtures=(setup?.pegsFixtures?.length?setup.pegsFixtures:D.fixtures||[]).filter(f=>Number(f.round)<=regular&&f.home&&f.away&&(f.home===teamKey||f.away===teamKey)).sort((a,b)=>Number(a.round)-Number(b.round)),results=setup?(getSeasonResults()?.[String(currentSeason())]||{}):null,out=[];
+    for(const f of fixtures){
+      let hs=0,as=0,complete=false;
+      if(setup){const rr=results[String(f.round)];if(!rr)continue;hs=Number(rr.teamScores?.[f.home]||0);as=Number(rr.teamScores?.[f.away]||0);complete=Boolean(rr.finalizedAt||roundFinalized(f.round));}
+      else {const totals=D.roundTotals?.[String(f.round)]||D.roundTotals?.[Number(f.round)];if(!totals)continue;hs=Number(totals[f.home]||0);as=Number(totals[f.away]||0);complete=Boolean(hs||as);}
+      if(!complete)continue;
+      const own=f.home===teamKey?hs:as,opp=f.home===teamKey?as:hs;
+      out.push(own>opp?'W':own<opp?'L':'D');
+    }
+    return out.slice(-n);
+  }
+
   function formBars(teamKey) {
-    const vals = recentTeamScores(teamKey,5); const max = Math.max(...vals,1); const min = Math.min(...vals,0);
-    return `<div class="form-guide" aria-label="Last five scores: ${vals.join(', ')}">${vals.map(v=>`<span style="height:${Math.max(4,Math.round((v-min)/(max-min||1)*20)+4)}px" title="${v}"></span>`).join('')}</div>`;
+    const form=recentTeamForm(teamKey,5);
+    return `<div class="form-results" aria-label="Last five results: ${form.join(', ')}">${form.length?form.map(v=>`<span class="${v==='W'?'win':v==='L'?'loss':'draw'}" title="${v==='W'?'Win':v==='L'?'Loss':'Draw'}">${v}</span>`).join(''):'<span class="empty-form">—</span>'}</div>`;
   }
 
   function effectiveLadder(){
@@ -1422,9 +1497,10 @@
   function proposalSummary(p){
     const x=p.payload||{};
     if(p.type==='TRADE'){
-      const a=x.assetsA||{players:[],picks:[]},b=x.assetsB||{players:[],picks:[]};
+      const a=x.assetsA||{players:[],picks:[]},b=x.assetsB||{players:[],picks:[]},da=x.conditionalDelistsA||[],db=x.conditionalDelistsB||[];
       const fmt=v=>[...(v.players||[]),...(v.picks||[]).map(n=>pickLabel(n,p.phase))].join(', ')||'No assets';
-      return `${team(p.proposerTeam).name} sends ${fmt(a)} · ${team(p.counterpartyTeam).name} sends ${fmt(b)}`;
+      const delistText=(names=[])=>names.length?` · conditional delist ${names.join(', ')}`:'';
+      return `${team(p.proposerTeam).name} sends ${fmt(a)}${delistText(da)} · ${team(p.counterpartyTeam).name} sends ${fmt(b)}${delistText(db)}`;
     }
     if(p.type==='SWAP') return `${x.playerIn||''} → Field · ${x.playerOut||''} → Interchange`;
     if(p.type==='DELIST') return `${(x.players||[]).join(', ')||'No players selected'}`;
@@ -1442,21 +1518,22 @@
     clearInteractionDraft();
     const adminTx=getCommissionerActions().filter(x=>x.status==='CONFIRMED').map(x=>({timestamp:x.timestamp,type:x.type,team:x.team||x.teamA,detail:x.detail||'',status:x.status}));
     const allTx=[...adminTx,...D.transactions].sort((a,b)=>String(b.timestamp||'').localeCompare(String(a.timestamp||''))),types=['All',...new Set(allTx.map(x=>x.type))],selected=(new URLSearchParams(location.hash.split('?')[1]||'')).get('type')||'All',rows=allTx.filter(x=>selected==='All'||x.type===selected).slice(0,250);
-    const windows=getProposalWindows(),tradeOpen=Boolean(windows.trade.open),delistOpen=Boolean(windows.delist.open),elevationOpen=Boolean(windows.elevation?.open),tradePhase=windows.trade.phase||'Pre-Season',delistPhase=windows.delist.phase||'Pre-Season',elevationPhase=windows.elevation?.phase||'Pre-Season',elevationSeason=Number(windows.elevation?.season||elevationSeasonFor(elevationPhase)),myTeam=loggedTeamKey(),logged=teamLoggedIn();
+    const windows=getProposalWindows(),tradeOpen=Boolean(windows.trade.open),delistOpen=Boolean(windows.delist.open),elevationOpen=Boolean(windows.elevation?.open),tradePhase=windows.trade.phase||'Pre-Season',delistPhase=windows.delist.phase||'Pre-Season',elevationPhase=windows.elevation?.phase||'Pre-Season',elevationSeason=Number(windows.elevation?.season||elevationSeasonFor(elevationPhase)),conditionalDelistOpen=tradeOpen&&delistOpen&&String(tradePhase)===String(delistPhase),myTeam=loggedTeamKey(),logged=teamLoggedIn();
     const tradeStatus=tradeOpen?`<span class="badge green">OPEN · ${esc(tradePhase)}</span>`:'<span class="badge red">CLOSED</span>',delistStatus=delistOpen?`<span class="badge green">OPEN · ${esc(delistPhase)}</span>`:'<span class="badge red">CLOSED</span>',elevationStatus=elevationOpen?`<span class="badge green">OPEN · ${esc(elevationPhase)}</span>`:'<span class="badge red">CLOSED</span>';
     const pendingMine=logged?proposalCache.filter(p=>activeProposalStatus(p.status)&&(p.proposerTeam===myTeam||p.counterpartyTeam===myTeam)&&p.type!=='DRAFT_PICK'):[],incoming=logged?incomingTradeRequests():[];
     const playerSlots=(side,key='')=>[1,2,3].map(i=>`<div class="field-group"><label>Player ${i} (optional)</label><select class="select proposal-player" id="proposal-player-${side}-${i}" data-side="${side}" ${key&&tradeOpen?'':'disabled'}>${playerOptions(key,null,'No player')}</select></div>`).join('');
     const pickSlots=(side,key='',phase=tradePhase)=>[1,2,3].map(i=>`<div class="field-group"><label>Draft pick ${i} (optional)</label><select class="select proposal-pick" id="proposal-pick-${side}-${i}" data-side="${side}" ${key&&tradeOpen?'':'disabled'}>${pickOptions(key,phase,'No pick')}</select></div>`).join('');
-    const incomingCards=incoming.map(p=>{const x=p.payload||{},a=x.assetsA||{players:[],picks:[]},b=x.assetsB||{players:[],picks:[]},after=effectiveRosters(tradeActionFor(p.proposerTeam,p.counterpartyTeam,a,b)),legalNow=rosterIsLegal(after[p.proposerTeam]||[])&&rosterIsLegal(after[p.counterpartyTeam]||[]);return `<article class="proposal-card incoming-trade-card"><div class="proposal-card-head"><div>${teamIdentity(p.proposerTeam,'sm')}<span class="badge ${legalNow?'amber':'red'}">${legalNow?'YOUR DECISION':'NOW BLOCKED'}</span></div><time>${fmtDate(p.createdAt)}</time></div><strong>Trade request from ${esc(team(p.proposerTeam).owner)}</strong><p>${esc(proposalSummary(p))}</p>${tradeVisualAssetsHtml(p.proposerTeam,p.counterpartyTeam,a,b,p.phase||'Pre-Season')}${tradeImpactHtml(p.proposerTeam,p.counterpartyTeam,a,b)}${legalNow?'':`<div class="notice danger"><strong>This trade cannot currently be accepted.</strong> One or both franchises would breach a salary, list or Field-position rule.</div>`}<div class="button-row"><button class="primary-button" data-trade-accept="${esc(p.id)}" ${legalNow?'':'disabled'}>${legalNow?'Accept & send to Commissioner':'Cannot accept'}</button><button class="secondary-button" data-trade-decline="${esc(p.id)}">Decline</button></div></article>`;}).join('');
+    const conditionalDelistSlots=(side,key='')=>[1,2,3].map(i=>`<div class="field-group"><label>Conditional delist ${i} (optional)</label><select class="select proposal-conditional-delist" id="proposal-delist-${side}-${i}" data-side="${side}" ${key&&conditionalDelistOpen?'':'disabled'}>${playerOptions(key,null,'No conditional delist')}</select></div>`).join('');
+    const incomingCards=incoming.map(p=>{const x=p.payload||{},a=x.assetsA||{players:[],picks:[]},b=x.assetsB||{players:[],picks:[]},da=x.conditionalDelistsA||[],db=x.conditionalDelistsB||[],after=effectiveRosters(tradeActionFor(p.proposerTeam,p.counterpartyTeam,a,b,da,db)),legalNow=rosterIsLegal(after[p.proposerTeam]||[])&&rosterIsLegal(after[p.counterpartyTeam]||[]);return `<article class="proposal-card incoming-trade-card"><div class="proposal-card-head"><div>${teamIdentity(p.proposerTeam,'sm')}<span class="badge ${legalNow?'amber':'red'}">${legalNow?'YOUR DECISION':'NOW BLOCKED'}</span></div><time>${fmtDate(p.createdAt)}</time></div><strong>Trade request from ${esc(team(p.proposerTeam).owner)}</strong><p>${esc(proposalSummary(p))}</p>${(da.length||db.length)?'<div class="notice conditional-trade-note"><strong>Conditional delistings included.</strong> These players are removed only if you accept this trade and the Commissioner approves the whole transaction.</div>':''}${tradeVisualAssetsHtml(p.proposerTeam,p.counterpartyTeam,a,b,p.phase||'Pre-Season',da,db)}${tradeImpactHtml(p.proposerTeam,p.counterpartyTeam,a,b,da,db)}${legalNow?'':`<div class="notice danger"><strong>This trade cannot currently be accepted.</strong> One or both franchises would breach a salary, list or Field-position rule after all trade assets and conditional delistings are applied.</div>`}<div class="button-row"><button class="primary-button" data-trade-accept="${esc(p.id)}" ${legalNow?'':'disabled'}>${legalNow?'Accept whole trade & send to Commissioner':'Cannot accept'}</button><button class="secondary-button" data-trade-decline="${esc(p.id)}">Decline</button></div></article>`;}).join('');
     const elevationUsed=logged?rookieElevationsUsed(myTeam,elevationSeason):0,pendingElevation=logged?proposalCache.some(p=>activeProposalStatus(p.status)&&p.type==='ELEVATION'&&p.proposerTeam===myTeam&&Number(p.payload?.season||elevationSeason)===elevationSeason):false;
     const rookieOptions=logged?`<option value="">Select rookie player</option>`+(effectiveRosters()[myTeam]||[]).filter(p=>String(p.contract).toLowerCase()==='rookie').sort((a,b)=>a.player.localeCompare(b.player)).map(p=>`<option value="${esc(p.player)}">${esc(p.player)} · ${esc(p.position)} · ${esc(p.status)} · ${money(p.salary)}</option>`).join(''):'';
     const teamTools=logged?`<section class="team-moves-banner card card-pad"><div>${teamIdentity(myTeam,'sm')}<div><span class="eyebrow">Signed in as coach</span><h2>${esc(team(myTeam).owner)}</h2><p>Every form below is locked to ${esc(team(myTeam).name)}.</p></div></div><button class="secondary-button" id="moves-team-logout">Log out</button></section>
       ${incoming.length?`<section class="card card-pad incoming-trades"><div class="section-title"><div><span class="eyebrow">Action required</span><h2>Trade requests</h2></div><span class="badge amber">${incoming.length}</span></div><div class="proposal-list">${incomingCards}</div></section>`:''}
       <section class="proposal-grid"><article class="card card-pad"><div class="section-title"><div><span class="eyebrow">${esc(team(myTeam).owner)} proposes</span><h2>Trade proposal</h2></div>${tradeStatus}</div>
-      ${tradeOpen?`<div class="notice"><strong>${esc(tradePhase)} trading is open.</strong> PEGS checks both franchises before allowing submission. The other coach must accept before the Commissioner sees it.</div>`:`<div class="notice danger"><strong>Trading is closed.</strong></div>`}<input type="hidden" id="proposal-phase" value="${esc(tradePhase)}"><input type="hidden" id="proposal-team-a" value="${esc(myTeam)}">
+      ${tradeOpen?`<div class="notice"><strong>${esc(tradePhase)} trading is open.</strong> PEGS checks both franchises before allowing submission. The other coach must accept before the Commissioner sees it.${conditionalDelistOpen?' Because delisting is also open, this trade can include up to three conditional delistings for each franchise.':' Conditional trade delistings are available only while the matching delisting window is also open.'}</div>`:`<div class="notice danger"><strong>Trading is closed.</strong></div>`}<input type="hidden" id="proposal-phase" value="${esc(tradePhase)}"><input type="hidden" id="proposal-team-a" value="${esc(myTeam)}">
       <div class="form-grid" style="margin-top:14px"><div class="field-group"><label>Your team</label><input class="search-input" value="${esc(team(myTeam).name)} (${esc(team(myTeam).owner)})" disabled></div><div class="field-group"><label for="proposal-team-b">Trade partner</label><select class="select" id="proposal-team-b" ${tradeOpen?'':'disabled'}><option value="">Select trade partner…</option>${D.teams.filter(t=>t.key!==myTeam).map(t=>`<option value="${t.key}">${esc(t.name)} (${esc(t.owner)})</option>`).join('')}</select></div><div id="proposal-pick-owner-note" class="field-help"></div></div>
-      <div class="trade-sides"><div class="trade-side"><h3 id="proposal-side-a-title">${esc(team(myTeam).name)} sends</h3><div id="proposal-side-a-players">${playerSlots('a',myTeam)}</div><div id="proposal-side-a-picks">${pickSlots('a',myTeam)}</div></div><div class="trade-arrow">⇄</div><div class="trade-side"><h3 id="proposal-side-b-title">Trade partner sends</h3><div id="proposal-side-b-players">${playerSlots('b')}</div><div id="proposal-side-b-picks">${pickSlots('b')}</div></div></div>
-      <div class="trade-visual-title"><div><span class="eyebrow">Visual proposal</span><h3>What each franchise is sending</h3></div><span>Player headshots and draft picks update live as you build the trade.</span></div><div id="proposal-trade-visual" class="trade-visual-shell"><div class="trade-visual-empty trade-visual-empty-wide">Choose a trade partner to open the visual trade board.</div></div>
+      <div class="trade-sides"><div class="trade-side"><h3 id="proposal-side-a-title">${esc(team(myTeam).name)} sends</h3><div id="proposal-side-a-players">${playerSlots('a',myTeam)}</div><div id="proposal-side-a-picks">${pickSlots('a',myTeam)}</div>${conditionalDelistOpen?`<div class="conditional-delist-builder"><div class="conditional-delist-builder-head"><span class="eyebrow">Conditional on this trade</span><strong>Delist up to 3</strong></div><p>Only occurs if the complete trade is accepted and approved.</p><div id="proposal-side-a-delists">${conditionalDelistSlots('a',myTeam)}</div></div>`:''}</div><div class="trade-arrow">⇄</div><div class="trade-side"><h3 id="proposal-side-b-title">Trade partner sends</h3><div id="proposal-side-b-players">${playerSlots('b')}</div><div id="proposal-side-b-picks">${pickSlots('b')}</div>${conditionalDelistOpen?`<div class="conditional-delist-builder"><div class="conditional-delist-builder-head"><span class="eyebrow">Conditional on this trade</span><strong>Delist up to 3</strong></div><p>The other coach accepts these delistings as part of the whole trade.</p><div id="proposal-side-b-delists">${conditionalDelistSlots('b')}</div></div>`:''}</div></div>
+      <div class="trade-visual-title"><div><span class="eyebrow">Visual proposal</span><h3>Complete trade package</h3></div><span>Players, picks and conditional delistings update live as you build the trade.</span></div><div id="proposal-trade-visual" class="trade-visual-shell"><div class="trade-visual-empty trade-visual-empty-wide">Choose a trade partner to open the visual trade board.</div></div>
       <div id="proposal-trade-validation" style="margin-top:14px"><div class="notice">Choose a trade partner and assets. PEGS will show both teams' before/after salary, list and field-position impact.</div></div><div class="button-row"><button class="primary-button" id="submit-trade-proposal" disabled>Send trade request</button></div></article>
       <div class="proposal-side-stack"><article class="card card-pad"><div class="section-title"><div><span class="eyebrow">My team</span><h2>Field / Rookie swap</h2></div><span class="badge neutral">Commissioner approval</span></div><p class="muted-copy">Move one Interchange player onto the Field and one Field player to Interchange. Contracts and salaries stay unchanged. A dual-position player must nominate the PEGS position used when entering the Field.</p><input type="hidden" id="proposal-swap-team" value="${esc(myTeam)}"><div class="form-grid"><div class="field-group"><label>Interchange → Field</label><select class="select" id="proposal-swap-in">${playerOptions(myTeam,'Interchange','Select interchange player')}</select></div><div class="field-group"><label>Field → Interchange</label><select class="select" id="proposal-swap-out">${playerOptions(myTeam,'Field','Select field player')}</select></div><div class="field-group" id="proposal-swap-position-group" style="display:none"><label for="proposal-swap-position">PEGS Field position</label><select class="select" id="proposal-swap-position"></select><small class="field-help">For a dual-position rookie, this nominates the fixed PEGS position when they first enter the Field.</small></div></div><div id="proposal-swap-validation" style="margin-top:14px"></div><div class="button-row"><button class="primary-button" id="submit-swap-proposal" disabled>Submit my swap</button></div></article>
       <article class="card card-pad"><div class="section-title"><div><span class="eyebrow">My team</span><h2>Rookie elevation</h2></div>${elevationStatus}</div>${elevationOpen?`<div class="notice"><strong>${esc(elevationPhase)} rookie elevations are open for ${elevationSeason}.</strong> PEGS will retrieve the player's current SuperCoach price and eligible positions before submission.</div>`:`<div class="notice danger"><strong>Rookie elevations are closed.</strong></div>`}<div class="notice"><strong>Elevations used:</strong> ${elevationUsed} / 1${pendingElevation?' · one request is already pending':''}.</div><div class="form-grid"><div class="field-group"><label for="proposal-elevation-player">Rookie player</label><select class="select" id="proposal-elevation-player" ${elevationOpen&&elevationUsed<1&&!pendingElevation?'':'disabled'}>${rookieOptions}</select></div><div class="field-group"><label for="proposal-elevation-position">New Main contract position</label><select class="select" id="proposal-elevation-position" disabled><option value="">Select player first</option></select></div></div><div id="proposal-elevation-validation" style="margin-top:14px"><div class="notice">Select a Rookie contract player to retrieve the live upgrade price and calculate the salary/position impact.</div></div><div class="button-row"><button class="primary-button" id="submit-elevation-proposal" disabled>Request rookie elevation</button></div></article>
@@ -1470,13 +1547,26 @@
     document.querySelectorAll('[data-trade-decline]').forEach(btn=>btn.addEventListener('click',async()=>{try{await respondTrade(btn.dataset.tradeDecline,false);toast('Trade declined.');renderTransactions();}catch(e){toast(e.message||'Trade could not be declined.');}}));
     if(!logged)return;
     const phase=document.getElementById('proposal-phase'),ta={value:myTeam},tb=document.getElementById('proposal-team-b'),tv=document.getElementById('proposal-trade-validation'),visual=document.getElementById('proposal-trade-visual'),submitTrade=document.getElementById('submit-trade-proposal'),ownerNote=document.getElementById('proposal-pick-owner-note');
-    const sidePlayers=side=>[1,2,3].map(i=>document.getElementById(`proposal-player-${side}-${i}`)?.value||'').filter(Boolean),sidePicks=side=>[1,2,3].map(i=>document.getElementById(`proposal-pick-${side}-${i}`)?.value||'').filter(Boolean);
-    const tradeValidation=()=>{if(!tradeOpen){tv.innerHTML='<div class="notice danger">Trading is closed.</div>';if(visual)visual.innerHTML='<div class="trade-visual-empty trade-visual-empty-wide">Trading is closed.</div>';submitTrade.disabled=true;return false;}const a=myTeam,b=tb.value,type=phase.value,pa=sidePlayers('a'),pb=sidePlayers('b'),pka=sidePicks('a'),pkb=sidePicks('b'),assetsA={players:pa,picks:pka},assetsB={players:pb,picks:pkb};if(visual)visual.innerHTML=tradeVisualAssetsHtml(a,b,assetsA,assetsB,type);if(!b){tv.innerHTML='<div class="notice">Choose a trade partner to calculate impact.</div>';submitTrade.disabled=true;return false;}const duplicate=pa.length!==new Set(pa).size||pb.length!==new Set(pb).size||pka.length!==new Set(pka).size||pkb.length!==new Set(pkb).size,action=tradeActionFor(a,b,assetsA,assetsB),after=effectiveRosters(action),legalA=rosterIsLegal(after[a]||[]),legalB=rosterIsLegal(after[b]||[]),ownA=picksOwnedBy(a,pka,type),ownB=picksOwnedBy(b,pkb,type),hasEach=(pa.length+pka.length)>0&&(pb.length+pkb.length)>0,ok=!duplicate&&hasEach&&ownA&&ownB&&legalA&&legalB;
-      tv.innerHTML=`<div class="trade-impact-intro"><strong>Live trade impact · before submission</strong><span>Recalculates with every asset selection. Both teams must remain within every salary, list and Field-position cap.</span></div>${tradeImpactHtml(a,b,assetsA,assetsB)}${duplicate?'<div class="notice danger">The same asset cannot be selected twice.</div>':''}${!hasEach?'<div class="notice danger">Each team must send at least one player or draft pick.</div>':''}${!ownA||!ownB?'<div class="notice danger">A selected draft pick is no longer owned by the offering team.</div>':''}${!legalA?`<div class="notice danger"><strong>${esc(team(a).name)} cannot accommodate this trade.</strong> Adjust assets until every rule is green.</div>`:''}${!legalB?`<div class="notice danger"><strong>${esc(team(b).name)} cannot accommodate this trade.</strong> The receiving coach could not legally accept this trade.</div>`:''}`;submitTrade.disabled=!ok;submitTrade.textContent=ok?`Send request to ${team(b).owner}`:'Trade blocked';return ok;};
-    const bindTradeAssets=()=>document.querySelectorAll('.proposal-player,.proposal-pick').forEach(x=>{x.addEventListener('change',tradeValidation);x.addEventListener('input',tradeValidation);});
-    const renderPartnerAssets=()=>{const b=tb.value,type=phase.value;document.getElementById('proposal-side-b-title').textContent=b?team(b).name+' sends':'Trade partner sends';document.getElementById('proposal-side-b-players').innerHTML=playerSlots('b',b);document.getElementById('proposal-side-b-picks').innerHTML=pickSlots('b',b,type);ownerNote.innerHTML=`<strong>${esc(team(myTeam).owner)}</strong> owns ${ownedDraftPicks(myTeam,type).map(p=>'Pick '+p.pick).join(', ')||'no available '+esc(type)+' picks'}.`;bindTradeAssets();tradeValidation();};
+    const sidePlayers=side=>[1,2,3].map(i=>document.getElementById(`proposal-player-${side}-${i}`)?.value||'').filter(Boolean),sidePicks=side=>[1,2,3].map(i=>document.getElementById(`proposal-pick-${side}-${i}`)?.value||'').filter(Boolean),sideConditionalDelists=side=>conditionalDelistOpen?[1,2,3].map(i=>document.getElementById(`proposal-delist-${side}-${i}`)?.value||'').filter(Boolean):[];
+    const tradeValidation=()=>{
+      if(!tradeOpen){tv.innerHTML='<div class="notice danger">Trading is closed.</div>';if(visual)visual.innerHTML='<div class="trade-visual-empty trade-visual-empty-wide">Trading is closed.</div>';submitTrade.disabled=true;return false;}
+      const a=myTeam,b=tb.value,type=phase.value,pa=sidePlayers('a'),pb=sidePlayers('b'),pka=sidePicks('a'),pkb=sidePicks('b'),da=sideConditionalDelists('a'),db=sideConditionalDelists('b'),assetsA={players:pa,picks:pka},assetsB={players:pb,picks:pkb};
+      if(visual)visual.innerHTML=tradeVisualAssetsHtml(a,b,assetsA,assetsB,type,da,db);
+      if(!b){tv.innerHTML='<div class="notice">Choose a trade partner to calculate impact.</div>';submitTrade.disabled=true;return false;}
+      const duplicate=pa.length!==new Set(pa).size||pb.length!==new Set(pb).size||pka.length!==new Set(pka).size||pkb.length!==new Set(pkb).size||da.length!==new Set(da).size||db.length!==new Set(db).size;
+      const delistTradeConflict=da.some(name=>pa.includes(name))||db.some(name=>pb.includes(name));
+      const current=effectiveRosters(),ownsConditionalDelists=da.every(name=>(current[a]||[]).some(r=>r.player===name))&&db.every(name=>(current[b]||[]).some(r=>r.player===name));
+      const delistTermsValid=(da.length<=3&&db.length<=3&&(!da.length&&!db.length||conditionalDelistOpen));
+      const action=tradeActionFor(a,b,assetsA,assetsB,da,db),after=effectiveRosters(action),legalA=rosterIsLegal(after[a]||[]),legalB=rosterIsLegal(after[b]||[]),ownA=picksOwnedBy(a,pka,type),ownB=picksOwnedBy(b,pkb,type),hasEach=(pa.length+pka.length)>0&&(pb.length+pkb.length)>0;
+      const ok=!duplicate&&!delistTradeConflict&&delistTermsValid&&ownsConditionalDelists&&hasEach&&ownA&&ownB&&legalA&&legalB;
+      const conditionalSummary=(da.length||db.length)?`<div class="notice conditional-trade-note"><strong>Conditional delistings:</strong> ${esc(team(a).name)} ${da.length?esc(da.join(', ')):'none'} · ${esc(team(b).name)} ${db.length?esc(db.join(', ')):'none'}. They occur only if the entire trade is accepted and Commissioner-approved.</div>`:(conditionalDelistOpen?'<div class="notice"><strong>Optional:</strong> both franchises may include up to three conditional delistings in this trade.</div>':'');
+      tv.innerHTML=`<div class="trade-impact-intro"><strong>Live trade impact · before submission</strong><span>Recalculates the final roster after traded players, picks and conditional delistings are applied together.</span></div>${conditionalSummary}${tradeImpactHtml(a,b,assetsA,assetsB,da,db)}${duplicate?'<div class="notice danger">The same player, pick or conditional delisting cannot be selected twice on one side.</div>':''}${delistTradeConflict?'<div class="notice danger">A player cannot be both traded away and conditionally delisted by the same franchise.</div>':''}${!hasEach?'<div class="notice danger">Each team must send at least one player or draft pick. A conditional delisting is not a traded asset.</div>':''}${!ownA||!ownB?'<div class="notice danger">A selected draft pick is no longer owned by the offering team.</div>':''}${!ownsConditionalDelists?'<div class="notice danger">A conditional delisting player is no longer owned by that franchise.</div>':''}${!delistTermsValid?'<div class="notice danger">Conditional delistings require the matching delisting window to be open and are limited to three per franchise.</div>':''}${!legalA?`<div class="notice danger"><strong>${esc(team(a).name)} cannot accommodate the complete transaction.</strong> Adjust trade assets or conditional delistings until every rule is green.</div>`:''}${!legalB?`<div class="notice danger"><strong>${esc(team(b).name)} cannot accommodate the complete transaction.</strong> The receiving coach could not legally accept these terms.</div>`:''}`;
+      submitTrade.disabled=!ok;submitTrade.textContent=ok?`Send complete request to ${team(b).owner}`:'Trade blocked';return ok;
+    };
+    const bindTradeAssets=()=>document.querySelectorAll('.proposal-player,.proposal-pick,.proposal-conditional-delist').forEach(x=>{x.addEventListener('change',tradeValidation);x.addEventListener('input',tradeValidation);});
+    const renderPartnerAssets=()=>{const b=tb.value,type=phase.value;document.getElementById('proposal-side-b-title').textContent=b?team(b).name+' sends':'Trade partner sends';document.getElementById('proposal-side-b-players').innerHTML=playerSlots('b',b);document.getElementById('proposal-side-b-picks').innerHTML=pickSlots('b',b,type);if(conditionalDelistOpen&&document.getElementById('proposal-side-b-delists'))document.getElementById('proposal-side-b-delists').innerHTML=conditionalDelistSlots('b',b);ownerNote.innerHTML=`<strong>${esc(team(myTeam).owner)}</strong> owns ${ownedDraftPicks(myTeam,type).map(p=>'Pick '+p.pick).join(', ')||'no available '+esc(type)+' picks'}.${conditionalDelistOpen?' Conditional delistings are part of this trade and do not execute separately.':''}`;bindTradeAssets();tradeValidation();};
     tb?.addEventListener('change',renderPartnerAssets);bindTradeAssets();tradeValidation();
-    submitTrade?.addEventListener('click',async()=>{if(!tradeValidation()){toast('Fix the blocked trade before submitting.');return;}const b=tb.value,assetsA={players:sidePlayers('a'),picks:sidePicks('a')},assetsB={players:sidePlayers('b'),picks:sidePicks('b')};try{await submitProposal({type:'TRADE',phase:phase.value,proposerTeam:myTeam,counterpartyTeam:b,payload:{assetsA,assetsB}});toast(`Trade request sent to ${team(b).owner}.`);renderTransactions();}catch(e){toast(e.message||'Could not submit the trade.');}});
+    submitTrade?.addEventListener('click',async()=>{if(!tradeValidation()){toast('Fix the blocked trade before submitting.');return;}const b=tb.value,assetsA={players:sidePlayers('a'),picks:sidePicks('a')},assetsB={players:sidePlayers('b'),picks:sidePicks('b')},conditionalDelistsA=sideConditionalDelists('a'),conditionalDelistsB=sideConditionalDelists('b');try{await submitProposal({type:'TRADE',phase:phase.value,proposerTeam:myTeam,counterpartyTeam:b,payload:{assetsA,assetsB,conditionalDelistsA,conditionalDelistsB}});toast(`Trade request sent to ${team(b).owner}. Conditional delistings, if any, are locked to this trade.`);renderTransactions();}catch(e){toast(e.message||'Could not submit the trade.');}});
     const st=document.getElementById('proposal-swap-team'),si=document.getElementById('proposal-swap-in'),so=document.getElementById('proposal-swap-out'),sp=document.getElementById('proposal-swap-position'),spg=document.getElementById('proposal-swap-position-group'),sv=document.getElementById('proposal-swap-validation'),submitSwap=document.getElementById('submit-swap-proposal'),usedCount=k=>D.transactions.filter(x=>x.type==='Rookie swap'&&x.team===k).length+getCommissionerActions().filter(x=>x.type==='Rookie swap'&&x.team===k&&x.status==='CONFIRMED').length;
     const swapIncoming=()=>((effectiveRosters()[myTeam]||[]).find(p=>p.player===si.value)||null);
     const refreshSwapPosition=()=>{const rec=swapIncoming(),choices=positionChoices(rec?.position||'');sp.innerHTML=choices.map(pos=>`<option value="${esc(pos)}">${esc(pos)}</option>`).join('');sp.disabled=!choices.length;spg.style.display=choices.length>1?'block':'none';if(choices.length)sp.value=choices[0];validateSwap();};
@@ -1496,7 +1586,14 @@
 
   function renderHistory() {
     const current=D.honours.find(h=>h.year===2026) || D.honours[D.honours.length-1];
-    const history=[...D.honours].sort((a,b)=>b.year-a.year);
+    // The workbook contains duplicate legacy 2018/2019 honour rows. Prefer the
+    // complete record (the one with a wooden-spoon entry), then keep one row per year.
+    const byYear=new Map();
+    [...D.honours].forEach(h=>{
+      const year=Number(h.year||0),existing=byYear.get(year);
+      if(!existing || (!existing.spoon && h.spoon)) byYear.set(year,h);
+    });
+    const history=[...byYear.values()].sort((a,b)=>b.year-a.year);
     main.innerHTML = `${pageHeader('Since 2018','League history','Premiers, runners-up, wooden spoons and the core rules that power the site.')}
       <section class="history-hero"><article class="card trophy-card"><div class="trophy-mark" aria-hidden="true">&#127942;</div><span class="eyebrow kicker">2026 Premiers</span><h2>${esc(current?.premier||'')}</h2><p>${esc(current?.premierCoach||'')} - defeated ${esc(current?.runnerUp||'')} in the Grand Final.</p></article>
       <article class="card card-pad"><div class="section-title"><h2>Core cap rules</h2></div><div class="stat-strip" style="grid-template-columns:1fr 1fr"><div class="stat-box"><span>Main contracts</span><strong>${compactMoney(D.rules.mainContractCap)}</strong></div><div class="stat-box"><span>Field cap</span><strong>${compactMoney(D.rules.fieldCap)}</strong></div><div class="stat-box"><span>Rookie contracts</span><strong>${compactMoney(D.rules.rookieContractCap)}</strong></div><div class="stat-box"><span>Max field list</span><strong>${D.rules.maxFieldPlayers}</strong></div></div></article></section>
@@ -1641,8 +1738,8 @@
   }
   function approvalDetail(p){
     if(p.type==='TRADE'){
-      const x=p.payload||{},a=x.assetsA||{players:[],picks:[]},b=x.assetsB||{players:[],picks:[]};
-      return `<div class="notice"><strong>Counterparty:</strong> ${p.counterpartyDecidedAt?'Accepted '+fmtDate(p.counterpartyDecidedAt):'Awaiting team acceptance'}</div>${tradeVisualAssetsHtml(p.proposerTeam,p.counterpartyTeam,a,b,p.phase||'Pre-Season')}${tradeImpactHtml(p.proposerTeam,p.counterpartyTeam,a,b)}`;
+      const x=p.payload||{},a=x.assetsA||{players:[],picks:[]},b=x.assetsB||{players:[],picks:[]},da=x.conditionalDelistsA||[],db=x.conditionalDelistsB||[];
+      return `<div class="notice"><strong>Counterparty:</strong> ${p.counterpartyDecidedAt?'Accepted '+fmtDate(p.counterpartyDecidedAt):'Awaiting team acceptance'}</div>${(da.length||db.length)?'<div class="notice conditional-trade-note"><strong>Atomic trade package:</strong> conditional delistings below execute only with this approved trade. Rejecting the trade leaves every listed player on their current roster.</div>':''}${tradeVisualAssetsHtml(p.proposerTeam,p.counterpartyTeam,a,b,p.phase||'Pre-Season',da,db)}${tradeImpactHtml(p.proposerTeam,p.counterpartyTeam,a,b,da,db)}`;
     }
     if(p.type==='SWAP'){
       const x=p.payload||{},action={type:'Rookie swap',status:'CONFIRMED',team:p.proposerTeam,playerIn:x.playerIn,playerOut:x.playerOut,playerInPosition:x.fieldPosition||''},before=effectiveRosters(),rosters=effectiveRosters(action);
@@ -1673,17 +1770,19 @@
     let action=null,serverDecided=false,serverActionApplied=false;
     if(p.type==='TRADE'){
       if(!p.counterpartyDecidedAt){toast('Trade approval blocked until the other coach accepts it.');return;}
-      const x=p.payload||{},a=x.assetsA||{players:[],picks:[]},b=x.assetsB||{players:[],picks:[]},moves=[],phase=normalizedDraftType(p.phase);
-      (a.players||[]).forEach(player=>moves.push({player,from:p.proposerTeam,to:p.counterpartyTeam}));(b.players||[]).forEach(player=>moves.push({player,from:p.counterpartyTeam,to:p.proposerTeam}));
+      const x=p.payload||{},a=x.assetsA||{players:[],picks:[]},b=x.assetsB||{players:[],picks:[]},da=[...new Set((x.conditionalDelistsA||[]).filter(Boolean))],db=[...new Set((x.conditionalDelistsB||[]).filter(Boolean))],phase=normalizedDraftType(p.phase);
+      if(da.length>3||db.length>3){toast('Trade approval blocked: maximum three conditional delistings per franchise.');return;}
+      if(da.some(name=>(a.players||[]).includes(name))||db.some(name=>(b.players||[]).includes(name))){toast('Trade approval blocked: a player cannot be both traded away and conditionally delisted.');return;}
       if(backendConfigured()){
         try{const serverCheck=await backendFetch('/rest/v1/rpc/pegs_validate_trade_payload',{method:'POST',body:JSON.stringify({p_team_a:p.proposerTeam,p_team_b:p.counterpartyTeam,p_phase:p.phase,p_payload:p.payload})});if(!serverCheck?.legal){toast('Trade approval blocked by current server roster rules.');return;}}catch(e){toast(e.message||'Trade validation failed.');return;}
       }
       const currentRosters=effectiveRosters(),ownsPlayers=(key,names)=>(names||[]).every(name=>(currentRosters[key]||[]).some(r=>r.player===name));
       if(!ownsPlayers(p.proposerTeam,a.players||[])||!ownsPlayers(p.counterpartyTeam,b.players||[])){toast('Trade approval blocked: a player is no longer owned by the team offering them.');return;}
+      if(!ownsPlayers(p.proposerTeam,da)||!ownsPlayers(p.counterpartyTeam,db)){toast('Trade approval blocked: a conditional delisting player is no longer owned by that franchise.');return;}
       if(!picksOwnedBy(p.proposerTeam,a.picks||[],phase)||!picksOwnedBy(p.counterpartyTeam,b.picks||[],phase)){toast('Trade approval blocked: a draft pick is no longer owned by the team offering it.');return;}
-      const test={type:'Trade',status:'CONFIRMED',moves},rosters=effectiveRosters(test);if(!rosterIsLegal(rosters[p.proposerTeam]||[])||!rosterIsLegal(rosters[p.counterpartyTeam]||[])){toast('Trade approval blocked by current salary/list/position rules.');return;}
-      const fmt=v=>[...(v.players||[]),...(v.picks||[]).map(n=>pickLabel(n,phase))].join(', ')||'No assets',pickTransfers=[...buildPickTransfers(p.proposerTeam,p.counterpartyTeam,a.picks||[],phase),...buildPickTransfers(p.counterpartyTeam,p.proposerTeam,b.picks||[],phase)];
-      action={...test,teamA:p.proposerTeam,teamB:p.counterpartyTeam,phase,season:currentSeason(),effectiveFromRound:nextUnfinalizedScoringRound(),timestamp:new Date().toISOString(),picks:{[p.proposerTeam]:a.picks||[],[p.counterpartyTeam]:b.picks||[]},pickTransfers,detail:`${phase}: ${team(p.proposerTeam).owner} sends ${fmt(a)} · ${team(p.counterpartyTeam).owner} sends ${fmt(b)}`};
+      const test=tradeActionFor(p.proposerTeam,p.counterpartyTeam,a,b,da,db),rosters=effectiveRosters(test);if(!rosterIsLegal(rosters[p.proposerTeam]||[])||!rosterIsLegal(rosters[p.counterpartyTeam]||[])){toast('Trade approval blocked by current salary/list/position rules after conditional delistings.');return;}
+      const fmt=v=>[...(v.players||[]),...(v.picks||[]).map(n=>pickLabel(n,phase))].join(', ')||'No assets',fmtDelists=names=>names.length?` · conditional delist ${names.join(', ')}`:'',pickTransfers=[...buildPickTransfers(p.proposerTeam,p.counterpartyTeam,a.picks||[],phase),...buildPickTransfers(p.counterpartyTeam,p.proposerTeam,b.picks||[],phase)];
+      action={...test,teamA:p.proposerTeam,teamB:p.counterpartyTeam,phase,season:currentSeason(),effectiveFromRound:nextUnfinalizedScoringRound(),timestamp:new Date().toISOString(),picks:{[p.proposerTeam]:a.picks||[],[p.counterpartyTeam]:b.picks||[]},pickTransfers,detail:`${phase}: ${team(p.proposerTeam).owner} sends ${fmt(a)}${fmtDelists(da)} · ${team(p.counterpartyTeam).owner} sends ${fmt(b)}${fmtDelists(db)}`};
     }else if(p.type==='SWAP'){
       const x=p.payload||{},used=D.transactions.filter(v=>v.type==='Rookie swap'&&v.team===p.proposerTeam).length+getCommissionerActions().filter(v=>v.type==='Rookie swap'&&v.team===p.proposerTeam&&v.status==='CONFIRMED').length,rows=effectiveRosters()[p.proposerTeam]||[],pin=rows.find(r=>r.player===x.playerIn),choices=positionChoices(pin?.position||'');
       const fieldPosition=String(x.fieldPosition||pin?.position||'').toUpperCase();if(!pin||!choices.includes(fieldPosition)){toast('Swap approval blocked: choose a valid PEGS Field position for the incoming player.');return;}

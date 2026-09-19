@@ -9,6 +9,17 @@
   const commissionerContent = document.getElementById('commissioner-content');
   const teamDialog = document.getElementById('team-dialog');
   const teamLoginContent = document.getElementById('team-login-content');
+  const accessGate = document.getElementById('access-gate');
+  const accessLoginForm = document.getElementById('access-login-form');
+  const accessTeamSelect = document.getElementById('access-team-select');
+  const accessPasswordInput = document.getElementById('access-team-password');
+  const accessRememberInput = document.getElementById('access-remember-password');
+  const accessLoginButton = document.getElementById('access-login-submit');
+  const accessStatus = document.getElementById('access-login-status');
+  const accessAuthStage = document.getElementById('access-auth-stage');
+  const accessAuthSteps = [1,2,3].map(n=>document.getElementById(`access-auth-step-${n}`));
+  const entryTransition = document.getElementById('entry-transition');
+  const entrySentinel = document.getElementById('entry-animation-sentinel');
   const teamMap = Object.fromEntries(D.teams.map(t => [t.key, t]));
   const ownerToKey = Object.fromEntries(D.teams.map(t => [t.owner.toUpperCase(), t.key]));
   const OVERRIDE_KEY = 'pegs-score-overrides-v6';
@@ -22,6 +33,7 @@
   const BACKEND_TOKEN_KEY = 'pegs-supabase-token-v6';
   const BACKEND_REFRESH_KEY = 'pegs-supabase-refresh-v14';
   const IDENTITY_KEY = 'pegs-identity-v14';
+  const REMEMBERED_TEAM_LOGIN_KEY = 'pegs-remembered-team-login-v145';
   const COMM_BACKEND_TOKEN_KEY = 'pegs-commissioner-supabase-token-v14q';
   const COMM_BACKEND_REFRESH_KEY = 'pegs-commissioner-supabase-refresh-v14q';
   const DRAFT_POOL_KEY = 'pegs-draft-pool-v14';
@@ -67,6 +79,8 @@
   let draftSelection = null;
   let draftSearch = '';
   let commissionerTab = 'scores';
+  let siteEntryCompleted = false;
+  let siteEntryTransitioning = false;
   let matchupScoreEditOpen = false;
   let reversingTransactionKey = '';
   let transactionScope = 'mine';
@@ -76,6 +90,8 @@
   let draftPoolCache = null;
   let backupCache = [];
   let auditCache = [];
+  let autoBackupTimer = null;
+  let autoBackupKeys = new Set();
   let teamAccountsCache = [];
   let teamCredentialCache = [];
   // Background polling used to fully re-render the current page every 10 seconds,
@@ -86,6 +102,8 @@
   let backgroundRenderPending = false;
 
   const DRAFT_ROUNDS = { 'Pre-Season': 5, 'Mid-Season': 10 };
+  const OPENING_ROUND_LAST_SEASON = 2026;
+  function openingRoundBankingAllowed(season){ return Number(season||0) <= OPENING_ROUND_LAST_SEASON; }
 
   function markInteractionDraft(){ interactionDraftDirty=true; }
   function clearInteractionDraft(){ interactionDraftDirty=false; backgroundRenderPending=false; }
@@ -300,26 +318,39 @@
     return AFL_NAME_TO_CODE[raw] || AFL_CLUB_TO_CODE[raw] || (AFL_CODE_SET.has(raw)?raw:'');
   }
   function legacySeasonSetup(){
+    const season=Number(D.meta.season||2026),closed=Boolean(D.meta.seasonComplete||String(D.meta.seasonStatus||'').toUpperCase()==='COMPLETE');
     const rounds=Object.entries(D.roundSchedule||{}).map(([round,rec])=>({
       round:Number(round),
       aflTeamsPlaying:Number(rec.aflTeamsPlaying||rec.topPlayers||18),
       byeClubs:[],
-      bankClubs:(D.openingRound?.byeBanks?.[String(round)]||[]).map(normalizeAflCode).filter(Boolean)
+      bankClubs:openingRoundBankingAllowed(season)?(D.openingRound?.byeBanks?.[String(round)]||[]).map(normalizeAflCode).filter(Boolean):[]
     }));
-    return {active:false,season:Number(D.meta.season||2026),currentRound:Number(D.meta.currentRound||1),completedThroughRound:Number(D.meta.currentRound||1),
-      openingRound:{enabled:Boolean(D.openingRound?.headToHead===false),label:D.openingRound?.label||'Opening Round',participants:[]},
+    return {active:false,status:closed?'COMPLETE':'ARCHIVED',season,currentRound:Number(D.meta.currentRound||1),completedThroughRound:Number(D.meta.completedThroughRound||D.meta.currentRound||1),
+      openingRound:{enabled:openingRoundBankingAllowed(season)&&Boolean(D.openingRound?.headToHead===false),label:D.openingRound?.label||'Opening Round',participants:[]},
       aflFixtureCsv:'',rounds,pegsRegularRounds:20,pegsFixtures:(D.fixtures||[]).filter(x=>Number(x.round)<=20).map(x=>({...x})),
       finals:{enabled:true,format:'TOP4_PAGE',week1Round:21,preliminaryRound:22,grandFinalRound:23,bracket:null},liveScoringEnabled:true,updatedAt:null};
   }
   function newSeasonTemplate(){
     const season=Number(D.meta.season||2026)+1, regularRounds=20;
-    return {active:false,season,currentRound:1,completedThroughRound:0,openingRound:{enabled:false,label:'Opening Round',participants:[]},aflFixtureCsv:'',rounds:[],pegsRegularRounds:regularRounds,pegsFixtures:generatePegsFixture(regularRounds),
+    return {active:false,status:'SETUP',season,currentRound:1,completedThroughRound:0,openingRound:{enabled:false,label:'Opening Round (retired after 2026)',participants:[],bankDestinations:{}},aflFixtureCsv:'',rounds:[],pegsRegularRounds:regularRounds,pegsFixtures:generatePegsFixture(regularRounds),
       finals:{enabled:true,format:'TOP4_PAGE',week1Round:regularRounds+1,preliminaryRound:regularRounds+2,grandFinalRound:regularRounds+3,bracket:null},liveScoringEnabled:true,updatedAt:null};
   }
-  function getSeasonSetup(){
-    try { const x=JSON.parse(localStorage.getItem(SEASON_SETUP_KEY)||'null'); return x&&typeof x==='object'?x:legacySeasonSetup(); } catch(_){ return legacySeasonSetup(); }
+  function normalizeSeasonSetup(value){
+    const x=value&&typeof value==='object'?JSON.parse(JSON.stringify(value)):legacySeasonSetup(),season=Number(x.season||D.meta.season||2026),staticSeason=Number(D.meta.season||2026);
+    x.season=season;
+    if(Boolean(D.meta.seasonComplete)&&season===staticSeason){
+      x.active=false;x.status='COMPLETE';x.currentRound=Number(D.meta.currentRound||23);x.completedThroughRound=Number(D.meta.completedThroughRound||D.meta.currentRound||23);
+    }
+    if(!openingRoundBankingAllowed(season)){
+      x.openingRound={...(x.openingRound||{}),enabled:false,label:'Opening Round (retired after 2026)',participants:[],bankDestinations:{},suggestedBankDestinations:{}};
+      x.rounds=(x.rounds||[]).map(r=>({...r,bankClubs:[]}));
+    }
+    return x;
   }
-  function saveSeasonSetup(value){ localStorage.setItem(SEASON_SETUP_KEY,JSON.stringify(value)); void pushSharedState('season_setup',value); }
+  function getSeasonSetup(){
+    try { const x=JSON.parse(localStorage.getItem(SEASON_SETUP_KEY)||'null'); return normalizeSeasonSetup(x&&typeof x==='object'?x:legacySeasonSetup()); } catch(_){ return normalizeSeasonSetup(legacySeasonSetup()); }
+  }
+  function saveSeasonSetup(value){ const clean=normalizeSeasonSetup(value); localStorage.setItem(SEASON_SETUP_KEY,JSON.stringify(clean)); void pushSharedState('season_setup',clean); return clean; }
   function getSeasonResults(){
     try { return JSON.parse(localStorage.getItem(SEASON_RESULTS_KEY)||'{}'); } catch(_){ return {}; }
   }
@@ -405,6 +436,11 @@
     const rounds=(base.rounds||[]).map(r=>({...r,bankClubs:Object.entries(chosen).filter(([,rd])=>Number(rd)===Number(r.round)).map(([club])=>club)}));
     return {...base,rounds,openingRound:{...op,bankDestinations:chosen}};
   }
+  function applySeasonFixtureRules(parsed,season){
+    const base=parsed||{games:[],rounds:[],openingRound:{enabled:false,label:'Opening Round',participants:[]}};
+    if(openingRoundBankingAllowed(season))return base;
+    return {...base,games:(base.games||[]).filter(g=>g.round!=='OR'),rounds:(base.rounds||[]).map(r=>({...r,bankClubs:[]})),openingRound:{...(base.openingRound||{}),enabled:false,label:'Opening Round (retired after 2026)',participants:[],bankDestinations:{},suggestedBankDestinations:{}}};
+  }
   function parseAflFixtureCsv(text){
     const games=[],lines=String(text||'').split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
     for(const line of lines){
@@ -443,6 +479,7 @@
     }).filter(Boolean).join('\n');
   }
   function openingRoundMappingControls(setup){
+    if(!openingRoundBankingAllowed(setup?.season))return '<div class="notice"><strong>Opening Round banking retired after 2026.</strong> In bye rounds, PEGS simply counts the same number of player scores as AFL clubs playing that round.</div>';
     const op=setup?.openingRound;
     if(!op?.enabled||!(op.participants||[]).length)return '<div class="notice"><strong>No Opening Round detected.</strong> No score-bank mapping is required.</div>';
     const chosen=op.bankDestinations||{},suggested=op.suggestedBankDestinations||{};
@@ -454,6 +491,7 @@
     }).join('')}</div>`;
   }
   function readOpeningRoundMapping(setup){
+    if(!openingRoundBankingAllowed(setup?.season))return applySeasonFixtureRules(setup,setup?.season);
     const mapping={};
     document.querySelectorAll('.or-bank-round').forEach(el=>{const round=Number(el.value||0);if(round>0)mapping[String(el.dataset.orClub||'')]=round;});
     return applyOpeningBankDestinations(setup,mapping);
@@ -678,9 +716,23 @@
     const who=await whoRes.json();if(String(who?.role||'').toLowerCase()!=='commissioner')throw new Error('This password is not for the Commissioner account.');
     return true;
   }
+  const AUTO_BACKUP_STATE_KEYS=new Set(['score_overrides','selection_overrides','commissioner_actions','transaction_reversals','draft_state','season_setup','season_results','proposal_windows','scoring_snapshots','figurehead_overrides','opening_bank','proposal_status','draft_pool']);
+  const AUTO_BACKUP_LABELS={score_overrides:'score correction',selection_overrides:'selection correction',commissioner_actions:'league transaction',transaction_reversals:'transaction reversal',draft_state:'draft state',season_setup:'season / finals setup',season_results:'season results',proposal_windows:'league windows',scoring_snapshots:'scoring roster lock',figurehead_overrides:'figureheads',opening_bank:'Opening Round bank',proposal_status:'proposal decision',draft_pool:'draft pool'};
+  function cancelPendingAutoBackup(){if(autoBackupTimer){clearTimeout(autoBackupTimer);autoBackupTimer=null;}autoBackupKeys.clear();}
+  function queueAutoBackup(key){
+    if(!AUTO_BACKUP_STATE_KEYS.has(key)||!backendConfigured()||!commissionerLoggedIn())return;
+    autoBackupKeys.add(key);if(autoBackupTimer)clearTimeout(autoBackupTimer);
+    autoBackupTimer=setTimeout(async()=>{
+      autoBackupTimer=null;const keys=[...autoBackupKeys];autoBackupKeys.clear();
+      const labels=[...new Set(keys.map(k=>AUTO_BACKUP_LABELS[k]||k))];
+      const label=`Automatic checkpoint · ${labels.slice(0,3).join(', ')}${labels.length>3?' + more':''}`;
+      try{await createServerBackup('AUTO_CHANGE',label);if(commissionerTab==='backups'&&commissionerDialog.open)renderCommissionerControls();}
+      catch(e){console.warn('Automatic PEGS checkpoint failed',e);}
+    },1800);
+  }
   async function pushSharedState(key,value) {
     if(!backendConfigured() || !commissionerLoggedIn()) return;
-    try { await commissionerFetch('/rest/v1/pegs_state?on_conflict=key',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({key,value,updated_at:new Date().toISOString()})}); } catch(e){ console.warn('Shared PEGS state update failed',e); }
+    try { await commissionerFetch('/rest/v1/pegs_state?on_conflict=key',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({key,value,updated_at:new Date().toISOString()})}); queueAutoBackup(key); } catch(e){ console.warn('Shared PEGS state update failed',e); }
   }
   async function pullSharedState() {
     if(!backendConfigured()) return;
@@ -692,7 +744,7 @@
         if(row.key==='commissioner_actions') localStorage.setItem(COMM_ACTIONS_KEY,JSON.stringify(row.value||[]));
         if(row.key==='transaction_reversals') localStorage.setItem(TRANSACTION_REVERSALS_KEY,JSON.stringify(row.value||{}));
         if(row.key==='draft_state') localStorage.setItem(DRAFT_STATE_KEY,JSON.stringify(row.value||{}));
-        if(row.key==='season_setup') localStorage.setItem(SEASON_SETUP_KEY,JSON.stringify(row.value||{}));
+        if(row.key==='season_setup') localStorage.setItem(SEASON_SETUP_KEY,JSON.stringify(normalizeSeasonSetup(row.value||{})));
         if(row.key==='season_results') localStorage.setItem(SEASON_RESULTS_KEY,JSON.stringify(row.value||{}));
         if(row.key==='live_feed') localStorage.setItem(LIVE_FEED_KEY,JSON.stringify(row.value||{}));
         if(row.key==='opening_bank') localStorage.setItem(OPENING_BANK_KEY,JSON.stringify(row.value||{}));
@@ -706,10 +758,184 @@
   function teamLoggedIn(){return backendConfigured()&&identity().role==='team'&&Boolean(identity().teamKey);}
   function loggedTeamKey(){return teamLoggedIn()?String(identity().teamKey||'').toUpperCase():'';}
   function teamAuthEmail(teamKey){const t=team(teamKey);return `${String(t.owner||teamKey).toLowerCase().replace(/[^a-z0-9]+/g,'')}@pegs.local`;}
+  function rememberedTeamLogin(){
+    try{
+      const value=JSON.parse(localStorage.getItem(REMEMBERED_TEAM_LOGIN_KEY)||'null');
+      if(!value||!teamMap[String(value.teamKey||'').toUpperCase()]||!String(value.password||''))return null;
+      return {teamKey:String(value.teamKey).toUpperCase(),password:String(value.password)};
+    }catch(_){return null;}
+  }
+  function saveRememberedTeamLogin(teamKey,password,remember){
+    if(remember)localStorage.setItem(REMEMBERED_TEAM_LOGIN_KEY,JSON.stringify({teamKey:String(teamKey||'').toUpperCase(),password:String(password||'')}));
+    else localStorage.removeItem(REMEMBERED_TEAM_LOGIN_KEY);
+  }
+  function siteAccessGranted(){return teamLoggedIn()||commissionerLoggedIn();}
+  function setAccessStatus(message='',kind=''){
+    if(!accessStatus)return;
+    accessStatus.textContent=String(message||'');
+    accessStatus.classList.toggle('is-error',kind==='error');
+    accessStatus.classList.toggle('is-success',kind==='success');
+  }
+  let accessAuthTimers=[];
+  function clearAccessAuthTimers(){accessAuthTimers.forEach(t=>clearTimeout(t));accessAuthTimers=[];}
+  function setAuthStep(index,state=''){
+    const el=accessAuthSteps[index];if(!el)return;
+    el.classList.remove('is-active','is-complete');
+    if(state)el.classList.add(`is-${state}`);
+  }
+  function beginAccessAuthenticationStage(){
+    clearAccessAuthTimers();
+    accessGate?.classList.add('is-authenticating');
+    accessAuthSteps.forEach((_,i)=>setAuthStep(i,''));
+    setAuthStep(0,'active');
+    accessAuthTimers.push(setTimeout(()=>{setAuthStep(0,'complete');setAuthStep(1,'active');},260));
+    accessAuthTimers.push(setTimeout(()=>{setAuthStep(1,'complete');setAuthStep(2,'active');},600));
+  }
+  async function finishAccessAuthenticationStage(success=true,startedAt=performance.now()){
+    const elapsed=performance.now()-startedAt;
+    if(success&&elapsed<950)await new Promise(r=>setTimeout(r,950-elapsed));
+    clearAccessAuthTimers();
+    if(success){setAuthStep(0,'complete');setAuthStep(1,'complete');setAuthStep(2,'complete');await new Promise(r=>setTimeout(r,170));}
+    else accessGate?.classList.remove('is-authenticating');
+  }
+  function populateAccessGate(){
+    if(!accessTeamSelect)return;
+    const saved=rememberedTeamLogin();
+    accessTeamSelect.innerHTML=D.teams.map(t=>`<option value="${esc(t.key)}">${esc(t.owner)} · ${esc(t.name)}</option>`).join('');
+    accessTeamSelect.value=saved?.teamKey||D.teams[0]?.key||'';
+    if(accessPasswordInput)accessPasswordInput.value=saved?.password||'';
+    if(accessRememberInput)accessRememberInput.checked=Boolean(saved?.password);
+    if(!backendConfigured()){
+      if(accessLoginButton)accessLoginButton.disabled=true;
+      setAccessStatus('Team Login needs the configured PEGS league server.','error');
+    }else{
+      if(accessLoginButton)accessLoginButton.disabled=false;
+      setAccessStatus(saved?.password?'Saved password loaded for this device.':'','');
+    }
+  }
+  function lockSiteForLogin(message=''){
+    siteEntryCompleted=false;
+    siteEntryTransitioning=false;
+    document.body.classList.add('pegs-access-locked');
+    if(entryTransition){entryTransition.hidden=true;entryTransition.classList.remove('is-active','is-exiting');}
+    if(accessGate){accessGate.hidden=false;accessGate.classList.remove('is-hidden','is-authenticating');}
+    populateAccessGate();
+    if(message)setAccessStatus(message,'');
+    setTimeout(()=>{if(accessPasswordInput&&!document.hidden)accessPasswordInput.focus({preventScroll:true});},80);
+  }
+  async function settleEntryViewport(){
+    const active=document.activeElement;
+    if(active&&typeof active.blur==='function')active.blur();
+    try{window.scrollTo({top:0,left:0,behavior:'auto'});}catch(_){window.scrollTo(0,0);}
+    const vv=window.visualViewport;
+    if(!vv){
+      await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+      return;
+    }
+    await new Promise(resolve=>{
+      const started=performance.now();
+      let previousHeight=Number(vv.height||0),previousWidth=Number(vv.width||0),stableFrames=0,raf=0;
+      const finish=()=>{if(raf)cancelAnimationFrame(raf);resolve();};
+      const tick=()=>{
+        const height=Number(vv.height||0),width=Number(vv.width||0);
+        if(Math.abs(height-previousHeight)<1&&Math.abs(width-previousWidth)<1)stableFrames+=1;
+        else stableFrames=0;
+        previousHeight=height;previousWidth=width;
+        if(stableFrames>=5||performance.now()-started>=850){finish();return;}
+        raf=requestAnimationFrame(tick);
+      };
+      raf=requestAnimationFrame(tick);
+    });
+  }
+  function waitForVisibleEntryAnimation(){
+    if(!entrySentinel)return Promise.resolve();
+    const reduced=Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches);
+    return new Promise(resolve=>{
+      let done=false,visibleMs=0,last=performance.now(),raf=0;
+      const finish=()=>{if(done)return;done=true;entrySentinel.removeEventListener('animationend',finish);if(raf)cancelAnimationFrame(raf);resolve();};
+      const limit=reduced?1900:12500;
+      const tick=now=>{if(done)return;if(!document.hidden)visibleMs+=Math.max(0,now-last);last=now;if(visibleMs>=limit){finish();return;}raf=requestAnimationFrame(tick);};
+      if(!reduced)entrySentinel.addEventListener('animationend',finish,{once:true});
+      raf=requestAnimationFrame(tick);
+    });
+  }
+  async function completeSiteEntry({teamKey='',commissioner=false}={}){
+    if(siteEntryCompleted&&!document.body.classList.contains('pegs-access-locked'))return;
+    if(siteEntryTransitioning)return;
+    siteEntryTransitioning=true;
+    const k=String(teamKey||loggedTeamKey()||'').toUpperCase(),t=teamMap[k]||null;
+    const kicker=document.getElementById('entry-welcome-kicker'),name=document.getElementById('entry-welcome-name'),label=document.getElementById('entry-loading-label');
+    await settleEntryViewport();
+    if(kicker)kicker.textContent=t?'Welcome back,':(commissioner?'Access confirmed':'Welcome to');
+    if(name)name.textContent=t?t.name:(commissioner?'PEGS Commissioner':'PEGS Supercoach Franchise');
+    if(label)label.textContent='PEGS Supercoach Franchise';
+    if(accessGate)accessGate.classList.add('is-hidden');
+    if(entryTransition){
+      entryTransition.hidden=false;
+      entryTransition.classList.remove('is-active','is-exiting');
+      void entryTransition.offsetWidth;
+      entryTransition.classList.add('is-active');
+      await waitForVisibleEntryAnimation();
+      entryTransition.classList.add('is-exiting');
+      const reduced=window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
+      await new Promise(r=>setTimeout(r,reduced?260:720));
+    }
+    document.body.classList.remove('pegs-access-locked');
+    if(entryTransition){entryTransition.hidden=true;entryTransition.classList.remove('is-active','is-exiting');}
+    if(accessGate)accessGate.hidden=true;
+    siteEntryCompleted=true;
+    siteEntryTransitioning=false;
+    updateSessionUI();render();
+    setTimeout(()=>main?.focus({preventScroll:true}),30);
+  }
+  function beginPostLoginSync(){
+    return Promise.all([pullSharedState(),syncProposals(),loadDraftPool()]).then(()=>{backgroundRefreshUi();}).catch(syncError=>{console.warn('Post-login sync incomplete',syncError);});
+  }
+  async function handleAccessTeamLogin(){
+    if(!backendConfigured()){setAccessStatus('Team Login needs the configured PEGS league server.','error');return;}
+    const k=String(accessTeamSelect?.value||'').toUpperCase(),pw=String(accessPasswordInput?.value||'').trim().toUpperCase();
+    if(!teamMap[k]){setAccessStatus('Choose your franchise.','error');return;}
+    if(!pw){setAccessStatus('Enter your team password.','error');accessPasswordInput?.focus();return;}
+    if(accessLoginButton){accessLoginButton.disabled=true;accessLoginButton.textContent='Authenticating…';}
+    setAccessStatus('Checking your franchise login…','');
+    const authStarted=performance.now();
+    beginAccessAuthenticationStage();
+    try{
+      await backendLogin(teamAuthEmail(k),pw,'team');
+      saveRememberedTeamLogin(k,pw,Boolean(accessRememberInput?.checked));
+      transactionScope='mine';
+      updateSessionUI();
+      setAccessStatus('Login confirmed. Welcome to PEGS.','success');
+      void beginPostLoginSync();
+      await finishAccessAuthenticationStage(true,authStarted);
+      await completeSiteEntry({teamKey:k});
+    }catch(e){
+      await finishAccessAuthenticationStage(false,authStarted);
+      setAccessStatus(e.message||'Team login failed.','error');
+      accessPasswordInput?.focus();
+    }finally{
+      if(accessLoginButton){accessLoginButton.disabled=false;accessLoginButton.textContent='Log in';}
+    }
+  }
+  function enforceAccessAfterLogout(message='Logged out.'){
+    updateSessionUI();
+    if(siteAccessGranted()){render();return;}
+    lockSiteForLogin(message);
+  }
+  function setupAccessGate(){
+    populateAccessGate();
+    accessLoginForm?.addEventListener('submit',e=>{e.preventDefault();void handleAccessTeamLogin();});
+    accessTeamSelect?.addEventListener('change',()=>{const saved=rememberedTeamLogin(),k=String(accessTeamSelect.value||'').toUpperCase();if(accessPasswordInput)accessPasswordInput.value=saved&&saved.teamKey===k?saved.password:'';if(accessRememberInput)accessRememberInput.checked=Boolean(saved&&saved.teamKey===k);setAccessStatus('','');});
+    document.getElementById('access-commissioner')?.addEventListener('click',()=>{void commissionerUI();commissionerDialog.showModal();});
+  }
   function incomingTradeRequests(){const k=loggedTeamKey();return k?proposalCache.filter(p=>p.type==='TRADE'&&p.status==='AWAITING_COUNTERPARTY'&&p.counterpartyTeam===k):[];}
   function updateSessionUI(){
-    const label=document.getElementById('team-login-label'),dot=document.getElementById('team-notification-dot'),comm=document.getElementById('open-commissioner');
-    if(label)label.textContent=teamLoggedIn()?team(loggedTeamKey()).owner:'Team Login';
+    const label=document.getElementById('team-login-label'),kicker=document.getElementById('team-session-kicker'),avatar=document.getElementById('team-session-avatar'),dot=document.getElementById('team-notification-dot'),teamBtn=document.getElementById('open-team-login'),comm=document.getElementById('open-commissioner');
+    const signedIn=teamLoggedIn(),current=signedIn?team(loggedTeamKey()):null;
+    if(label)label.textContent=signedIn?current.owner:'Team Login';
+    if(kicker)kicker.textContent=signedIn?current.name:'Franchise';
+    if(avatar){avatar.textContent=signedIn?(current.code||String(current.owner||'T').slice(0,2)).slice(0,2):'T';avatar.style.setProperty('--team-accent',signedIn?(current.accent||'#4d91ff'):'#4d91ff');}
+    if(teamBtn)teamBtn.classList.toggle('is-team-session',signedIn);
     if(dot){const n=incomingTradeRequests().length;dot.hidden=!n;dot.textContent=n?String(n):'';}
     if(comm){
       const enabled=commissionerLoggedIn();
@@ -800,18 +1026,18 @@
     return `<button class="my-matchup-card" data-action="open-matchup" data-round="${round}" data-home="${esc(f.home)}" data-away="${esc(f.away)}"><div class="my-matchup-card-head"><span class="eyebrow">${esc(roundLabel(round))}</span><span class="badge ${final?'green':isCurrent?'blue':'neutral'}">${esc(badge)}</span></div><div class="my-matchup-teams"><div>${teamIdentity(f.home,'sm')}<strong>${final||isCurrent?home.actual:'—'}</strong><small>${!final?`Proj ${Math.round(home.projected||0)}`:'Final'}</small></div><span class="vs-dot">VS</span><div>${teamIdentity(f.away,'sm')}<strong>${final||isCurrent?away.actual:'—'}</strong><small>${!final?`Proj ${Math.round(away.projected||0)}`:'Final'}</small></div></div><span class="my-matchup-open">View matchup →</span></button>`;
   }
   function renderPersonalizedHome(teamKey){
-    const d=teamDashboardData(teamKey),t=team(teamKey),last=d.last,next=d.nextFixture,ladder=d.ladderRow||{},projected=d.projectedRow||ladder;
+    const d=teamDashboardData(teamKey),t=team(teamKey),last=d.last,next=d.nextFixture,ladder=d.ladderRow||{},projected=d.projectedRow||ladder,seasonClosed=!activeSeasonSetup()&&Boolean(D.meta.seasonComplete);
     const lastLabel=last?`${last.result} · ${Number(last.ownScore).toLocaleString('en-AU')}–${Number(last.opponentScore).toLocaleString('en-AU')}`:'No result yet';
     const lastSub=last?`${roundLabel(last.round)} vs ${team(last.opponent).owner}`:'Season results will appear here';
-    const nextOpponent=next?(next.home===teamKey?next.away:next.home):'',nextLabel=next?`R${Number(next.round)} · ${team(nextOpponent).owner}`:'Not scheduled';
+    const nextOpponent=next?(next.home===teamKey?next.away:next.home):'',nextLabel=seasonClosed?'Season complete':(next?`R${Number(next.round)} · ${team(nextOpponent).owner}`:'Not scheduled');
     const ladderIndex=Math.max(0,d.ladder.findIndex(r=>r.team===teamKey)),start=Math.max(0,Math.min(ladderIndex-2,Math.max(0,d.ladder.length-5))),nearby=d.ladder.slice(start,start+5);
     const form=d.form.length?d.form.map(v=>`<span class="my-form-pill ${v==='W'?'win':v==='L'?'loss':'draw'}">${v}</span>`).join(''):'<span class="muted-copy">No completed fixtures yet</span>';
     const picks=d.picks.slice(0,8),pickHtml=picks.length?picks.map(p=>`<span class="my-pick-chip"><b>${p.pick}</b><small>R${p.round}${p.originalOwner!==p.owner?` · from ${esc(team(p.originalOwner).owner)}`:''}</small></span>`).join(''):'<span class="muted-copy">No ${esc(d.phase)} picks currently owned.</span>';
     const moves=d.moves.length?d.moves.map(x=>transactionItem(x,false)).join(''):'<div class="empty">No confirmed franchise moves yet.</div>';
     const currentFixture=d.currentFixture,matchRoute=currentFixture?`matchups/${currentFixture.round}/${currentFixture.home}/${currentFixture.away}`:(next?`matchups/${next.round}/${next.home}/${next.away}`:'matchups');
     main.innerHTML=`${teamNotificationBanner()}<section class="my-franchise-home" data-team="${esc(teamKey)}">
-      <header class="card my-franchise-hero" style="--accent:${esc(t.accent)}"><div class="my-franchise-hero-team">${figurehead(teamKey,'lg')}<div><span class="badge green">YOUR FRANCHISE</span><span class="eyebrow">${currentSeason()} · Round ${d.currentRound}</span><h1>Welcome back, ${esc(t.owner)}</h1><p>${esc(t.name)}</p></div></div><div class="my-franchise-actions"><button class="primary-button" data-route="teams">My Franchise</button><button class="secondary-button" data-route="${esc(matchRoute)}">My Matchup</button><button class="secondary-button" data-route="transactions">My Moves</button></div></header>
-      <section class="my-franchise-kpis" aria-label="Franchise overview"><article class="card my-kpi"><span>Ladder position</span><strong>${ordinal(ladder.position)}</strong><small>${ladder.points??0} pts · ${Number(ladder.percentage||0).toFixed(1)}%</small>${projected&&ladder.position&&projected.position!==ladder.position?`<em>Projected ${ordinal(projected.position)}</em>`:''}</article><article class="card my-kpi"><span>Season record</span><strong>${ladder.wins??0}–${ladder.losses??0}${ladder.draws?`–${ladder.draws}`:''}</strong><small>${ladder.played??0} completed</small></article><article class="card my-kpi"><span>Last result</span><strong>${esc(lastLabel)}</strong><small>${esc(lastSub)}</small></article><article class="card my-kpi"><span>Next fixture</span><strong>${esc(nextLabel)}</strong><small>${nextOpponent?esc(team(nextOpponent).name):'Fixture TBC'}</small></article></section>
+      <header class="card my-franchise-hero" style="--accent:${esc(t.accent)}"><div class="my-franchise-hero-team">${figurehead(teamKey,'lg')}<div><span class="badge green">YOUR FRANCHISE</span><span class="eyebrow">${currentSeason()} · ${seasonClosed?'Season complete':`Round ${d.currentRound}`}</span><h1>Welcome back, ${esc(t.owner)}</h1><p>${esc(t.name)}</p></div></div><div class="my-franchise-actions"><button class="primary-button" data-route="teams"><span class="action-icon" aria-hidden="true">◎</span><span>My Franchise</span></button><button class="secondary-button" data-route="${esc(matchRoute)}"><span class="action-icon" aria-hidden="true">VS</span><span>My Matchup</span></button><button class="secondary-button" data-route="transactions"><span class="action-icon" aria-hidden="true">⇄</span><span>My Moves</span></button></div></header>
+      <section class="my-franchise-kpis" aria-label="Franchise overview"><article class="card my-kpi"><span>Ladder position</span><strong>${ordinal(ladder.position)}</strong><small>${ladder.points??0} pts · ${Number(ladder.percentage||0).toFixed(1)}%</small>${projected&&ladder.position&&projected.position!==ladder.position?`<em>Projected ${ordinal(projected.position)}</em>`:''}</article><article class="card my-kpi"><span>Season record</span><strong>${ladder.wins??0}–${ladder.losses??0}${ladder.draws?`–${ladder.draws}`:''}</strong><small>${ladder.played??0} completed</small></article><article class="card my-kpi"><span>Last result</span><strong>${esc(lastLabel)}</strong><small>${esc(lastSub)}</small></article><article class="card my-kpi"><span>Next fixture</span><strong>${esc(nextLabel)}</strong><small>${seasonClosed?'Off-season':(nextOpponent?esc(team(nextOpponent).name):'Fixture TBC')}</small></article></section>
       <section class="my-franchise-main-grid"><article class="card card-pad my-current-match"><div class="section-title"><div><span class="eyebrow">Match centre</span><h2>${currentFixture&&!d.completed.some(x=>Number(x.round)===Number(currentFixture.round))?'Your current matchup':'Your next matchup'}</h2></div><button class="link-button" data-route="matchups">All matchups</button></div>${dashboardMatchupCard(d)}</article><article class="card card-pad my-team-snapshot"><div class="section-title"><div><span class="eyebrow">List health</span><h2>Team snapshot</h2></div><button class="link-button" data-route="teams">Full team</button></div><div class="my-snapshot-grid"><div><span>Players</span><strong>${d.roster.length}</strong></div><div><span>Field</span><strong>${d.summary.counts.field||0}</strong></div><div><span>Interchange</span><strong>${d.summary.counts.interchange||0}</strong></div><div><span>Score avg</span><strong>${d.scoreAvg||'—'}</strong></div><div><span>Expiring ${currentSeason()}</span><strong>${d.expiring}</strong></div><div><span>Roster</span><strong class="${rosterIsLegal(d.roster)?'legal-copy':'illegal-copy'}">${rosterIsLegal(d.roster)?'LEGAL':'REVIEW'}</strong></div></div></article></section>
       <section class="my-franchise-secondary-grid"><article class="card card-pad"><div class="section-title"><div><span class="eyebrow">Recent form</span><h2>Last five</h2></div><button class="link-button" data-route="results">Results</button></div><div class="my-form-line">${form}</div><div class="my-score-summary"><span>Regular-season score average</span><strong>${d.scoreAvg||'—'}</strong></div></article><article class="card card-pad"><div class="section-title"><div><span class="eyebrow">Your position</span><h2>Ladder neighbourhood</h2></div><button class="link-button" data-route="ladder">Full ladder</button></div><div class="my-mini-ladder">${nearby.map(r=>`<button data-route="team/${r.team}" class="my-mini-ladder-row ${r.team===teamKey?'is-me':''}"><b>${r.position}</b>${teamIdentity(r.team,'sm')}<span>${r.wins}-${r.losses}</span><strong>${r.points}</strong></button>`).join('')}</div></article></section>
       <section class="my-franchise-secondary-grid"><article class="card card-pad"><div class="section-title"><div><span class="eyebrow">${esc(d.phase)}</span><h2>Your draft assets</h2></div><button class="link-button" data-route="draft">Draft room</button></div><div class="my-pick-list">${pickHtml}</div></article><article class="card card-pad"><div class="section-title"><div><span class="eyebrow">Franchise activity</span><h2>Your recent moves</h2></div><button class="link-button" data-route="transactions">All my moves</button></div><div class="transaction-list my-home-moves">${moves}</div></article></section>
@@ -831,14 +1057,16 @@
       const k=loggedTeamKey(),incoming=incomingTradeRequests();
       teamLoginContent.innerHTML=`<div class="commissioner-body commissioner-login"><div class="team-login-avatar">${figurehead(k,'md')}</div><span class="eyebrow">Signed in</span><h3>${esc(team(k).owner)} · ${esc(team(k).name)}</h3><p>This login can only submit actions for this franchise.${commissionerLoggedIn()?' Commissioner Mode is also enabled in this browser session.':''}</p>${incoming.length?`<div class="notice trade-notification"><strong>${incoming.length} trade request${incoming.length===1?'':'s'} waiting.</strong> Review ${incoming.length===1?'it':'them'} in Moves.</div>`:''}<div class="button-row"><button class="primary-button" id="team-go-moves">Open Moves</button><button class="secondary-button" id="team-logout">Log out</button></div></div>`;
       document.getElementById('team-go-moves')?.addEventListener('click',()=>{teamDialog.close();routeTo('transactions');});
-      document.getElementById('team-logout')?.addEventListener('click',()=>{teamCredentialCache=[];clearBackendSession();proposalCache=[];teamDialog.close();void syncProposals().then(()=>render());toast('Team logged out.');});
+      document.getElementById('team-logout')?.addEventListener('click',()=>{teamCredentialCache=[];clearBackendSession();proposalCache=[];teamDialog.close();toast('Team logged out.');enforceAccessAfterLogout('Team logged out. Log in to re-enter PEGS.');});
       return;
     }
-    const options=D.teams.map(t=>`<option value="${t.key}">${esc(t.owner)} · ${esc(t.name)}</option>`).join('');
-    teamLoginContent.innerHTML=`<div class="commissioner-body commissioner-login"><div class="team-login-avatar"><span class="commissioner-lock">T</span></div><span class="eyebrow">Franchise access</span><h3>Team Login</h3><p>Choose your coach username and enter the six-letter password supplied by the Commissioner.</p><div class="form-grid" style="margin-top:16px"><div class="field-group"><label for="team-login-team">Coach username</label><select class="select" id="team-login-team">${options}</select></div><div class="field-group"><label for="team-login-password">Password</label><input class="search-input team-password-input" id="team-login-password" type="password" maxlength="6" autocomplete="current-password" placeholder="ABCDEF"></div></div><div class="button-row"><button class="primary-button" id="team-login-submit">Login to my team</button></div><div class="notice" style="margin-top:16px"><strong>Permissions:</strong> your login is tied to one franchise. Commissioner Mode, when enabled, remains a separate concurrent permission layer.  PEGS will not accept a draft pick, swap, rookie elevation, delisting or trade proposal for another team.</div></div>`;
-    const login=async()=>{const k=document.getElementById('team-login-team').value,pw=String(document.getElementById('team-login-password').value||'').trim().toUpperCase();if(pw.length!==6){toast('Enter the six-letter team password.');return;}try{await backendLogin(teamAuthEmail(k),pw,'team');transactionScope='mine';dismissDialog(teamDialog);updateSessionUI();toast(`${team(k).owner} logged in.${commissionerLoggedIn()?' Commissioner Mode remains enabled.':''}`);render();try{await Promise.all([pullSharedState(),syncProposals(),loadDraftPool()]);backgroundRefreshUi();}catch(syncError){console.warn('Team post-login sync incomplete',syncError);}}catch(e){toast(e.message||'Team login failed.');}};
+    const saved=rememberedTeamLogin(),options=D.teams.map(t=>`<option value="${t.key}" ${saved?.teamKey===t.key?'selected':''}>${esc(t.owner)} · ${esc(t.name)}</option>`).join('');
+    teamLoginContent.innerHTML=`<div class="commissioner-body commissioner-login"><div class="team-login-avatar"><span class="commissioner-lock">T</span></div><span class="eyebrow">Franchise access</span><h3>Team Login</h3><p>Choose your coach username and enter your team password.</p><div class="form-grid" style="margin-top:16px"><div class="field-group"><label for="team-login-team">Coach username</label><select class="select" id="team-login-team">${options}</select></div><div class="field-group"><label for="team-login-password">Password</label><input class="search-input" id="team-login-password" type="password" autocomplete="current-password" value="${esc(saved?.password||'')}" placeholder="Enter password"></div></div><label class="access-remember-row" style="margin-top:12px"><input id="team-login-remember" type="checkbox" ${saved?.password?'checked':''}><span><strong>Remember password on this device</strong><small>Stored only in this browser. Avoid this on a shared device.</small></span></label><div class="button-row"><button class="primary-button" id="team-login-submit">Login to my team</button></div><div class="notice" style="margin-top:16px"><strong>Permissions:</strong> your login is tied to one franchise. Commissioner Mode, when enabled, remains a separate concurrent permission layer. PEGS will not accept a draft pick, swap, rookie elevation, delisting or trade proposal for another team.</div></div>`;
+    const teamEl=document.getElementById('team-login-team'),pwEl=document.getElementById('team-login-password'),rememberEl=document.getElementById('team-login-remember');
+    teamEl?.addEventListener('change',()=>{const r=rememberedTeamLogin(),k=String(teamEl.value||'').toUpperCase();pwEl.value=r&&r.teamKey===k?r.password:'';rememberEl.checked=Boolean(r&&r.teamKey===k);});
+    const login=async()=>{const k=String(teamEl?.value||'').toUpperCase(),pw=String(pwEl?.value||'').trim().toUpperCase();if(!pw){toast('Enter your team password.');return;}try{await backendLogin(teamAuthEmail(k),pw,'team');saveRememberedTeamLogin(k,pw,Boolean(rememberEl?.checked));transactionScope='mine';dismissDialog(teamDialog);updateSessionUI();toast(`${team(k).owner} logged in.${commissionerLoggedIn()?' Commissioner Mode remains enabled.':''}`);render();void beginPostLoginSync();}catch(e){toast(e.message||'Team login failed.');}};
     document.getElementById('team-login-submit')?.addEventListener('click',login);
-    document.getElementById('team-login-password')?.addEventListener('keydown',e=>{if(e.key==='Enter')void login();});
+    pwEl?.addEventListener('keydown',e=>{if(e.key==='Enter')void login();});
   }
 
   function tradeActionFor(teamA,teamB,assetsA,assetsB,conditionalDelistsA=[],conditionalDelistsB=[]){
@@ -984,24 +1212,128 @@
   function credentialsTable(credentials){if(!credentials?.length)return '<div class="notice">No new passwords were generated.</div>';return `<div class="credential-sheet" id="credential-sheet"><div class="credential-head"><span>Coach</span><span>Username</span><span>6-letter password</span></div>${credentials.map(c=>`<div><strong>${esc(c.coachName)}</strong><span>${esc(c.username)}</span><code>${esc(c.password)}</code></div>`).join('')}</div><div class="notice danger"><strong>Copy these now.</strong> Passwords are not stored in PEGS and cannot be displayed again; you can reset a team later.</div>`;}
 
   function backupDerivedData(){
-    return {meta:{league:D.meta.league,season:currentSeason(),round:effectiveCurrentRound(),createdAt:new Date().toISOString()},rules:D.rules,teams:D.teams,rosters:effectiveRosters(),ladder:effectiveLadder(),fixtures:effectiveFixtures(),finals:effectiveFinals(),transactions:[...getCommissionerActions().filter(x=>x.status==='CONFIRMED'),...visibleLegacyTransactions()],draftHistory:[...D.draft.filter(d=>!Object.keys(getTransactionReversals()).map(k=>LEGACY_TRANSACTION_META[k]).filter(m=>m?.type==='Drafted'&&m.pick).some(m=>Number(m.pick)===Number(d.pick)&&m.team===d.team&&canonicalPlayerName(m.players?.[0]||'')===canonicalPlayerName(d.player))),...getCommissionerActions().filter(x=>x.type==='Drafted'&&x.status==='CONFIRMED')],pickOwnership:{preSeason:draftPickLedger('Pre-Season'),midSeason:draftPickLedger('Mid-Season')},honours:D.honours};
+    return {meta:{league:D.meta.league,season:currentSeason(),round:effectiveCurrentRound(),createdAt:new Date().toISOString(),archiveVersion:'14.4'},rules:D.rules,teams:D.teams,rosters:effectiveRosters(),ladder:effectiveLadder(),fixtures:effectiveFixtures(),finals:effectiveFinals(),transactions:[...getCommissionerActions().filter(x=>x.status==='CONFIRMED'),...visibleLegacyTransactions()],draftHistory:[...D.draft.filter(d=>!Object.keys(getTransactionReversals()).map(k=>LEGACY_TRANSACTION_META[k]).filter(m=>m?.type==='Drafted'&&m.pick).some(m=>Number(m.pick)===Number(d.pick)&&m.team===d.team&&canonicalPlayerName(m.players?.[0]||'')===canonicalPlayerName(d.player))),...getCommissionerActions().filter(x=>x.type==='Drafted'&&x.status==='CONFIRMED')],pickOwnership:{preSeason:draftPickLedger('Pre-Season'),midSeason:draftPickLedger('Mid-Season')},honours:D.honours};
   }
   async function syncBackups(){if(!commissionerLoggedIn())return [];try{backupCache=await commissionerFetch('/rest/v1/pegs_backups?select=id,created_at,season,round,label,reason&order=created_at.desc&limit=100')||[];}catch(e){console.warn(e);backupCache=[];}return backupCache;}
-  async function createServerBackup(reason='MANUAL',label=''){const id=await commissionerFetch('/rest/v1/rpc/pegs_create_backup',{method:'POST',body:JSON.stringify({p_label:label,p_reason:reason,p_derived:backupDerivedData()})});await syncBackups();return id;}
-  async function getBackupSnapshot(id){const rows=await commissionerFetch('/rest/v1/pegs_backups?select=*&id=eq.'+encodeURIComponent(id)+'&limit=1');if(!rows?.[0])throw new Error('Backup not found.');return rows[0];}
-  function downloadBlob(name,blob){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),500);}
-  async function exportBackupJson(id){const rec=await getBackupSnapshot(id);downloadBlob(`PEGS-Backup-${rec.season||currentSeason()}-R${rec.round||0}-${id}.json`,new Blob([JSON.stringify(rec.snapshot,null,2)],{type:'application/json'}));}
-  async function ensureSheetJs(){if(globalThis.XLSX)return globalThis.XLSX;await new Promise((resolve,reject)=>{const sc=document.createElement('script');sc.src='https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';sc.onload=resolve;sc.onerror=()=>reject(new Error('Excel library could not be loaded.'));document.head.appendChild(sc);});return globalThis.XLSX;}
-  function backupSheetRows(snapshot){
-    const d=snapshot?.derived||{},state=snapshot?.state||{},results=state.season_results||{},season=String(d.meta?.season||state.season_setup?.season||currentSeason()),seasonResults=results?.[season]||{};
-    const teamLists=[];for(const [k,rows] of Object.entries(d.rosters||{}))for(const p of rows||[])teamLists.push({Team:team(k).name,Coach:team(k).owner,Player:p.player,AFLClub:p.club,Position:p.position,Contract:p.contract,Salary:Number(p.salary||0),ContractEnd:p.contractEnd,ListLocation:p.status});
-    const roundResults=[],playerScores=[];for(const [round,rr] of Object.entries(seasonResults)){for(const [k,score] of Object.entries(rr.teamScores||{}))roundResults.push({Round:Number(round),Team:team(k).name,Coach:team(k).owner,Score:Number(score||0),TopPlayers:Number(rr.topPlayers||0),FinalizedAt:rr.finalizedAt||''});for(const [k,ps] of Object.entries(rr.players||{}))for(const p of ps||[])playerScores.push({Round:Number(round),Team:team(k).name,Player:p.player,Position:p.position,AFLClub:p.club,Score:Number(p.score||0),Source:p.scoreSource||''});}
-    const bank=state.opening_bank?.[season]?.players||{},opening=Object.values(bank).map(p=>({Player:p.player,AFLClub:p.club,OpeningRoundScore:Number(p.actual||0),Source:p.source||''}));
-    const auditLog=(snapshot?.auditLog||[]).map(a=>({ID:a.id,CreatedAt:a.created_at,ActorRole:a.actor_role,ActorTeam:a.actor_team,Action:a.action,EntityType:a.entity_type,EntityID:a.entity_id,Detail:JSON.stringify(a.detail||{})}));
-    return {summary:[{League:d.meta?.league||D.meta.league,Season:d.meta?.season||season,Round:d.meta?.round||'',CreatedAt:snapshot?.createdAt||''}],teamLists,ladder:d.ladder||[],roundResults,playerScores,transactions:d.transactions||[],draftHistory:d.draftHistory||[],pickOwnership:[...(d.pickOwnership?.preSeason||[]),...(d.pickOwnership?.midSeason||[])],opening,finals:d.finals||[],seasonSettings:[state.season_setup||{}],auditLog};
+  async function createServerBackup(reason='MANUAL',label=''){
+    if(reason!=='AUTO_CHANGE')cancelPendingAutoBackup();
+    const id=await commissionerFetch('/rest/v1/rpc/pegs_create_backup',{method:'POST',body:JSON.stringify({p_label:label,p_reason:reason,p_derived:backupDerivedData()})});await syncBackups();return id;
   }
-  async function exportBackupExcel(id){const rec=await getBackupSnapshot(id),X=await ensureSheetJs(),rows=backupSheetRows(rec.snapshot),wb=X.utils.book_new(),add=(name,data)=>X.utils.book_append_sheet(wb,X.utils.json_to_sheet(data?.length?data:[{Info:'No records'}]),name);add('League Summary',rows.summary);add('Team Lists',rows.teamLists);add('Ladder',rows.ladder);add('Round Results',rows.roundResults);add('Player Scores',rows.playerScores);add('Transactions',rows.transactions);add('Draft History',rows.draftHistory);add('Draft Pick Ownership',rows.pickOwnership);add('Opening Round Banking',rows.opening);add('Finals',rows.finals);add('Season Settings',rows.seasonSettings);add('Audit Log',rows.auditLog);X.writeFile(wb,`PEGS-Backup-${rec.season||currentSeason()}-R${rec.round||0}-${id}.xlsx`);}
-  async function restoreServerBackup(id){if(!commissionerLoggedIn())throw new Error('Commissioner login required.');const typed=prompt(`Restore backup #${id}? PEGS will first create an emergency copy of the current state. Type RESTORE to continue.`);if(typed!=='RESTORE')return false;await commissionerFetch('/rest/v1/rpc/pegs_restore_backup',{method:'POST',body:JSON.stringify({p_backup_id:Number(id)})});[OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,TRANSACTION_REVERSALS_KEY,DRAFT_STATE_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,FIGUREHEAD_OVERRIDE_KEY,DRAFT_POOL_KEY].forEach(k=>localStorage.removeItem(k));draftPoolCache=null;proposalCache=[];await pullSharedState();await syncProposals();await loadDraftPool();await syncBackups();await syncServerAuthority();return true;}
+  async function getBackupSnapshot(id){const rows=await commissionerFetch('/rest/v1/pegs_backups?select=*&id=eq.'+encodeURIComponent(id)+'&limit=1');if(!rows?.[0])throw new Error('Restore point not found.');return rows[0];}
+  function downloadBlob(name,blob){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),500);}
+  async function ensureSheetJs(){if(globalThis.XLSX)return globalThis.XLSX;await new Promise((resolve,reject)=>{const sc=document.createElement('script');sc.src='https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';sc.onload=resolve;sc.onerror=()=>reject(new Error('Excel library could not be loaded.'));document.head.appendChild(sc);});return globalThis.XLSX;}
+  let legacyArchiveLoadPromise=null;
+  async function ensureLegacyArchiveLoaded(){
+    if(D.legacyArchive)return D.legacyArchive;
+    if(globalThis.PEGS_LEGACY_ARCHIVE){D.legacyArchive=globalThis.PEGS_LEGACY_ARCHIVE;return D.legacyArchive;}
+    if(!legacyArchiveLoadPromise)legacyArchiveLoadPromise=new Promise((resolve,reject)=>{const sc=document.createElement('script');sc.src='./legacy-archive-data.js';sc.onload=()=>{if(globalThis.PEGS_LEGACY_ARCHIVE){D.legacyArchive=globalThis.PEGS_LEGACY_ARCHIVE;resolve(D.legacyArchive);}else reject(new Error('Legacy archive data did not initialise.'));};sc.onerror=()=>reject(new Error('Legacy archive data could not be loaded.'));document.head.appendChild(sc);});
+    return legacyArchiveLoadPromise;
+  }
+  function currentLocalRecoverySnapshot(){
+    return {schemaVersion:14,createdAt:new Date().toISOString(),state:{score_overrides:getOverrides(),selection_overrides:getSelectionOverrides(),commissioner_actions:getCommissionerActions(),transaction_reversals:getTransactionReversals(),draft_state:getDraftState(),proposal_windows:getProposalWindows(),scoring_snapshots:getScoringSnapshots(),figurehead_overrides:getFigureheadOverrides(),season_setup:getSeasonSetup(),season_results:getSeasonResults(),live_feed:getLiveFeed(),opening_bank:getOpeningBank()},proposals:proposalCache||[],draftPools:draftPoolCache?[draftPoolCache]:[],rosterAuthority:effectiveRosters(),pickAuthority:[...draftPickLedger('Pre-Season'),...draftPickLedger('Mid-Season')],auditLog:auditCache||[],derived:backupDerivedData()};
+  }
+  function archiveJson(value){try{return JSON.stringify(value??null);}catch(_){return String(value??'');}}
+  function archiveTeamName(key){const t=team(key);return {TeamKey:String(key||''),Franchise:t.name||key,Coach:t.owner||key};}
+  function backupSheetRows(snapshot){
+    const d=snapshot?.derived||{},state=snapshot?.state||{},legacy=D.legacyArchive||globalThis.PEGS_LEGACY_ARCHIVE||{},staticSeason=Number(D.meta.season||2026),current=Number(d.meta?.season||state.season_setup?.season||currentSeason()),seasonResults=state.season_results||{};
+    const guide=[
+      {Sheet:'League Summary',Purpose:'Archive metadata and restore-point context'},
+      {Sheet:'Rules',Purpose:'League caps, list limits and competition rules'},
+      {Sheet:'Teams',Purpose:'Franchises, coaches and current cap/list summary'},
+      {Sheet:'Team Lists',Purpose:'Current authoritative rosters and contracts'},
+      {Sheet:'Roster History',Purpose:'Consolidated historical roster states and legacy roster backups'},
+      {Sheet:'Fixtures',Purpose:'Historical 2026 and current PEGS head-to-head fixtures'},
+      {Sheet:'Round Schedule',Purpose:'AFL participation/byes and number of PEGS scores counted'},
+      {Sheet:'Round Results',Purpose:'Official team totals for every archived round'},
+      {Sheet:'Legacy Round Totals',Purpose:'Original Team Round Totals and backup-source values retained for audit'},
+      {Sheet:'Player Scores',Purpose:'Official PEGS player-level round scores, including completed 2026 corrections'},
+      {Sheet:'PEGS Score Source',Purpose:'Raw Team Round Scores records from the legacy workbook'},
+      {Sheet:'AFL Score History',Purpose:'Complete AFL Player_Scores history from the legacy workbook'},
+      {Sheet:'Ladder',Purpose:'Current ladder snapshot'},
+      {Sheet:'Finals',Purpose:'Official finals matchups, scores and winners'},
+      {Sheet:'GF History Summary',Purpose:'Historical Grand Final team totals from the legacy workbook'},
+      {Sheet:'GF Player History',Purpose:'Historical player-level Grand Final scorecards from the legacy workbook'},
+      {Sheet:'Honours',Purpose:'Historical premiers, runners-up and wooden spoons'},
+      {Sheet:'Legacy Rulebook',Purpose:'Written clauses preserved from the original legacy workbook for historical reference'},
+      {Sheet:'Team Identity History',Purpose:'Former franchise names, former coaches and legacy SuperCoach payment records'},
+      {Sheet:'Delisting History',Purpose:'Normalized 2018-2026 delisting history from all legacy period blocks'},
+      {Sheet:'Trade History',Purpose:'Normalized 2019-2026 trade history, one row per player or pick movement'},
+      {Sheet:'Legacy Draft History',Purpose:'Normalized 2018-2026 pre-season, rookie and mid-season draft history'},
+      {Sheet:'Weekly Player History',Purpose:'Week 1-23 source records preserving player prices, scores and value metrics'},
+      {Sheet:'Workbook Map',Purpose:'Maps every sheet in the old workbook to its consolidated archive destination'},
+      {Sheet:'Transactions',Purpose:'Official trades, delistings, swaps and rookie elevations'},
+      {Sheet:'Legacy Transaction Source',Purpose:'Detailed source fields from the old swap/delist/trade/elevation logs'},
+      {Sheet:'Draft History',Purpose:'Official historical and current draft selections'},
+      {Sheet:'Draft Source Log',Purpose:'Raw Draft_Log selections retained from the legacy workbook'},
+      {Sheet:'Draft Order History',Purpose:'Legacy draft order, pass/display state and recorded selection'},
+      {Sheet:'Draft Timing',Purpose:'Legacy draft pick start times'},
+      {Sheet:'Draft Pick Ownership',Purpose:'Current pre-season and mid-season pick ownership'},
+      {Sheet:'Player Master',Purpose:'Legacy player master, prices, positions and status'},
+      {Sheet:'Season Settings',Purpose:'Current season setup and fixture configuration'},
+      {Sheet:'Proposals',Purpose:'Team proposals captured in the restore point'},
+      {Sheet:'Draft Pools',Purpose:'Frozen draft-pool snapshots'},
+      {Sheet:'Audit Log',Purpose:'Commissioner and team activity history'},
+      {Sheet:'System State',Purpose:'Every persisted PEGS state object as JSON for audit/recovery'},
+      {Sheet:'Recovery Snapshot',Purpose:'Complete machine-readable restore snapshot split across Excel rows'}
+    ];
+    const summary=[{League:d.meta?.league||D.meta.league,ArchiveVersion:'14.4',SnapshotCreated:snapshot?.createdAt||d.meta?.createdAt||new Date().toISOString(),CurrentSeason:current,CurrentRound:Number(d.meta?.round||state.season_setup?.currentRound||effectiveCurrentRound()),LegacyWorkbookSeason:staticSeason,LegacyWorkbook:D.meta.generatedFrom||'PEGS legacy workbook',SeasonStatus:current===staticSeason?(D.meta.seasonStatus||''):(state.season_setup?.status||'ACTIVE'),Premier:current===staticSeason?team(D.meta.premier).name:'',RunnerUp:current===staticSeason?team(D.meta.runnerUp).name:''}];
+    const rules=[];for(const [k,v] of Object.entries(D.rules||{})){if(k==='positionMax'){for(const [pos,max] of Object.entries(v||{}))rules.push({Category:'Position maximum',Setting:pos,Value:max});}else if(k==='notes'){(v||[]).forEach((note,i)=>rules.push({Category:'Rule note',Setting:`Note ${i+1}`,Value:note}));}else rules.push({Category:'League rule',Setting:k,Value:typeof v==='object'?archiveJson(v):v});}for(const [k,v] of Object.entries(D.settings||{}))rules.push({Category:`${staticSeason} workbook setting`,Setting:k,Value:typeof v==='object'?archiveJson(v):v});if(D.openingRound){rules.push({Category:`${staticSeason} Opening Round archive`,Setting:'Historical only',Value:Boolean(D.openingRound.historicalOnly)});rules.push({Category:`${staticSeason} Opening Round archive`,Setting:'AFL teams playing',Value:Number(D.openingRound.aflTeamsPlaying||0)});rules.push({Category:`${staticSeason} Opening Round archive`,Setting:'Banking note',Value:D.openingRound.bankingNote||''});rules.push({Category:`${staticSeason} Opening Round archive`,Setting:'Bye banks',Value:archiveJson(D.openingRound.byeBanks||{})});rules.push({Category:`${staticSeason} Opening Round archive`,Setting:'Retired after season',Value:Number(D.openingRound.retiredAfterSeason||staticSeason)});}for(const [k,v] of Object.entries(legacy.draftSettings||{}))rules.push({Category:`${staticSeason} legacy draft setting`,Setting:k,Value:typeof v==='object'?archiveJson(v):v});(legacy.consolidationNotes||[]).forEach((note,i)=>rules.push({Category:'Archive consolidation',Setting:`Note ${i+1}`,Value:note}));
+    const teams=(D.teams||[]).map(t=>({TeamKey:t.key,Coach:t.owner,Franchise:t.name,Code:t.code,MainSalary:Number(t.caps?.main||0),FieldSalary:Number(t.caps?.field||0),RookieSalary:Number(t.caps?.rookie||0),FieldPlayers:Number(t.counts?.field||0),InterchangePlayers:Number(t.counts?.interchange||0),DEF:Number(t.counts?.DEF||0),MID:Number(t.counts?.MID||0),FWD:Number(t.counts?.FWD||0),RUC:Number(t.counts?.RUC||0)}));
+    const teamLists=[];for(const [k,rows] of Object.entries(d.rosters||effectiveRosters()))for(const p of rows||[])teamLists.push({...archiveTeamName(k),Player:p.player,AFLClub:p.club,Position:p.position,Contract:p.contract,Salary:Number(p.salary||0),ContractEnd:p.contractEnd,ListLocation:p.status});
+    const rosterHistory=(legacy.rosterHistory||[]).map(x=>({Season:staticSeason,Round:x.round??'',...archiveTeamName(x.team),Player:x.player||'',AFLClub:x.club||'',Position:x.position||'',Contract:x.contract||'',Salary:x.salary??'',ContractEnd:x.contractEnd??'',ListLocation:x.status||'',LegacySource:x.source||''}));
+    const fixtures=[];const fixtureSeen=new Set();const addFixture=(season,f)=>{const key=[season,f.round,f.home,f.away].join('|');if(fixtureSeen.has(key))return;fixtureSeen.add(key);fixtures.push({Season:Number(season),Round:Number(f.round),...archiveTeamName(f.home),OpponentKey:f.away,Opponent:team(f.away).name,OpponentCoach:team(f.away).owner,FinalType:f.finalType||''});};(D.fixtures||[]).forEach(f=>addFixture(staticSeason,f));if(current!==staticSeason)(d.fixtures||[]).forEach(f=>addFixture(current,f));
+    const roundSchedule=[];if(D.openingRound)roundSchedule.push({Season:staticSeason,Round:0,Label:D.openingRound.label||'Opening Round',AFLTeamsPlaying:Number(D.openingRound.aflTeamsPlaying||0),PEGSPlayersCounted:0,ByeClubs:'',BankedToRounds:Object.entries(D.openingRound.byeBanks||{}).map(([r,clubs])=>`R${r}: ${(clubs||[]).join(', ')}`).join(' | '),Source:'Legacy workbook · historical only'});for(const [round,rec] of Object.entries(D.roundSchedule||{}))roundSchedule.push({Season:staticSeason,Round:Number(round),Label:`Round ${round}`,AFLTeamsPlaying:Number(rec.aflTeamsPlaying||rec.topPlayers||18),PEGSPlayersCounted:Number(rec.topPlayers||rec.aflTeamsPlaying||18),ByeClubs:'',BankedToRounds:'',Source:'Legacy workbook'});for(const r of state.season_setup?.rounds||[]){const season=Number(state.season_setup?.season||current);if(season===staticSeason&&roundSchedule.some(x=>x.Season===season&&x.Round===Number(r.round)))continue;roundSchedule.push({Season:season,Round:Number(r.round),Label:`Round ${r.round}`,AFLTeamsPlaying:Number(r.aflTeamsPlaying||18),PEGSPlayersCounted:Number(r.aflTeamsPlaying||18),ByeClubs:(r.byeClubs||[]).join(', '),BankedToRounds:'',Source:state.season_setup?.fixtureSource||'Season setup'});}
+    const resultMap=new Map(),scoreMap=new Map();const putResult=row=>resultMap.set([row.Season,row.Round,row.TeamKey].join('|'),row),putScore=row=>scoreMap.set([row.Season,row.Round,row.TeamKey,canonicalPlayerName(row.Player)].join('|'),row);
+    for(const [round,rr] of Object.entries(D.roundTotals||{}))for(const [k,score] of Object.entries(rr||{}))putResult({Season:staticSeason,Round:Number(round),...archiveTeamName(k),Score:Number(score||0),TopPlayers:Number(D.roundSchedule?.[String(round)]?.topPlayers||D.meta.topPlayersDefault||18),FinalizedAt:'',Source:'Legacy workbook'});
+    for(const [round,teamsByKey] of Object.entries(D.roundScores||{}))for(const [k,ps] of Object.entries(teamsByKey||{}))for(const p of ps||[])putScore({Season:staticSeason,Round:Number(round),...archiveTeamName(k),Player:p.player,Position:p.position,AFLClub:p.club,Score:Number(p.score||0),Projected:Number(p.projected||0),Status:p.status||'',Source:p.scoreSource||'Legacy workbook'});
+    for(const [season,rounds] of Object.entries(seasonResults||{}))for(const [round,rr] of Object.entries(rounds||{})){for(const [k,score] of Object.entries(rr.teamScores||{}))putResult({Season:Number(season),Round:Number(round),...archiveTeamName(k),Score:Number(score||0),TopPlayers:Number(rr.topPlayers||0),FinalizedAt:rr.finalizedAt||'',Source:'PEGS finalised result'});for(const [k,ps] of Object.entries(rr.players||{}))for(const p of ps||[])putScore({Season:Number(season),Round:Number(round),...archiveTeamName(k),Player:p.player,Position:p.position,AFLClub:p.club,Score:Number(p.score||0),Projected:Number(p.projected||0),Status:p.status||'',Source:p.scoreSource||'PEGS finalised result'});}
+    const roundResults=[...resultMap.values()].sort((a,b)=>a.Season-b.Season||a.Round-b.Round||a.TeamKey.localeCompare(b.TeamKey)),playerScores=[...scoreMap.values()].sort((a,b)=>a.Season-b.Season||a.Round-b.Round||a.TeamKey.localeCompare(b.TeamKey)||a.Player.localeCompare(b.Player));
+    const legacyRoundTotals=(legacy.roundTotalSource||[]).map(x=>({Season:staticSeason,Round:Number(x.round||0),...archiveTeamName(x.team),Score:x.total??'',LegacySource:x.source||''}));
+    const pegsScoreSource=(legacy.pegsScoreSource||[]).map(x=>({Season:staticSeason,Round:Number(x.round||0),...archiveTeamName(x.team),Player:x.player||'',Position:x.position||'',AFLClub:x.club||'',Score:x.score??'',Projected:x.projected??'',Status:x.status||'',LegacySource:'Team Round Scores'}));
+    const aflScoreHistory=(legacy.aflPlayerScoreHistory||[]).map(x=>({Season:staticSeason,Round:Number(x.round||0),Player:x.player||'',AFLClub:x.club||'',Score:x.score??''}));
+    const ladder=(d.ladder||effectiveLadder()).map(x=>({Season:current,Position:Number(x.position||0),...archiveTeamName(x.team),Played:Number(x.played||0),Wins:Number(x.wins||0),Losses:Number(x.losses||0),Draws:Number(x.draws||0),Points:Number(x.points||0),For:Number(x.for||0),Against:Number(x.against||0),Percentage:Number(x.percentage||0)}));
+    const finals=[];const finalSeen=new Set(),addFinal=(season,x)=>{if(!x?.home)return;const key=[season,x.round,x.home,x.away||''].join('|');if(finalSeen.has(key))return;finalSeen.add(key);finals.push({Season:Number(season),Round:Number(x.round||0),Type:x.label||x.finalType||'',HomeKey:x.home,HomeTeam:team(x.home).name,HomeCoach:team(x.home).owner,AwayKey:x.away||'',AwayTeam:x.away?team(x.away).name:'',AwayCoach:x.away?team(x.away).owner:'',HomeScore:Number.isFinite(Number(x.homeScore))?Number(x.homeScore):'',AwayScore:Number.isFinite(Number(x.awayScore))?Number(x.awayScore):'',WinnerKey:x.winner||'',Winner:x.winner?team(x.winner).name:''});};(D.finals||[]).forEach((x,i)=>addFinal(staticSeason,{...x,label:Number(x.round)===23?'Grand Final':Number(x.round)===22?'Preliminary Final':i===0?'Qualifying Final':'Elimination Final'}));if(current!==staticSeason)(d.finals||[]).forEach(x=>addFinal(current,x));
+    const honours=(d.honours||D.honours||[]).map(x=>({...x}));
+    const gfHistorySummary=(legacy.grandFinalSummary||[]).map(x=>({Season:Number(x.season||x.sourceYear||0),SourceYear:Number(x.sourceYear||0),Block:Number(x.block||0),TeamA:x.teamA||'',TeamB:x.teamB||'',TeamATotal:x.teamATotal??'',TeamBTotal:x.teamBTotal??'',Winner:x.winner||''}));
+    const gfPlayerHistory=(legacy.grandFinalPlayerHistory||[]).map(x=>({Season:Number(x.season||x.sourceYear||0),SourceYear:Number(x.sourceYear||0),Block:Number(x.block||0),Team:x.team||'',Opponent:x.opponent||'',Side:x.side||'',Player:x.player||'',Score:x.score??'',Counted:Boolean(x.counted),TeamTotal:x.teamTotal??'',Winner:x.winner||''}));
+    const legacyRulebook=(legacy.writtenRules||[]).map(x=>({Section:x.section||'',Clause:x.clause??'',Rule:x.text||'',SourceRow:x.sourceRow??''}));
+    const teamIdentityHistory=(legacy.teamIdentityHistory||[]).map(x=>({Coach:x.coach||'',Franchise:x.teamName||'',SuperCoachPayment:x.scPayment??'',FormerTeamNames:x.formerTeamNames||'',FormerCoaches:x.formerCoaches||'',SourceRow:x.sourceRow??''}));
+    const delistingHistory=(legacy.delistingHistory||[]).map(x=>({Season:x.season??'',Phase:x.phase||'',Period:x.period||'',Coach:x.coach||'',Player:x.player||'',Position:x.position||'',Price:x.price??'',LegacySource:x.source||'',SourceRow:x.sourceRow??''}));
+    const tradeHistoryAll=(legacy.tradeHistoryAll||[]).map(x=>({Season:x.season??'',Phase:x.phase||'',Period:x.period||'',TradeNo:x.tradeNo??'',OriginalTeam:x.originalTeam||'',Asset:x.asset||'',Price:x.price??'',Position:x.position||'',ContractExpiry:x.contractExpiry??'',NewTeam:x.newTeam||'',LegacySource:x.source||'',SourceRow:x.sourceRow??''}));
+    const legacyDraftHistory=(legacy.draftHistoryAll||[]).map(x=>({Season:x.season??'',Phase:x.phase||'',Period:x.period||'',PickOrType:x.pickOrType??'',Coach:x.coach||'',Player:x.player||'',Position:x.position||'',Price:x.price??'',Status:x.status||'',LegacySource:x.source||'',SourceRow:x.sourceRow??''}));
+    const weeklyPlayerHistory=(legacy.weeklyPlayerHistory||[]).map(x=>({Round:Number(x.round||0),Rank:x.rank??'',Player:x.player||'',AFLClub:x.club||'',Price:x.price??'',ReferencePrice:x.referencePrice??'',Score:x.score??'',PointsPer100k:x.pointsPer100k??'',LegacySource:x.source||'',SourceRow:x.sourceRow??''}));
+    const workbookMap=(legacy.workbookMap||[]).map(x=>({LegacySheet:x.sheet||'',Rows:Number(x.rows||0),Columns:Number(x.columns||0),Classification:x.classification||'',ConsolidatedInto:x.consolidatedInto||''}));
+    const transactions=(d.transactions||[]).map(x=>{const stampedYear=Number(String(x.timestamp||x.createdAt||'').slice(0,4));return {Timestamp:x.timestamp||x.createdAt||'',Season:Number(x.season||(stampedYear>=2000?stampedYear:staticSeason)),Round:Number(x.round||0)||'',Type:x.type||'',Team:x.team||x.teamA||'',TeamName:x.team?team(x.team).name:x.teamA?team(x.teamA).name:'',Counterparty:x.teamB||'',CounterpartyName:x.teamB?team(x.teamB).name:'',Player:x.player||'',Detail:x.detail||'',Status:x.status||'',RawJSON:archiveJson(x)};});
+    const legacyTransactionSource=(legacy.transactionSourceLog||[]).map(x=>({Source:x.source||'',Timestamp:x.timestamp||'',Year:x.year??'',Type:x.type||'',Round:x.round??'',Team:x.team||'',Counterparty:x.counterparty||'',Player:x.player||'',PlayerIn:x.playerIn||'',PlayerOut:x.playerOut||'',Position:x.position||'',PlayersSent:x.playersSent||'',PlayersReceived:x.playersReceived||'',PicksSent:x.picksSent??'',PicksReceived:x.picksReceived??'',Status:x.status||'',OldContract:x.oldContract||'',NewContract:x.newContract||'',OldSalary:x.oldSalary??'',NewSalary:x.newSalary??'',OldContractEnd:x.oldContractEnd??'',NewContractEnd:x.newContractEnd??'',PerformedBy:x.performedBy||'',SourceID:x.sourceId||''}));
+    const draftHistory=(d.draftHistory||[]).map(x=>({Year:Number(x.year||x.draftSeason||current),Type:x.type||x.phase||'',Pick:Number(x.pick||0),Team:x.team||'',TeamName:x.team?team(x.team).name:'',Coach:x.team?team(x.team).owner:'',Player:x.player||'',AFLClub:x.club||'',Position:x.position||'',Contract:x.contract||'',Salary:Number(x.salary||0),Timestamp:x.timestamp||'',RawJSON:archiveJson(x)}));
+    const draftSourceLog=(legacy.draftSourceLog||[]).map(x=>({Year:x.year??'',Type:x.type||'',Pick:x.pick??'',Team:x.team||'',TeamName:x.team?team(x.team).name:'',Player:x.player||'',AFLClub:x.club||'',Position:x.position||'',Contract:x.contract||'',Salary:x.salary??'',Timestamp:x.timestamp||'',LegacySource:'Draft_Log'}));
+    const draftOrderHistory=(legacy.draftOrderHistory||[]).map(x=>({Season:staticSeason,Pick:Number(x.pick||0),Team:x.team||'',TeamName:x.team?team(x.team).name:'',DisplayNameOrPass:x.displayNameOrPass||'',Flag:x.flag??'',RecordedSelection:x.selectedPlayer||''}));
+    const draftTiming=(legacy.draftTimerHistory||[]).map(x=>({Season:staticSeason,Pick:Number(x.pick||0),StartTime:x.startTime||''}));
+    const pickOwnership=[...(d.pickOwnership?.preSeason||[]),...(d.pickOwnership?.midSeason||[])].map(x=>({Season:Number(x.season||current),Phase:x.type||x.phase||'',Pick:Number(x.pick||0),Round:Number(x.round||0),OriginalOwner:x.originalOwner||'',OriginalOwnerName:x.originalOwner?team(x.originalOwner).name:'',Owner:x.owner||'',OwnerName:x.owner?team(x.owner).name:'',PickID:x.id||x.pick_id||''}));
+    const poolByPlayer=new Map((D.playerPool||[]).map(p=>[canonicalPlayerName(p.player),p])),masterNames=new Set(),playerMaster=[];for(const src of legacy.playerStatusSource||[]){const p=poolByPlayer.get(canonicalPlayerName(src.player))||{};masterNames.add(canonicalPlayerName(src.player));playerMaster.push({Player:src.player||p.player||'',AFLClub:src.club||p.club||'',CurrentPrice:src.currentPrice??p.price??'',OpeningPrice:src.startPrice??p.startPrice??'',Position:src.position||p.position||'',PlayerStatus:src.playerStatus||p.playerStatus||'',Average:p.average??'',Last3:p.last3??'',Last5:p.last5??'',Rostered:Boolean(p.rostered)});}for(const p of D.playerPool||[]){if(masterNames.has(canonicalPlayerName(p.player)))continue;playerMaster.push({Player:p.player,AFLClub:p.club,CurrentPrice:p.price??'',OpeningPrice:p.startPrice??'',Position:p.position,PlayerStatus:p.playerStatus||'',Average:p.average??'',Last3:p.last3??'',Last5:p.last5??'',Rostered:Boolean(p.rostered)});}
+    const seasonSettings=[{Season:Number(state.season_setup?.season||current),Active:Boolean(state.season_setup?.active),Status:state.season_setup?.status||'',CurrentRound:Number(state.season_setup?.currentRound||current),CompletedThroughRound:Number(state.season_setup?.completedThroughRound||0),RegularRounds:Number(state.season_setup?.pegsRegularRounds||20),LiveScoringEnabled:state.season_setup?.liveScoringEnabled!==false,FixtureSource:state.season_setup?.fixtureSource||'',FixtureRetrievedAt:state.season_setup?.fixtureRetrievedAt||'',UpdatedAt:state.season_setup?.updatedAt||'',FullSetupJSON:archiveJson(state.season_setup||{})}];
+    const proposals=(snapshot?.proposals||[]).map(p=>({ID:p.id||'',CreatedAt:p.created_at||p.createdAt||'',Type:p.type||'',Phase:p.phase||'',Proposer:p.proposer_team||p.proposerTeam||'',Counterparty:p.counterparty_team||p.counterpartyTeam||'',Status:p.status||'',DecidedAt:p.decided_at||p.decidedAt||'',PayloadJSON:archiveJson(p.payload||{}),RawJSON:archiveJson(p)}));
+    const draftPools=[],draftPoolPlayers=[];for(const pool of snapshot?.draftPools||[]){draftPools.push({SessionID:pool.session_id||pool.sessionId||'',Season:Number(pool.season||0),Phase:pool.phase||'',CapturedAt:pool.captured_at||pool.capturedAt||'',Source:pool.source||'',Complete:Boolean(pool.complete),ClubCount:Number(pool.club_count||pool.clubCount||0),PlayerCount:Number(pool.player_count||pool.playerCount||((pool.players||[]).length))});for(const p of pool.players||[])draftPoolPlayers.push({SessionID:pool.session_id||pool.sessionId||'',Season:Number(pool.season||0),Phase:pool.phase||'',Player:p.player||p.name||'',AFLClub:p.club||'',Position:p.position||'',Price:Number(p.price||p.salary||0),RawJSON:archiveJson(p)});}
+    const auditLog=(snapshot?.auditLog||[]).map(a=>({ID:a.id||'',CreatedAt:a.created_at||a.createdAt||'',ActorRole:a.actor_role||a.actorRole||'',ActorTeam:a.actor_team||a.actorTeam||'',Action:a.action||'',EntityType:a.entity_type||a.entityType||'',EntityID:a.entity_id||a.entityId||'',DetailJSON:archiveJson(a.detail||{})}));
+    const systemState=Object.entries(state||{}).map(([key,value])=>({StateKey:key,JSON:archiveJson(value)}));
+    const snapshotText=archiveJson(snapshot),recoverySnapshot=[];for(let i=0,part=1;i<snapshotText.length;i+=30000,part++)recoverySnapshot.push({Part:part,JSON:snapshotText.slice(i,i+30000)});
+    return {guide,summary,rules,teams,teamLists,rosterHistory,fixtures,roundSchedule,roundResults,legacyRoundTotals,playerScores,pegsScoreSource,aflScoreHistory,ladder,finals,gfHistorySummary,gfPlayerHistory,honours,legacyRulebook,teamIdentityHistory,delistingHistory,tradeHistoryAll,legacyDraftHistory,weeklyPlayerHistory,workbookMap,transactions,legacyTransactionSource,draftHistory,draftSourceLog,draftOrderHistory,draftTiming,pickOwnership,playerMaster,seasonSettings,proposals,draftPools,draftPoolPlayers,auditLog,systemState,recoverySnapshot};
+  }
+  async function writeArchiveWorkbook(snapshot,filename){
+    await ensureLegacyArchiveLoaded();
+    const X=await ensureSheetJs(),rows=backupSheetRows(snapshot),wb=X.utils.book_new();
+    const add=(name,data,widths=[])=>{const ws=X.utils.json_to_sheet(data?.length?data:[{Info:'No records'}]);if(widths.length)ws['!cols']=widths.map(w=>({wch:w}));X.utils.book_append_sheet(wb,ws,name);};
+    add('Archive Guide',rows.guide,[26,88]);add('League Summary',rows.summary,[24,22,22,16,16,20,34,18,28,28]);add('Rules',rows.rules,[24,30,88]);add('Teams',rows.teams);add('Team Lists',rows.teamLists);add('Roster History',rows.rosterHistory);add('Fixtures',rows.fixtures);add('Round Schedule',rows.roundSchedule);add('Round Results',rows.roundResults);add('Legacy Round Totals',rows.legacyRoundTotals);add('Player Scores',rows.playerScores);add('PEGS Score Source',rows.pegsScoreSource);add('AFL Score History',rows.aflScoreHistory);add('Ladder',rows.ladder);add('Finals',rows.finals);add('GF History Summary',rows.gfHistorySummary);add('GF Player History',rows.gfPlayerHistory);add('Honours',rows.honours);add('Legacy Rulebook',rows.legacyRulebook,[34,14,100,12]);add('Team Identity History',rows.teamIdentityHistory,[16,34,20,55,40,12]);add('Delisting History',rows.delistingHistory);add('Trade History',rows.tradeHistoryAll);add('Legacy Draft History',rows.legacyDraftHistory);add('Weekly Player History',rows.weeklyPlayerHistory);add('Workbook Map',rows.workbookMap,[34,12,12,28,48]);add('Transactions',rows.transactions);add('Legacy Transaction Source',rows.legacyTransactionSource);add('Draft History',rows.draftHistory);add('Draft Source Log',rows.draftSourceLog);add('Draft Order History',rows.draftOrderHistory);add('Draft Timing',rows.draftTiming);add('Draft Pick Ownership',rows.pickOwnership);add('Player Master',rows.playerMaster);add('Season Settings',rows.seasonSettings);add('Proposals',rows.proposals);add('Draft Pools',rows.draftPools);add('Draft Pool Players',rows.draftPoolPlayers);add('Audit Log',rows.auditLog);add('System State',rows.systemState,[26,120]);add('Recovery Snapshot',rows.recoverySnapshot,[10,120]);
+    X.writeFile(wb,filename);
+  }
+  async function exportBackupExcel(id){const rec=await getBackupSnapshot(id);await writeArchiveWorkbook(rec.snapshot,`PEGS-League-Archive-${rec.season||currentSeason()}-R${rec.round||0}-${id}.xlsx`);}
+  async function exportCurrentLeagueExcel(){
+    if(backendConfigured()&&commissionerLoggedIn()){
+      const id=await createServerBackup('MANUAL_EXPORT','Excel league archive exported'),rec=await getBackupSnapshot(id);await writeArchiveWorkbook(rec.snapshot,`PEGS-League-Archive-${rec.season||currentSeason()}-${new Date().toISOString().slice(0,10)}.xlsx`);return id;
+    }
+    await writeArchiveWorkbook(currentLocalRecoverySnapshot(),`PEGS-League-Archive-${currentSeason()}-${new Date().toISOString().slice(0,10)}.xlsx`);return null;
+  }
+  async function restoreServerBackup(id){if(!commissionerLoggedIn())throw new Error('Commissioner login required.');const rec=backupCache.find(x=>String(x.id)===String(id));const when=rec?.created_at?fmtDate(rec.created_at):`#${id}`;const typed=prompt(`Restore PEGS to ${when}? A safeguard of the current state will be created first. Type RESTORE to continue.`);if(typed!=='RESTORE')return false;cancelPendingAutoBackup();await commissionerFetch('/rest/v1/rpc/pegs_restore_backup',{method:'POST',body:JSON.stringify({p_backup_id:Number(id)})});[OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,TRANSACTION_REVERSALS_KEY,DRAFT_STATE_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,FIGUREHEAD_OVERRIDE_KEY,DRAFT_POOL_KEY].forEach(k=>localStorage.removeItem(k));draftPoolCache=null;proposalCache=[];await pullSharedState();await syncProposals();await loadDraftPool();await syncBackups();await syncServerAuthority();return true;}
   async function syncAudit(){if(!commissionerLoggedIn())return [];try{auditCache=await commissionerFetch('/rest/v1/pegs_audit_log?select=*&order=created_at.desc&limit=100')||[];}catch(e){auditCache=[];}return auditCache;}
 
   function validPegsPosition(value){return Object.prototype.hasOwnProperty.call(D.rules.positionMax,String(value||'').trim().toUpperCase());}
@@ -1067,9 +1399,10 @@
 
   function scoreCountForRoundRecord(rec){
     const playing=Number(rec?.aflTeamsPlaying||D.meta.topPlayersDefault||18);
+    // Opening Round banking only existed for the 2026 competition. From 2027,
+    // the score count is exactly the number of AFL clubs playing that round.
+    if(!openingRoundBankingAllowed(currentSeason()))return Math.min(18,Math.max(0,playing));
     const banked=[...new Set((rec?.bankClubs||[]).map(normalizeAflCode).filter(Boolean))].length;
-    // An OR banked club contributes one available score slot in addition to
-    // the clubs physically playing that round. There are only 18 AFL clubs.
     return Math.min(18,Math.max(0,playing)+banked);
   }
   function topPlayersForRound(round) {
@@ -1153,8 +1486,8 @@
     if(futureScoringRound(round))return {status:'TBC',gameStatus:'PRE',source:'Future round - scoring locked',projection:Number(p.projected||baselineProjection(p.player,0)),actual:null};
     if(p.scoreSource==='Workbook result · roster adjusted')return {status:'FT',gameStatus:'FT',source:p.scoreSource,projection:Number(p.projected||p.score||0),actual:Number(p.score||0)};
     if(!activeSeasonSetup() && !teamLoggedIn() && currentSeason()===Number(D.meta.season) && D.roundScores[String(round)]?.[teamKey]) return {status:'FT',gameStatus:'FT',source:p.scoreSource||'Workbook result',projection:Number(p.projected||p.score||0),actual:Number(p.score||0)};
-    if(p.scoreSource==='Opening Round banked')return {status:'BANKED',gameStatus:'FT',source:'OR bank',projection:Number(p.score||0),actual:Number(p.score||0)};
-    const roundRec=effectiveRoundRecord(round),clubCode=normalizeAflCode(p.club),bankApplies=(roundRec.bankClubs||[]).includes(clubCode),onBye=(roundRec.byeClubs||[]).includes(clubCode);
+    if(openingRoundBankingAllowed(currentSeason())&&p.scoreSource==='Opening Round banked')return {status:'BANKED',gameStatus:'FT',source:'OR bank',projection:Number(p.score||0),actual:Number(p.score||0)};
+    const roundRec=effectiveRoundRecord(round),clubCode=normalizeAflCode(p.club),bankApplies=openingRoundBankingAllowed(currentSeason())&&(roundRec.bankClubs||[]).includes(clubCode),onBye=(roundRec.byeClubs||[]).includes(clubCode);
     if(bankApplies){const bank=getOpeningBank()?.[String(currentSeason())]?.players?.[canonicalPlayerName(p.player)];if(bank&&bank.actual!==null&&bank.actual!==undefined)return {status:'BANKED',gameStatus:'FT',source:'Opening Round bank',projection:Number(bank.actual||0),actual:Number(bank.actual||0)};return {status:'BYE',gameStatus:'PRE',source:'AFL bye - no Opening Round score',projection:0,actual:null};}
     if(onBye)return {status:'BYE',gameStatus:'PRE',source:'AFL bye',projection:0,actual:null};
     const feed=getLiveFeed(),liveRound=Number(feed.season)===currentSeason()&&Number(feed.round)===Number(round),feedComplete=liveFeedCompleteForRound(round),rec=liveRound?feed.players?.[canonicalPlayerName(p.player)]:null;
@@ -1412,8 +1745,9 @@
     if (!selected) selected = roundFixtures.find(f => f.away) || roundFixtures[0];
     const displayFixtures=teamLoggedIn()?roundFixtures.slice().sort((a,b)=>Number(!(a.home===loggedTeamKey()||a.away===loggedTeamKey()))-Number(!(b.home===loggedTeamKey()||b.away===loggedTeamKey()))):roundFixtures;
     const opts = [...new Set(fixtures.map(f=>Number(f.round)))].sort((a,b)=>a-b).map(r=>`<option value="${r}" ${r===round?'selected':''}>${roundLabel(r)}</option>`).join('');
-    main.innerHTML = `${pageHeader('Match centre','Head-to-head matchups','Opening Round banks scores only. PEGS head-to-head fixtures begin in Round 1, with the counted-player total matching the number of AFL clubs playing.',`<div class="filters"><label class="screen-reader-only" for="round-select">Round</label><select class="select" id="round-select">${opts}</select></div>`)}
-      ${(()=>{const setup=activeSeasonSetup(),op=setup?.openingRound||D.openingRound;if(op?.enabled===false)return '<section class="card opening-bank-card no-opening"><div><span class="eyebrow kicker">Season format</span><h2>No Opening Round this season</h2><p>PEGS scoring begins with Round 1. Bye-round player counts are calculated directly from the AFL fixture.</p></div></section>';const setupBankRounds=(setup?.rounds||[]).filter(r=>(r.bankClubs||[]).length).map(r=>Number(r.round)).filter(Number.isFinite),fallbackBankRounds=Object.entries(D.openingRound?.byeBanks||{}).filter(([,clubs])=>Array.isArray(clubs)&&clubs.length).map(([r])=>Number(r)).filter(Number.isFinite),bankRounds=setupBankRounds.length?setupBankRounds:fallbackBankRounds,lastBankRound=bankRounds.length?Math.max(...bankRounds):0,completed=Number(setup?.completedThroughRound||0),current=Number(setup?.currentRound||effectiveCurrentRound()||1);if(!lastBankRound||completed>=lastBankRound||current>lastBankRound)return '';const banks=bankRounds.sort((a,b)=>a-b).map(r=>'R'+r).join(' / ');return `<section class="card opening-bank-card"><div><span class="eyebrow kicker">${esc(op?.label||'Opening Round')}</span><h2>Score bank only - no head-to-head matchup</h2><p>Opening Round scores are banked only for clubs that later have a bye in configured early rounds.</p></div><div class="opening-bank-flow"><span>Opening Round</span><b>→</b><span>${banks}</span></div></section>`;})()}
+    const matchupRuleCopy=openingRoundBankingAllowed(currentSeason())?'Opening Round banking is retained only for the historical 2026 season. PEGS head-to-head fixtures begin in Round 1.':'Each round counts exactly the same number of PEGS player scores as AFL clubs playing that round. There is no Opening Round bank.';
+    main.innerHTML = `${pageHeader('Match centre','Head-to-head matchups',matchupRuleCopy,`<div class="filters"><label class="screen-reader-only" for="round-select">Round</label><select class="select" id="round-select">${opts}</select></div>`)}
+      ${(()=>{const setup=activeSeasonSetup(),op=setup?.openingRound||D.openingRound;if(op?.enabled===false)return `<section class="card opening-bank-card no-opening"><div><span class="eyebrow kicker">Season format</span><h2>${openingRoundBankingAllowed(currentSeason())?'No Opening Round this season':'Opening Round banking retired'}</h2><p>PEGS scoring begins with Round 1. In bye rounds, the number of scores counted equals the number of AFL clubs playing.</p></div></section>`;const setupBankRounds=(setup?.rounds||[]).filter(r=>(r.bankClubs||[]).length).map(r=>Number(r.round)).filter(Number.isFinite),fallbackBankRounds=Object.entries(D.openingRound?.byeBanks||{}).filter(([,clubs])=>Array.isArray(clubs)&&clubs.length).map(([r])=>Number(r)).filter(Number.isFinite),bankRounds=setupBankRounds.length?setupBankRounds:fallbackBankRounds,lastBankRound=bankRounds.length?Math.max(...bankRounds):0,completed=Number(setup?.completedThroughRound||0),current=Number(setup?.currentRound||effectiveCurrentRound()||1);if(!lastBankRound||completed>=lastBankRound||current>lastBankRound)return '';const banks=bankRounds.sort((a,b)=>a-b).map(r=>'R'+r).join(' / ');return `<section class="card opening-bank-card"><div><span class="eyebrow kicker">${esc(op?.label||'Opening Round')}</span><h2>Score bank only - no head-to-head matchup</h2><p>Opening Round scores are banked only for clubs that later have a bye in configured early rounds.</p></div><div class="opening-bank-flow"><span>Opening Round</span><b>→</b><span>${banks}</span></div></section>`;})()}
       <div class="fixture-grid">${displayFixtures.map(f=>fixtureCard(round,f,selected===f)).join('')}</div>
       ${selected ? renderMatchupDetail(round,selected.home,selected.away) : '<div class="card empty">No fixtures in this round.</div>'}`;
     if(selected?.away)bindMatchupScoreEditor(round,selected.home,selected.away);
@@ -1460,7 +1794,8 @@
     }).join('');
     const scores=D.teams.map(t=>[t.key,calcTeamRound(round,t.key).actual]).sort((a,b)=>b[1]-a[1]);
     const controls=`<div class="filters"><label class="screen-reader-only" for="results-round-select">Round</label><select class="select" id="results-round-select">${options}</select></div>`;
-    main.innerHTML = `${pageHeader('Scoreboard','Results','Opening Round has no PEGS result. From Round 1 onward, each score uses the number of AFL clubs playing that round, including banked Opening Round scores in Rounds 2-4.',controls)}
+    const resultsRuleCopy=openingRoundBankingAllowed(currentSeason())?'2026 retains its historical Opening Round banking. From Round 1 onward, the counted-player total follows the season fixture.':'Each round counts exactly the same number of PEGS player scores as AFL clubs playing that round. Opening Round banking is not used.';
+    main.innerHTML = `${pageHeader('Scoreboard','Results',resultsRuleCopy,controls)}
       <div class="notice round-rule-note"><strong>Round ${round}: top ${topPlayersForRound(round)} count.</strong> ${esc(roundContext(round))}</div>
       <div class="fixture-grid">${completed || '<div class="card empty">No completed fixtures.</div>'}</div>
       <section class="card ladder-card" style="margin-top:16px"><div class="table-wrap" style="border:0"><table class="data-table"><caption>Round ${round} scoring leaderboard</caption><thead><tr><th>#</th><th>Team</th><th>Score</th><th>Players counted</th></tr></thead><tbody>${scores.map(([k,v],i)=>`<tr><td class="ladder-pos">${i+1}</td><td>${teamIdentity(k,'sm')}</td><td><strong>${Number(v).toLocaleString('en-AU')}</strong></td><td>Top ${topPlayersForRound(round)}</td></tr>`).join('')}</tbody></table></div></section>`;
@@ -1916,7 +2251,7 @@
     main.innerHTML=`${pageHeader('League moves','Moves & Trades','Team accounts control submissions. A trade must be legal for both teams, accepted by the other coach, then approved by the Commissioner.')}
       <section class="move-window-strip"><div><span>Trading</span>${tradeStatus}</div><div><span>Draft</span><span class="badge ${getDraftState().active?'green':'red'}">${getDraftState().active?'OPEN · '+esc(getDraftState().type||'Draft'):'CLOSED'}</span></div><div><span>Rookie elevation</span>${elevationStatus}</div><div><span>Delisting</span>${delistStatus}</div></section>${teamTools}
       <section style="margin-top:24px">${pageHeader('Audit trail',logged&&transactionScope==='mine'?'My Confirmed Transactions':'Confirmed Transactions',logged&&transactionScope==='mine'?`Confirmed league moves involving ${team(myTeam).name}. Switch to All League to inspect the full audit trail.`:'Only fully approved moves appear in the official transaction history.')}${logged?`<div class="transaction-scope-toolbar"><button class="tab-button ${transactionScope==='mine'?'active':''}" data-action="tx-scope" data-scope="mine">My Moves</button><button class="tab-button ${transactionScope==='all'?'active':''}" data-action="tx-scope" data-scope="all">All League</button></div>`:''}<div class="transaction-toolbar">${types.map(t=>`<button class="tab-button ${selected===t?'active':''}" data-action="tx-filter" data-type="${esc(t)}">${esc(t)}</button>`).join('')}</div><div class="card card-pad transaction-table"><div class="transaction-list">${rows.length?rows.map(x=>transactionItem(x,true)).join(''):`<div class="empty">No ${transactionScope==='mine'?'franchise ':''}transactions match this filter.</div>`}</div></div></section>`;
-    document.getElementById('moves-open-team-login')?.addEventListener('click',()=>{void teamLoginUI();teamDialog.showModal();});document.getElementById('moves-team-logout')?.addEventListener('click',()=>{teamCredentialCache=[];clearBackendSession();proposalCache=[];void syncProposals().then(()=>renderTransactions());toast('Team logged out.');});
+    document.getElementById('moves-open-team-login')?.addEventListener('click',()=>{void teamLoginUI();teamDialog.showModal();});document.getElementById('moves-team-logout')?.addEventListener('click',()=>{teamCredentialCache=[];clearBackendSession();proposalCache=[];toast('Team logged out.');enforceAccessAfterLogout('Team logged out. Log in to re-enter PEGS.');});
     document.querySelectorAll('[data-trade-accept]').forEach(btn=>btn.addEventListener('click',async()=>{try{await respondTrade(btn.dataset.tradeAccept,true);toast('Trade accepted and sent to the Commissioner.');renderTransactions();}catch(e){toast(e.message||'Trade could not be accepted.');}}));
     document.querySelectorAll('[data-trade-decline]').forEach(btn=>btn.addEventListener('click',async()=>{try{await respondTrade(btn.dataset.tradeDecline,false);toast('Trade declined.');renderTransactions();}catch(e){toast(e.message||'Trade could not be declined.');}}));
     document.querySelectorAll('[data-reverse-transaction]').forEach(btn=>btn.addEventListener('click',()=>{reversingTransactionKey=decodeURIComponent(btn.dataset.reverseTransaction||'');renderTransactions();}));
@@ -1981,7 +2316,7 @@
   async function commissionerUI() {
     if (backendConfigured() && !commissionerLoggedIn()) {
       commissionerContent.innerHTML=`<div class="commissioner-body commissioner-login"><div class="commissioner-lock">C</div><span class="eyebrow">Private administration</span><h3>Commissioner login</h3><p>Commissioner Mode is an additional permission layer. Any active Team Login remains signed in while Commissioner controls are enabled.</p><div class="form-grid" style="margin-top:16px"><div class="field-group"><label for="comm-backend-email">Commissioner email</label><input class="search-input" id="comm-backend-email" type="email" autocomplete="username" value="${esc(CONFIG.commissionerEmail||'')}" placeholder="commissioner@example.com"></div><div class="field-group"><label for="comm-backend-password">Password</label><input class="search-input" id="comm-backend-password" type="password" autocomplete="current-password"></div></div><div class="button-row"><button class="primary-button" id="commissioner-backend-login">Login</button></div><div class="notice" style="margin-top:16px"><strong>Concurrent access:</strong> you can be signed into a franchise and have Commissioner Mode enabled at the same time. Disabling one does not log out the other.</div></div>`;
-      const login=async()=>{try{await commissionerBackendLogin(document.getElementById('comm-backend-email').value,document.getElementById('comm-backend-password').value);dismissDialog(commissionerDialog);updateSessionUI();toast('Commissioner Mode enabled.');render();try{await Promise.all([pullSharedState(),syncProposals(),loadDraftPool()]);await syncServerAuthority();backgroundRefreshUi();}catch(syncError){console.warn('Commissioner post-login sync incomplete',syncError);toast('Commissioner Mode enabled. Some admin data will retry syncing automatically.');}}catch(e){toast(e.message||'Login failed.');}};
+      const login=async()=>{try{const entering=document.body.classList.contains('pegs-access-locked');await commissionerBackendLogin(document.getElementById('comm-backend-email').value,document.getElementById('comm-backend-password').value);dismissDialog(commissionerDialog);updateSessionUI();toast('Commissioner Mode enabled.');void beginPostLoginSync().then(()=>syncServerAuthority()).catch(()=>{});if(entering)await completeSiteEntry({commissioner:true});else render();}catch(e){toast(e.message||'Login failed.');}};
       document.getElementById('commissioner-backend-login').addEventListener('click',login);
       document.getElementById('comm-backend-password').addEventListener('keydown',e=>{if(e.key==='Enter') login();});
       return;
@@ -1990,13 +2325,13 @@
 
     const savedHash=localStorage.getItem(COMM_PIN_KEY);
     if(!savedHash){
-      commissionerContent.innerHTML=`<div class="commissioner-body commissioner-login"><div class="commissioner-lock">C</div><span class="eyebrow">Commissioner only</span><h3>Create Commissioner PIN</h3><p>No team logins are required. Create one Commissioner PIN for this local preview.</p><div class="notice"><strong>Preview mode:</strong> this PIN and changes stay in this browser. The included free hosted setup provides the same single Commissioner login across devices.</div><div class="form-grid" style="margin-top:16px"><div class="field-group"><label for="comm-new-pin">New PIN</label><input class="search-input" id="comm-new-pin" type="password" minlength="4" autocomplete="new-password" placeholder="At least 4 characters"></div><div class="field-group"><label for="comm-new-pin2">Confirm PIN</label><input class="search-input" id="comm-new-pin2" type="password" minlength="4" autocomplete="new-password"></div></div><div class="button-row"><button class="primary-button" id="create-commissioner-pin">Create Commissioner login</button></div></div>`;
-      document.getElementById('create-commissioner-pin').addEventListener('click',async()=>{const a=document.getElementById('comm-new-pin').value,b=document.getElementById('comm-new-pin2').value;if(a.length<4){toast('Use at least 4 characters.');return;}if(a!==b){toast('PINs do not match.');return;}localStorage.setItem(COMM_PIN_KEY,await hashPin(a));sessionStorage.setItem(COMM_SESSION_KEY,'1');dismissDialog(commissionerDialog);updateSessionUI();toast('Commissioner Mode enabled.');render();});
+      commissionerContent.innerHTML=`<div class="commissioner-body commissioner-login"><div class="commissioner-lock">C</div><span class="eyebrow">Commissioner only</span><h3>Create Commissioner PIN</h3><p>Local preview Commissioner access can enter without a Team Login. Create one Commissioner PIN for this browser.</p><div class="notice"><strong>Preview mode:</strong> this PIN and changes stay in this browser. The included free hosted setup provides the same single Commissioner login across devices.</div><div class="form-grid" style="margin-top:16px"><div class="field-group"><label for="comm-new-pin">New PIN</label><input class="search-input" id="comm-new-pin" type="password" minlength="4" autocomplete="new-password" placeholder="At least 4 characters"></div><div class="field-group"><label for="comm-new-pin2">Confirm PIN</label><input class="search-input" id="comm-new-pin2" type="password" minlength="4" autocomplete="new-password"></div></div><div class="button-row"><button class="primary-button" id="create-commissioner-pin">Create Commissioner login</button></div></div>`;
+      document.getElementById('create-commissioner-pin').addEventListener('click',async()=>{const a=document.getElementById('comm-new-pin').value,b=document.getElementById('comm-new-pin2').value;if(a.length<4){toast('Use at least 4 characters.');return;}if(a!==b){toast('PINs do not match.');return;}const entering=document.body.classList.contains('pegs-access-locked');localStorage.setItem(COMM_PIN_KEY,await hashPin(a));sessionStorage.setItem(COMM_SESSION_KEY,'1');dismissDialog(commissionerDialog);updateSessionUI();toast('Commissioner Mode enabled.');if(entering)await completeSiteEntry({commissioner:true});else render();});
       return;
     }
     if(!commissionerLoggedIn()){
-      commissionerContent.innerHTML=`<div class="commissioner-body commissioner-login"><div class="commissioner-lock">C</div><span class="eyebrow">Private administration</span><h3>Commissioner login</h3><p>Teams and league pages are public. Only Commissioner functions require authentication.</p><div class="field-group" style="margin-top:16px"><label for="comm-login-pin">Commissioner PIN</label><input class="search-input" id="comm-login-pin" type="password" autocomplete="current-password" placeholder="Enter PIN"></div><div class="button-row"><button class="primary-button" id="commissioner-login-button">Login</button></div></div>`;
-      const login=async()=>{const hash=await hashPin(document.getElementById('comm-login-pin').value);if(hash!==savedHash){toast('Incorrect Commissioner PIN.');return;}sessionStorage.setItem(COMM_SESSION_KEY,'1');dismissDialog(commissionerDialog);updateSessionUI();toast('Commissioner Mode enabled.');render();};
+      commissionerContent.innerHTML=`<div class="commissioner-body commissioner-login"><div class="commissioner-lock">C</div><span class="eyebrow">Private administration</span><h3>Commissioner login</h3><p>PEGS is login-gated. Use the Commissioner PIN to enter the site with administration access.</p><div class="field-group" style="margin-top:16px"><label for="comm-login-pin">Commissioner PIN</label><input class="search-input" id="comm-login-pin" type="password" autocomplete="current-password" placeholder="Enter PIN"></div><div class="button-row"><button class="primary-button" id="commissioner-login-button">Login</button></div></div>`;
+      const login=async()=>{const hash=await hashPin(document.getElementById('comm-login-pin').value);if(hash!==savedHash){toast('Incorrect Commissioner PIN.');return;}const entering=document.body.classList.contains('pegs-access-locked');sessionStorage.setItem(COMM_SESSION_KEY,'1');dismissDialog(commissionerDialog);updateSessionUI();toast('Commissioner Mode enabled.');if(entering)await completeSiteEntry({commissioner:true});else render();};
       document.getElementById('commissioner-login-button').addEventListener('click',login);
       document.getElementById('comm-login-pin').addEventListener('keydown',e=>{if(e.key==='Enter') login();});
       return;
@@ -2005,8 +2340,8 @@
   }
 
   function commissionerTabs(){
-    const tabs=[['scores','Scores & live'],['season','Season setup'],['finals','Finals'],['windows','League windows'],['approvals','Approvals'],['draft','Draft control'],['accounts','Team accounts'],['figureheads','Figureheads'],['backups','Backups'],['data','Legacy data']];
-    return `<div class="admin-tabs">${tabs.map(([id,label])=>`<button class="tab-button ${commissionerTab===id?'active':''}" data-admin-tab="${id}">${label}</button>`).join('')}<button class="tab-button admin-logout" id="commissioner-logout">Disable Commissioner</button></div>`;
+    const tabs=[['scores','Round control'],['season','Season setup'],['finals','Finals'],['windows','League windows'],['approvals','Approvals'],['draft','Draft control'],['accounts','Team accounts'],['figureheads','Figureheads'],['backups','Data & recovery']];
+    return `<div class="admin-tabs">${tabs.map(([id,label])=>`<button class="tab-button ${commissionerTab===id?'active':''}" data-admin-tab="${id}">${label}</button>`).join('')}</div>`;
   }
 
   function teamOptions(selected=''){return D.teams.map(t=>`<option value="${t.key}" ${t.key===selected?'selected':''}>${esc(t.name)} (${esc(t.owner)})</option>`).join('');}
@@ -2174,11 +2509,11 @@
     }else if(p.type==='DRAFT_PICK'){
       const x=p.payload||{},pl={player:x.player,club:x.club||'',position:x.position||'',price:Number(x.salary||0),startPrice:Number(x.salary||0)},checks=validateDraft(p.proposerTeam,pl,x.contract||'Main',x.listStatus||'Field',x.position||'');if(!checks.length||!checks.every(c=>c.pass)){toast('Draft pick approval blocked by current roster rules.');return;}action={type:'Drafted',status:'CONFIRMED',phase:p.phase||'Draft',draftSeason:Number(x.draftSeason||getDraftState().season||D.meta.season),sessionId:x.sessionId||'',pick:Number(x.pick||0),team:p.proposerTeam,player:x.player,position:x.position||'',club:x.club||'',contract:x.contract||'Main',listStatus:x.listStatus||'Field',salary:Number(x.salary||0),timestamp:new Date().toISOString(),detail:`${p.phase||'Draft'} pick ${Number(x.pick||0)}: ${x.player} (${x.position||''}) · ${money(x.salary||0)}`};
     }
-    if(!action)return;if(serverActionApplied){await pullSharedState();}else{const all=getCommissionerActions();all.unshift(action);saveCommissionerActions(all);if(!serverDecided)await decideProposal(id,'APPROVED');}await syncServerAuthority();await logCommissioner('PROPOSAL_APPROVED','proposal',id,{type:p.type,team:p.proposerTeam,counterparty:p.counterpartyTeam||null});await syncProposals();toast('Proposal approved and applied.');render();renderCommissionerControls();
+    if(!action)return;if(serverActionApplied){await pullSharedState();}else{const all=getCommissionerActions();all.unshift(action);saveCommissionerActions(all);if(!serverDecided)await decideProposal(id,'APPROVED');}await syncServerAuthority();await logCommissioner('PROPOSAL_APPROVED','proposal',id,{type:p.type,team:p.proposerTeam,counterparty:p.counterpartyTeam||null});await syncProposals();queueAutoBackup('proposal_status');toast('Proposal approved and applied.');render();renderCommissionerControls();
   }
 
   async function rejectProposal(id){
-    const p=proposalCache.find(x=>String(x.id)===String(id));if(!p||p.status!=='AWAITING_COMMISSIONER'){toast('Proposal is not awaiting Commissioner approval.');return;}await decideProposal(id,'REJECTED');await logCommissioner('PROPOSAL_REJECTED','proposal',id,{type:p.type,team:p.proposerTeam});await syncProposals();toast('Proposal rejected.');render();renderCommissionerControls();
+    const p=proposalCache.find(x=>String(x.id)===String(id));if(!p||p.status!=='AWAITING_COMMISSIONER'){toast('Proposal is not awaiting Commissioner approval.');return;}await decideProposal(id,'REJECTED');await logCommissioner('PROPOSAL_REJECTED','proposal',id,{type:p.type,team:p.proposerTeam});await syncProposals();queueAutoBackup('proposal_status');toast('Proposal rejected.');render();renderCommissionerControls();
   }
 
   function liveFeedSummary(){
@@ -2191,7 +2526,8 @@
     if(!backendConfigured()){toast('Configure the free Supabase backend first; automatic SuperCoach sync uses its Edge Function.');return;}
     try{
       const fn=CONFIG.liveScoreFunction||'supercoach-sync',round=roundOverride===null?effectiveCurrentRound():Number(roundOverride),base=CONFIG.supabaseUrl.replace(/\/$/,'')+`/functions/v1/${fn}`;
-      const parsed=parseAflFixtureCsv(activeSeasonSetup()?.aflFixtureCsv||''),token=Number(round)===0?'OR':Number(round),roundGames=(parsed.games||[]).filter(g=>g.round===token);
+      if(Number(round)===0&&!openingRoundBankingAllowed(currentSeason()))throw new Error('Opening Round banking was retired after the 2026 season.');
+      const parsed=applySeasonFixtureRules(parseAflFixtureCsv(activeSeasonSetup()?.aflFixtureCsv||''),currentSeason()),token=Number(round)===0?'OR':Number(round),roundGames=(parsed.games||[]).filter(g=>g.round===token);
       if(!roundGames.length)throw new Error(`No AFL fixture games are configured for ${Number(round)===0?'Opening Round':'Round '+round}.`);
       const headers={apikey:CONFIG.supabaseAnonKey,Authorization:'Bearer '+(backendToken()||commissionerBackendToken()||CONFIG.supabaseAnonKey)};
       const fetchSlice=async params=>{const qs=new URLSearchParams(params);const res=await fetch(`${base}?${qs.toString()}`,{headers});if(!res.ok)throw new Error(await res.text());return await res.json();};
@@ -2235,7 +2571,7 @@
     }catch(e){console.warn(e);toast('Live score sync failed. Commissioner overrides remain available.');}
   }
   function captureOpeningRoundBank(){
-    const setup=activeSeasonSetup(),feed=getLiveFeed(); if(!setup?.openingRound?.enabled){toast('This season has no Opening Round.');return;} if(Number(feed.season)!==currentSeason()||Number(feed.round)!==0){toast('Sync Opening Round data first.');return;}
+    const setup=activeSeasonSetup(),feed=getLiveFeed(); if(!openingRoundBankingAllowed(currentSeason())){toast('Opening Round banking was retired after 2026.');return;} if(!setup?.openingRound?.enabled){toast('This season has no Opening Round.');return;} if(Number(feed.season)!==currentSeason()||Number(feed.round)!==0){toast('Sync Opening Round data first.');return;}
     const players={}; for(const [key,p] of Object.entries(feed.players||{})){if(p.actual!==null&&p.actual!==undefined&&String(p.gameStatus||'').toUpperCase()==='FT')players[key]={player:p.player,club:p.club,actual:Number(p.actual),source:p.source||feed.source};}
     const all=getOpeningBank(); all[String(currentSeason())]={season:currentSeason(),capturedAt:new Date().toISOString(),players}; saveOpeningBank(all); toast(`${Object.keys(players).length} Opening Round scores banked.`); render(); renderCommissionerControls();
   }
@@ -2254,9 +2590,12 @@
 
   function seasonRoundPreview(setup){
     const rounds=setup.rounds||[]; if(!rounds.length)return '<div class="notice"><strong>No AFL fixture loaded yet.</strong> Retrieve it by season, or paste/upload a fixture manually as a fallback.</div>';
-    const byeRounds=rounds.filter(r=>(r.byeClubs||[]).length),rows=rounds.slice(0,Math.max(1,Math.min(30,rounds.length))).map(r=>`<tr><td>${r.round}</td><td><strong>${scoreCountForRoundRecord(r)}</strong></td><td>${(r.byeClubs||[]).join(', ')||'—'}</td><td>${(r.bankClubs||[]).join(', ')||'—'}</td></tr>`).join('');
+    const legacyOR=openingRoundBankingAllowed(setup?.season),byeRounds=rounds.filter(r=>(r.byeClubs||[]).length),scoreCount=r=>legacyOR?Math.min(18,Number(r.aflTeamsPlaying||18)+[...new Set((r.bankClubs||[]).map(normalizeAflCode).filter(Boolean))].length):Math.min(18,Math.max(0,Number(r.aflTeamsPlaying||18)));
+    const rows=rounds.slice(0,Math.max(1,Math.min(30,rounds.length))).map(r=>`<tr><td>${r.round}</td><td><strong>${scoreCount(r)}</strong></td><td>${(r.byeClubs||[]).join(', ')||'—'}</td>${legacyOR?`<td>${(r.bankClubs||[]).join(', ')||'—'}</td>`:''}</tr>`).join('');
     const source=setup.fixtureSource?`<div class="fixture-source">Fixture source: <strong>${esc(setup.fixtureSource)}</strong>${setup.fixtureRetrievedAt?` · retrieved ${fmtDate(setup.fixtureRetrievedAt)}`:''}</div>`:'';
-    return `${source}<div class="stat-strip" style="grid-template-columns:repeat(3,1fr);margin-bottom:12px"><div class="stat-box"><span>Opening Round</span><strong>${setup.openingRound?.enabled?'YES':'NO'}</strong></div><div class="stat-box"><span>Bye rounds</span><strong>${byeRounds.length}</strong></div><div class="stat-box"><span>AFL rounds loaded</span><strong>${rounds.length}</strong></div></div><div class="table-wrap setup-round-table"><table class="data-table"><thead><tr><th>Round</th><th>PEGS scores count</th><th>AFL byes</th><th>OR banked clubs</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    const policy=legacyOR?`<div class="stat-box"><span>Opening Round</span><strong>${setup.openingRound?.enabled?'YES':'NO'}</strong></div>`:`<div class="stat-box"><span>Scoring rule</span><strong>AFL clubs playing</strong></div>`;
+    const note=legacyOR?'':`<div class="notice" style="margin-bottom:12px"><strong>Post-2026 bye scoring:</strong> the number of PEGS player scores counted equals the number of AFL clubs playing that round. No Opening Round scores are banked.</div>`;
+    return `${source}${note}<div class="stat-strip" style="grid-template-columns:repeat(3,1fr);margin-bottom:12px">${policy}<div class="stat-box"><span>Bye rounds</span><strong>${byeRounds.length}</strong></div><div class="stat-box"><span>AFL rounds loaded</span><strong>${rounds.length}</strong></div></div><div class="table-wrap setup-round-table"><table class="data-table"><thead><tr><th>Round</th><th>PEGS scores count</th><th>AFL byes</th>${legacyOR?'<th>OR banked clubs</th>':''}</tr></thead><tbody>${rows}</tbody></table></div>`;
   }
   function seasonFixturePreview(fixtures,limit=24){
     if(!fixtures?.length)return '<div class="empty">No PEGS H2H fixture loaded.</div>'; const grouped={}; fixtures.forEach(f=>(grouped[f.round]||(grouped[f.round]=[])).push(f));
@@ -2266,19 +2605,41 @@
     clearInteractionDraft();
     const ds=getDraftState(); let panel='';
     if(commissionerTab==='scores'){
-      const round=effectiveCurrentRound(),keys=D.teams.map(t=>t.key),defaultTeam=keys[0];
-      panel=`${liveFeedSummary()}<div class="button-row" style="margin-top:12px"><button class="primary-button" id="sync-live-feed">Sync SuperCoach.live now</button>${activeSeasonSetup()?.openingRound?.enabled?'<button class="secondary-button" id="sync-opening-feed">Sync Opening Round</button><button class="secondary-button" id="capture-opening-bank">Capture OR bank</button>':''}<button class="secondary-button" id="finalise-current-round">Finalise Round ${round}</button><button class="secondary-button" id="force-finalise-current-round">Finalise anyway</button></div><div class="notice" style="margin-top:14px"><strong>Official player score corrections are handled in Matchups.</strong> Commissioner Mode enables the score editor inside the selected head-to-head matchup. No password re-entry is required while this Commissioner session remains active.</div><hr style="border:0;border-top:1px solid var(--line);margin:20px 0"><div class="notice"><strong>Selection status correction:</strong> this remains here for provider team-list issues. It changes selected/OUT status only — not the player's official score.</div><div class="form-grid" style="margin-top:16px"><div class="field-group"><label for="comm-round">Round</label><select class="select" id="comm-round">${(activeSeasonSetup()?.rounds||Object.keys(D.roundSchedule).map(r=>({round:Number(r)}))).map(x=>`<option value="${x.round}" ${Number(x.round)===round?'selected':''}>Round ${x.round}</option>`).join('')}</select></div><div class="field-group"><label for="comm-team">Team</label><select class="select" id="comm-team">${keys.map(k=>`<option value="${k}">${esc(team(k).name)}</option>`).join('')}</select></div><div class="field-group"><label for="comm-player">Player</label><select class="select" id="comm-player">${teamRoundPlayers(round,defaultTeam).map(p=>`<option value="${esc(p.player)}">${esc(p.player)}</option>`).join('')}</select></div><div class="field-group"><label for="comm-selection">Selection override</label><select class="select" id="comm-selection"><option value="">Use live feed</option><option value="SELECTED">Force selected</option><option value="OUT">Force OUT (projects 0)</option></select></div></div><div class="button-row"><button class="secondary-button" id="save-selection-override">Save selection override</button><button class="secondary-button" id="clear-selection-override">Use feed again</button><button class="primary-button" id="open-matchups-from-admin">Open Matchups score editor</button></div>`;
+      const active=activeSeasonSetup();
+      if(!active&&Boolean(D.meta.seasonComplete)){
+        panel=`<div class="admin-section-hero"><div><span class="eyebrow">Round control</span><h3>No active scoring round</h3><p>The ${Number(D.meta.season||2026)} season is complete and locked in history. Start the next competition in Season Setup before live scoring resumes.</p></div><span class="badge green">${Number(D.meta.season||2026)} COMPLETE</span></div>
+        <div class="admin-kpi-strip"><div><span>Completed season</span><strong>${Number(D.meta.season||2026)}</strong></div><div><span>Completed through</span><strong>R${Number(D.meta.completedThroughRound||D.meta.currentRound||23)}</strong></div><div><span>Premier</span><strong>${esc(team(D.meta.premier).name)}</strong></div><div><span>Next action</span><strong>Season setup</strong></div></div>
+        <div class="admin-workflow"><article class="admin-step ready"><span class="admin-step-number">✓</span><div><span class="eyebrow">Archived</span><h3>2026 scoring is closed</h3><p>Historical round scores, finals and the premiership remain available throughout the site and in the consolidated Excel archive.</p></div></article><article class="admin-step"><span class="admin-step-number">1</span><div><span class="eyebrow">Next season</span><h3>Prepare ${Number(D.meta.season||2026)+1}</h3><p>Load the AFL fixture, confirm the PEGS fixture and activate the new season. Round Control will then automatically switch to the new active round.</p><div class="button-row"><button class="primary-button" id="go-season-setup">Open Season Setup</button></div></div></article></div>`;
+      }else{
+        const round=effectiveCurrentRound(),keys=D.teams.map(t=>t.key),defaultTeam=keys[0],feed=getLiveFeed(),expected=Number(feed.expectedGameCount||0),matched=Number(feed.matchedGameCount||feed.games?.length||0),completed=Number(feed.completedGameCount||0),feedIsCurrent=Number(feed.season)===currentSeason()&&Number(feed.round)===round,ready=feedIsCurrent&&expected>0&&matched>=expected&&completed>=expected,counted=topPlayersForRound(round),finalized=roundFinalized(round);
+        panel=`<div class="admin-section-hero"><div><span class="eyebrow">Round workflow</span><h3>${esc(roundLabel(round))}</h3><p>Sync the live feed, review the round, make any exceptional corrections, then finalise once every AFL game is complete.</p></div><span class="badge ${finalized?'green':ready?'green':feedIsCurrent?'amber':'neutral'}">${finalized?'FINALISED':ready?'READY TO FINALISE':feedIsCurrent?'LIVE / INCOMPLETE':'NOT SYNCED'}</span></div>
+        <div class="admin-kpi-strip"><div><span>Season</span><strong>${currentSeason()}</strong></div><div><span>PEGS scores counted</span><strong>${counted}</strong></div><div><span>AFL games loaded</span><strong>${expected?`${matched}/${expected}`:'—'}</strong></div><div><span>Games final</span><strong>${expected?`${completed}/${expected}`:'—'}</strong></div></div>
+        <div class="admin-workflow">
+          <article class="admin-step"><span class="admin-step-number">1</span><div><span class="eyebrow">Sync</span><h3>Refresh live scores</h3><p>Pull the current SuperCoach scores, game status and team-list information for this round.</p>${liveFeedSummary()}<div class="button-row"><button class="primary-button" id="sync-live-feed">Sync live scores now</button></div></div></article>
+          <article class="admin-step"><span class="admin-step-number">2</span><div><span class="eyebrow">Review</span><h3>Check matchups</h3><p>Use the normal Matchups page to review all head-to-head scores. Commissioner Mode adds the official score correction tools there when required.</p><div class="button-row"><button class="secondary-button" id="open-matchups-from-admin">Open Matchups & score editor</button></div></div></article>
+          <article class="admin-step ${ready?'ready':''}"><span class="admin-step-number">3</span><div><span class="eyebrow">Lock</span><h3>Finalise ${esc(roundLabel(round))}</h3><p>${finalized?'This round already has a finalised result snapshot.':ready?'All configured AFL games are final. Finalising stores the results, advances the season and creates a named restore point.':'PEGS will block normal finalisation until all configured AFL games are retrieved and final.'}</p><div class="button-row"><button class="primary-button" id="finalise-current-round" ${finalized?'disabled':''}>${finalized?'Round already finalised':`Finalise ${esc(roundLabel(round))}`}</button></div><details class="admin-details"><summary>Emergency finalisation</summary><div class="notice danger"><strong>Use only when the provider cannot complete the round.</strong> This bypasses the AFL-game completion check but still creates an official result and recovery checkpoint.</div><div class="button-row"><button class="secondary-button danger-button" id="force-finalise-current-round" ${finalized?'disabled':''}>Finalise anyway</button></div></details></div></article>
+        </div>
+        <details class="admin-details admin-advanced" style="margin-top:16px"><summary>Advanced · correct player selection status</summary><div class="notice" style="margin-top:12px"><strong>Selection status only.</strong> Use this when the provider incorrectly marks a player selected or OUT. Official score corrections belong in Matchups.</div><div class="form-grid" style="margin-top:16px"><div class="field-group"><label for="comm-round">Round</label><select class="select" id="comm-round">${(activeSeasonSetup()?.rounds||Object.keys(D.roundSchedule).map(r=>({round:Number(r)}))).map(x=>`<option value="${x.round}" ${Number(x.round)===round?'selected':''}>Round ${x.round}</option>`).join('')}</select></div><div class="field-group"><label for="comm-team">Team</label><select class="select" id="comm-team">${keys.map(k=>`<option value="${k}">${esc(team(k).name)}</option>`).join('')}</select></div><div class="field-group"><label for="comm-player">Player</label><select class="select" id="comm-player">${teamRoundPlayers(round,defaultTeam).map(p=>`<option value="${esc(p.player)}">${esc(p.player)}</option>`).join('')}</select></div><div class="field-group"><label for="comm-selection">Selection override</label><select class="select" id="comm-selection"><option value="">Use live feed</option><option value="SELECTED">Force selected</option><option value="OUT">Force OUT (projects 0)</option></select></div></div><div class="button-row"><button class="secondary-button" id="save-selection-override">Save override</button><button class="secondary-button" id="clear-selection-override">Use feed again</button></div></details>`;
+      }
     } else if(commissionerTab==='season'){
-      const saved=localStorage.getItem(SEASON_SETUP_KEY)?getSeasonSetup():newSeasonTemplate(),pegsCsv=pegsFixtureCsv(saved.pegsFixtures||[]);
-      panel=`<div class="notice"><strong>Season setup:</strong> choose the season and retrieve the AFL home-and-away fixture automatically. PEGS detects Opening Round, byes and the number of scores that count. CSV paste/upload remains available as a fallback.</div><div class="form-grid" style="margin-top:16px"><div class="field-group"><label for="season-year">Season</label><input class="search-input" id="season-year" type="number" value="${Number(saved.season||currentSeason()+1)}"></div><div class="field-group"><label for="season-current-round">Current AFL / PEGS round</label><input class="search-input" id="season-current-round" type="number" min="1" value="${Number(saved.currentRound||1)}"></div><div class="field-group"><label for="season-regular-rounds">PEGS regular H2H rounds</label><input class="search-input" id="season-regular-rounds" type="number" min="1" max="40" value="${Number(saved.pegsRegularRounds||20)}"></div><div class="field-group"><label>Live SuperCoach data</label><select class="select" id="season-live-enabled"><option value="1" ${saved.liveScoringEnabled!==false?'selected':''}>Enabled</option><option value="0" ${saved.liveScoringEnabled===false?'selected':''}>Disabled</option></select></div></div><div class="button-row" style="margin-top:14px"><button class="primary-button" id="retrieve-afl-fixture">Retrieve AFL fixture</button><span class="button-help">One request per setup/reload, cached in PEGS — no fixture file required.</span></div><div class="field-group" style="margin-top:14px"><label for="afl-fixture-csv">AFL fixture data <small>(advanced / fallback)</small></label><textarea class="setup-textarea" id="afl-fixture-csv" rows="7" placeholder="OR,SYD,CAR\nOR,BRL,GEE\n1,ADE,RIC\n1,COL,HAW\n...">${esc(saved.aflFixtureCsv||'')}</textarea><small>Automatically filled after retrieval. You can still paste or upload a corrected fixture if required.</small></div><div class="button-row"><button class="secondary-button" id="analyse-afl-fixture">Analyse fixture</button><label class="secondary-button file-button" for="afl-fixture-file">Upload fixture CSV</label><input id="afl-fixture-file" type="file" accept=".csv,.txt,text/csv,text/plain" hidden></div><div id="season-round-preview" style="margin-top:14px">${seasonRoundPreview(saved)}</div><div class="or-map-section"><div class="section-title"><div><span class="eyebrow">Opening Round</span><h3>Choose where banked scores are used</h3></div></div><p class="muted-copy">For each AFL club that plays Opening Round, choose the later bye round in which its Opening Round player scores should be inserted. PEGS suggests the club's bye from the retrieved fixture, but the Commissioner controls the final mapping.</p><div id="opening-round-map">${openingRoundMappingControls(saved)}</div></div><hr style="border:0;border-top:1px solid var(--line);margin:22px 0"><div class="section-title"><div><span class="eyebrow">PEGS fixture</span><h3>Who plays who</h3></div><button class="secondary-button" id="generate-pegs-fixture">Generate round-robin</button></div><div class="field-group"><label for="pegs-fixture-csv">PEGS H2H fixture CSV</label><textarea class="setup-textarea" id="pegs-fixture-csv" rows="10">${esc(pegsCsv)}</textarea><small>Format: round,home-team-key,away-team-key. Team keys: ${D.teams.map(t=>t.key).join(', ')}.</small></div><div id="pegs-fixture-preview" style="margin-top:14px">${seasonFixturePreview(saved.pegsFixtures||[])}</div><div class="button-row"><button class="primary-button" id="save-season-setup">Save & activate season</button><button class="secondary-button" id="deactivate-season-setup">Use workbook 2026 season</button></div>`;
+      const existing=localStorage.getItem(SEASON_SETUP_KEY)?getSeasonSetup():null,saved=existing&&!(Boolean(D.meta.seasonComplete)&&Number(existing.season)<=Number(D.meta.season||2026))?existing:newSeasonTemplate(),pegsCsv=pegsFixtureCsv(saved.pegsFixtures||[]),loaded=Number(saved.aflGameCount||0)>0||(saved.rounds||[]).length>0;
+      panel=`<div class="admin-section-hero"><div><span class="eyebrow">Season setup</span><h3>${Number(saved.season||currentSeason()+1)} competition</h3><p>Set the season basics, load the AFL fixture, confirm the PEGS head-to-head fixture and then activate the season.</p></div><span class="badge ${saved.active?'green':loaded?'amber':'neutral'}">${saved.active?'ACTIVE':loaded?'READY TO REVIEW':'SETUP'}</span></div>
+      <div class="admin-workflow compact-workflow">
+        <article class="admin-step"><span class="admin-step-number">1</span><div><span class="eyebrow">Basics</span><h3>Competition settings</h3><div class="form-grid" style="margin-top:12px"><div class="field-group"><label for="season-year">Season</label><input class="search-input" id="season-year" type="number" value="${Number(saved.season||currentSeason()+1)}"></div><div class="field-group"><label for="season-current-round">Current round</label><input class="search-input" id="season-current-round" type="number" min="1" value="${Number(saved.currentRound||1)}"></div><div class="field-group"><label for="season-regular-rounds">Regular H2H rounds</label><input class="search-input" id="season-regular-rounds" type="number" min="1" max="40" value="${Number(saved.pegsRegularRounds||20)}"></div><div class="field-group"><label>Live scoring</label><select class="select" id="season-live-enabled"><option value="1" ${saved.liveScoringEnabled!==false?'selected':''}>Enabled</option><option value="0" ${saved.liveScoringEnabled===false?'selected':''}>Disabled</option></select></div></div></div></article>
+        <article class="admin-step"><span class="admin-step-number">2</span><div><span class="eyebrow">AFL fixture</span><h3>Load byes & scoring counts</h3><p>Retrieve the published AFL fixture. From 2027 onward, PEGS automatically counts exactly one player score for each AFL club playing that round. There is no Opening Round banking.</p><div class="button-row"><button class="primary-button" id="retrieve-afl-fixture">Retrieve AFL fixture</button><button class="secondary-button" id="analyse-afl-fixture">Recalculate</button></div><div id="season-round-preview" style="margin-top:14px">${seasonRoundPreview(saved)}</div><details class="admin-details"><summary>Advanced · fixture CSV fallback</summary><div class="field-group" style="margin-top:12px"><label for="afl-fixture-csv">AFL fixture CSV</label><textarea class="setup-textarea" id="afl-fixture-csv" rows="7" placeholder="1,ADE,RIC\n1,COL,HAW\n2,SYD,CAR\n...">${esc(saved.aflFixtureCsv||'')}</textarea><small>Automatically filled after retrieval. Paste or upload only if the published fixture needs manual correction.</small></div><div class="button-row"><label class="secondary-button file-button" for="afl-fixture-file">Upload fixture CSV</label><input id="afl-fixture-file" type="file" accept=".csv,.txt,text/csv,text/plain" hidden></div><div id="opening-round-map" style="margin-top:12px">${openingRoundMappingControls(saved)}</div></details></div></article>
+        <article class="admin-step"><span class="admin-step-number">3</span><div><span class="eyebrow">PEGS fixture</span><h3>Confirm who plays who</h3><p>Generate the standard round-robin fixture, then review the matchup preview before activation.</p><div class="button-row"><button class="secondary-button" id="generate-pegs-fixture">Generate round-robin</button></div><div id="pegs-fixture-preview" style="margin-top:14px">${seasonFixturePreview(saved.pegsFixtures||[])}</div><details class="admin-details"><summary>Advanced · edit PEGS fixture CSV</summary><div class="field-group" style="margin-top:12px"><label for="pegs-fixture-csv">PEGS H2H fixture CSV</label><textarea class="setup-textarea" id="pegs-fixture-csv" rows="10">${esc(pegsCsv)}</textarea><small>Format: round,home-team-key,away-team-key. Team keys: ${D.teams.map(t=>t.key).join(', ')}.</small></div></details></div></article>
+        <article class="admin-step activation-step"><span class="admin-step-number">4</span><div><span class="eyebrow">Activate</span><h3>Make the season live</h3><p>Activation saves the verified AFL and PEGS fixtures as the authoritative season configuration. Future Commissioner changes are automatically checkpointed.</p><div class="button-row"><button class="primary-button" id="save-season-setup">Save & activate season</button>${saved.active?'<button class="secondary-button" id="deactivate-season-setup">Deactivate season</button>':'<button class="secondary-button" id="deactivate-season-setup">Return to archived 2026</button>'}</div></div></article>
+      </div>`;
     } else if(commissionerTab==='finals'){
-      const setup=getSeasonSetup(),f=finalsConfig(setup),b=calculatedFinalsBracket(setup),ladder=[...effectiveLadder()].sort((a,b)=>Number(a.position)-Number(b.position));
-      const seeds=b?.seeds||ladder.slice(0,4).map(x=>x.team),seedSelect=(i)=>`<select class="select" id="final-seed-${i}">${D.teams.map(t=>`<option value="${t.key}" ${seeds[i]===t.key?'selected':''}>${i+1}. ${esc(t.name)} (${esc(t.owner)})</option>`).join('')}</select>`;
-      const card=(label,x)=>`<div class="final-card"><div class="final-team">${x?.home?teamIdentity(x.home,'sm'):'TBC'}</div><div><div class="final-round">${label}<br><small>Round ${Number(x?.round||0)}</small></div><div class="vs-dot" style="width:34px;height:34px;font-size:10px">VS</div></div><div class="final-team">${x?.away?teamIdentity(x.away,'sm'):'TBC'}</div></div>`;
-      panel=`<div class="notice"><strong>Top-four finals:</strong> 1st v 2nd in the Qualifying Final (winner directly to the Grand Final); 3rd v 4th in the Elimination Final (loser eliminated); the Qualifying Final loser then plays the Elimination Final winner in the Preliminary Final; the winner meets the Qualifying Final winner in the Grand Final.</div>
-      <div class="form-grid" style="margin-top:16px"><div class="field-group"><label>Finals format</label><input class="search-input" value="Top 4 · Page system" disabled></div><div class="field-group"><label for="final-week1-round">Finals Week 1 AFL round</label><input class="search-input" id="final-week1-round" type="number" min="1" value="${f.week1Round}"></div><div class="field-group"><label for="final-prelim-round">Preliminary Final AFL round</label><input class="search-input" id="final-prelim-round" type="number" min="1" value="${f.preliminaryRound}"></div><div class="field-group"><label for="final-gf-round">Grand Final AFL round</label><input class="search-input" id="final-gf-round" type="number" min="1" value="${f.grandFinalRound}"></div></div>
-      <div class="section-title" style="margin-top:20px"><div><span class="eyebrow">Seeding</span><h3>Final ladder top four</h3></div><button class="secondary-button" id="seed-finals-from-ladder">Use current ladder top 4</button></div><div class="form-grid"><div class="field-group"><label>Seed 1</label>${seedSelect(0)}</div><div class="field-group"><label>Seed 2</label>${seedSelect(1)}</div><div class="field-group"><label>Seed 3</label>${seedSelect(2)}</div><div class="field-group"><label>Seed 4</label>${seedSelect(3)}</div></div><div class="button-row"><button class="primary-button" id="save-finals-setup">Save finals setup</button><button class="secondary-button" id="clear-finals-bracket">Clear bracket</button></div>
-      <div class="section-title" style="margin-top:22px"><div><span class="eyebrow">Bracket</span><h3>Finals path</h3></div></div><div class="finals-list">${b?[card('Qualifying Final',b.qf),card('Elimination Final',b.ef),card('Preliminary Final',b.pf),card('Grand Final',b.gf)].join(''):'<div class="empty">Seed the finals after the regular season ladder is complete.</div>'}</div>`;
+      const setup=getSeasonSetup(),f=finalsConfig(setup),b=calculatedFinalsBracket(setup),ladder=[...effectiveLadder()].sort((a,b)=>Number(a.position)-Number(b.position)),archived=!activeSeasonSetup()&&Boolean(D.meta.seasonComplete)?effectiveFinals():[];
+      const seeds=b?.seeds||ladder.slice(0,4).map(x=>x.team),seedSelect=(i)=>`<select class="select" id="final-seed-${i}">${D.teams.map(t=>`<option value="${t.key}" ${seeds[i]===t.key?'selected':''}>${i+1}. ${esc(t.name)} · ${esc(t.owner)}</option>`).join('')}</select>`;
+      const card=(label,x)=>{const hs=Number(x?.homeScore),as=Number(x?.awayScore),hasScore=Number.isFinite(hs)&&Number.isFinite(as),winner=x?.winner;return `<div class="final-card admin-final-card"><div class="final-team">${x?.home?teamIdentity(x.home,'sm'):'TBC'}${hasScore?`<strong class="final-score ${winner===x?.home?'winner-score':''}">${hs}</strong>`:''}</div><div><div class="final-round">${label}<br><small>Round ${Number(x?.round||0)}</small></div><div class="vs-dot" style="width:34px;height:34px;font-size:10px">VS</div></div><div class="final-team">${x?.away?teamIdentity(x.away,'sm'):'TBC'}${hasScore?`<strong class="final-score ${winner===x?.away?'winner-score':''}">${as}</strong>`:''}</div></div>`;};
+      const displayed=b?[card('Qualifying Final',b.qf),card('Elimination Final',b.ef),card('Preliminary Final',b.pf),card('Grand Final',b.gf)].join(''):archived.length?archived.map((x,i)=>card(x.label||(['Qualifying Final','Elimination Final','Preliminary Final','Grand Final'][i]||'Final'),x)).join(''):'<div class="empty">No finals bracket has been seeded yet.</div>';
+      const regularComplete=Number(setup.completedThroughRound||0)>=Number(setup.pegsRegularRounds||20)||(!activeSeasonSetup()&&Boolean(D.meta.seasonComplete));
+      panel=`<div class="admin-section-hero"><div><span class="eyebrow">Finals control</span><h3>Top-four Page finals</h3><p>Seed the top four from the ladder, confirm the AFL rounds used for each finals week, then let PEGS advance winners automatically as results are finalised.</p></div><span class="badge ${archived.length?'green':b?'amber':regularComplete?'green':'neutral'}">${archived.length?'2026 COMPLETE':b?'BRACKET SEEDED':regularComplete?'READY TO SEED':'REGULAR SEASON'}</span></div>
+      <div class="admin-kpi-strip"><div><span>Finals Week 1</span><strong>R${f.week1Round}</strong></div><div><span>Preliminary Final</span><strong>R${f.preliminaryRound}</strong></div><div><span>Grand Final</span><strong>R${f.grandFinalRound}</strong></div><div><span>Format</span><strong>Top 4</strong></div></div>
+      <div class="section-title" style="margin-top:20px"><div><span class="eyebrow">Bracket</span><h3>${archived.length?'Completed finals':'Finals path'}</h3></div>${!archived.length?'<button class="primary-button" id="seed-finals-from-ladder">Seed from current ladder</button>':''}</div><div class="finals-list">${displayed}</div>
+      ${archived.length?'<div class="notice" style="margin-top:14px"><strong>Archived season:</strong> the completed 2026 finals are locked into the historical league data. Activate a new season before configuring the next finals series.</div>':`<details class="admin-details admin-advanced" style="margin-top:18px" open><summary>Finals setup & manual seeding</summary><div class="form-grid" style="margin-top:14px"><div class="field-group"><label for="final-week1-round">Finals Week 1 AFL round</label><input class="search-input" id="final-week1-round" type="number" min="1" value="${f.week1Round}"></div><div class="field-group"><label for="final-prelim-round">Preliminary Final AFL round</label><input class="search-input" id="final-prelim-round" type="number" min="1" value="${f.preliminaryRound}"></div><div class="field-group"><label for="final-gf-round">Grand Final AFL round</label><input class="search-input" id="final-gf-round" type="number" min="1" value="${f.grandFinalRound}"></div><div class="field-group"><label>Finals format</label><input class="search-input" value="Top 4 · Page system" disabled></div></div><div class="section-title" style="margin-top:18px"><div><span class="eyebrow">Seeds</span><h3>Final ladder top four</h3></div></div><div class="form-grid"><div class="field-group"><label>Seed 1</label>${seedSelect(0)}</div><div class="field-group"><label>Seed 2</label>${seedSelect(1)}</div><div class="field-group"><label>Seed 3</label>${seedSelect(2)}</div><div class="field-group"><label>Seed 4</label>${seedSelect(3)}</div></div><div class="button-row"><button class="primary-button" id="save-finals-setup">Save finals setup</button><button class="secondary-button" id="clear-finals-bracket">Clear bracket</button></div></details>`}`;
     } else if(commissionerTab==='windows'){
       const w=getProposalWindows(),trade=w.trade||{},delist=w.delist||{},elevation=w.elevation||{},draft=getDraftState();
       panel=`<div class="notice"><strong>League submission windows:</strong> teams cannot submit trades, rookie elevations, draft selections or delistings until you open the relevant activity. Existing pending proposals remain available for approval after a window closes.</div>
@@ -2307,20 +2668,28 @@
       <hr style="border:0;border-top:1px solid var(--line);margin:22px 0"><div class="section-title"><div><span class="eyebrow">Team selections</span><h3>Draft approval inbox</h3></div><span class="badge amber">${pending.length} pending</span></div><div class="proposal-list">${commissionerProposalCards(pending)}</div>`;
     } else if(commissionerTab==='accounts'){
       const rows=D.teams.map(t=>{const a=teamAccountsCache.find(x=>x.teamKey===t.key)||{};return `<tr><td>${teamIdentity(t.key,'sm')}</td><td><strong>${esc(t.owner)}</strong></td><td><code>${esc(a.username||String(t.owner).toLowerCase())}</code></td><td><span class="badge ${a.provisioned&&a.active!==false?'green':'amber'}">${a.provisioned&&a.active!==false?'ACTIVE':'NOT PROVISIONED'}</span></td><td><button class="secondary-button compact-button" data-reset-team-password="${t.key}">${a.provisioned?'Reset password':'Create account'}</button></td></tr>`;}).join('');
-      panel=`<div class="notice"><strong>12 franchise logins:</strong> each coach account is permanently tied to one team. Passwords are six random letters and are never stored or displayed again after creation/reset.</div><div class="button-row" style="margin-top:14px"><button class="primary-button" id="provision-team-accounts">Provision missing team accounts</button><button class="secondary-button" id="reload-team-accounts">Refresh status</button></div><div id="team-credential-output" style="margin-top:14px">${teamCredentialCache.length?credentialsTable(teamCredentialCache):''}</div><div class="table-wrap" style="margin-top:16px"><table class="data-table"><thead><tr><th>Franchise</th><th>Coach</th><th>Username</th><th>Status</th><th>Password</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+      panel=`<div class="notice"><strong>12 franchise logins:</strong> each coach account is permanently tied to one team. Passwords are not displayed by the server after creation/reset; a coach may optionally remember their own password in their browser on that device.</div><div class="button-row" style="margin-top:14px"><button class="primary-button" id="provision-team-accounts">Provision missing team accounts</button><button class="secondary-button" id="reload-team-accounts">Refresh status</button></div><div id="team-credential-output" style="margin-top:14px">${teamCredentialCache.length?credentialsTable(teamCredentialCache):''}</div><div class="table-wrap" style="margin-top:16px"><table class="data-table"><thead><tr><th>Franchise</th><th>Coach</th><th>Username</th><th>Status</th><th>Password</th></tr></thead><tbody>${rows}</tbody></table></div>`;
     } else if(commissionerTab==='backups'){
-      const rows=backupCache.map(b=>`<tr><td><strong>#${b.id}</strong></td><td>${fmtDate(b.created_at)}</td><td>${b.season||'—'}</td><td>${b.round||'—'}</td><td>${esc(b.reason||'')}</td><td>${esc(b.label||'')}</td><td><div class="backup-actions"><button class="secondary-button compact-button" data-backup-json="${b.id}">JSON</button><button class="secondary-button compact-button" data-backup-excel="${b.id}">Excel</button><button class="secondary-button compact-button danger-button" data-backup-restore="${b.id}">Restore</button></div></td></tr>`).join('');
-      const audit=auditCache.slice(0,15).map(a=>`<div class="audit-row"><time>${fmtDate(a.created_at)}</time><strong>${esc(a.action)}</strong><span>${esc(a.actor_team||a.actor_role||'')}</span><small>${esc(a.entity_type||'')} ${esc(a.entity_id||'')}</small></div>`).join('');
-      panel=`<div class="notice"><strong>Recovery system:</strong> finalising a round creates an immutable server backup automatically. You can also create one manually. Restore first creates an emergency pre-restore safeguard, and team login credentials are deliberately excluded from rollback.</div><div class="button-row" style="margin-top:14px"><button class="primary-button" id="create-manual-backup">Create backup now</button><button class="secondary-button" id="reload-backups">Refresh list</button></div><div class="table-wrap" style="margin-top:16px"><table class="data-table"><thead><tr><th>ID</th><th>Created</th><th>Season</th><th>Round</th><th>Reason</th><th>Label</th><th>Actions</th></tr></thead><tbody>${rows||'<tr><td colspan="7">No backups yet.</td></tr>'}</tbody></table></div><div class="section-title" style="margin-top:22px"><div><span class="eyebrow">Audit trail</span><h3>Recent official activity</h3></div></div><div class="audit-list">${audit||'<div class="empty">No audit entries loaded.</div>'}</div>`;
+      const latest=backupCache[0],autoCount=backupCache.filter(x=>String(x.reason||'').toUpperCase()==='AUTO_CHANGE').length,rows=backupCache.slice(0,50).map(b=>{const reason=String(b.reason||'').toUpperCase(),kind=reason==='AUTO_CHANGE'?'Automatic':reason==='ROUND_FINALIZED'?'Round finalised':reason==='PRE_RESTORE'?'Pre-restore safeguard':reason==='MANUAL_EXPORT'?'Excel archive':reason==='MANUAL'?'Manual':'System';return `<tr><td><strong>${fmtDate(b.created_at)}</strong><small class="table-subline">#${b.id}</small></td><td><span class="badge ${reason==='PRE_RESTORE'?'amber':reason==='ROUND_FINALIZED'?'green':'neutral'}">${kind}</span></td><td>${b.season||'—'}${b.round?` · R${b.round}`:''}</td><td>${esc(b.label||'Checkpoint')}</td><td><div class="backup-actions"><button class="secondary-button compact-button" data-backup-excel="${b.id}">Excel</button><button class="secondary-button compact-button danger-button" data-backup-restore="${b.id}">Restore</button></div></td></tr>`;}).join('');
+      const audit=auditCache.slice(0,20).map(a=>`<div class="audit-row"><time>${fmtDate(a.created_at)}</time><strong>${esc(a.action)}</strong><span>${esc(a.actor_team||a.actor_role||'')}</span><small>${esc(a.entity_type||'')} ${esc(a.entity_id||'')}</small></div>`).join('');
+      panel=`<div class="admin-section-hero"><div><span class="eyebrow">Data & recovery</span><h3>One archive, safe restore points</h3><p>Excel is the single Commissioner archive format. PEGS automatically saves timestamped restore points after material Commissioner changes; any restore point can be exported to the same consolidated Excel structure.</p></div><span class="badge green">AUTO BACKUP ON</span></div>
+      <div class="admin-kpi-strip"><div><span>Latest restore point</span><strong>${latest?fmtDate(latest.created_at):'None'}</strong></div><div><span>Restore points loaded</span><strong>${backupCache.length}</strong></div><div><span>Automatic checkpoints</span><strong>${autoCount}</strong></div><div><span>Archive format</span><strong>Excel</strong></div></div>
+      <div class="recovery-action-grid">
+        <article class="recovery-action-card primary"><span class="eyebrow">Full league archive</span><h3>Download current Excel archive</h3><p>Creates a fresh restore point, then exports the same recovery data to one consolidated Excel workbook. It includes the complete league archive plus the current PEGS state.</p><button class="primary-button" id="download-current-archive">Download Excel archive</button></article>
+        <article class="recovery-action-card"><span class="eyebrow">Before a major change</span><h3>Create manual restore point</h3><p>Add a named point-in-time checkpoint without downloading anything. Automatic checkpoints continue in the background.</p><button class="secondary-button" id="create-manual-backup">Create restore point now</button></article>
+      </div>
+      <div class="notice" style="margin-top:14px"><strong>What the Excel archive replaces:</strong> the old Legacy Data JSON export and the separate backup export. The consolidated workbook carries the meaningful records from the full 102-sheet legacy workbook: roster history, raw PEGS/AFL scores, 2018-2026 draft/trade/delisting history, written rules, former franchise identities, weekly player market history, draft order/timing and Grand Final scorecards, plus the current PEGS state. Formula/helper/display sheets are deliberately replaced by their canonical source tables. The Workbook Map sheet accounts for every original sheet.</div>
+      <div class="section-title" style="margin-top:22px"><div><span class="eyebrow">Point-in-time restore</span><h3>Restore history</h3></div><button class="secondary-button" id="reload-backups">Refresh</button></div><div class="notice"><strong>Restore protection:</strong> restoring any point first creates an automatic safeguard of the state you are leaving. Team login passwords are never rolled back.</div><div class="table-wrap recovery-table" style="margin-top:14px"><table class="data-table"><thead><tr><th>When</th><th>Type</th><th>Season</th><th>Checkpoint</th><th>Actions</th></tr></thead><tbody>${rows||'<tr><td colspan="5">No restore points yet.</td></tr>'}</tbody></table></div>
+      <details class="admin-details" style="margin-top:18px"><summary>Recent audit activity</summary><div class="audit-list" style="margin-top:12px">${audit||'<div class="empty">No audit entries loaded.</div>'}</div></details>`;
     } else if(commissionerTab==='figureheads'){
       const overrides=getFigureheadOverrides();
       panel=`<div class="notice"><strong>Team figureheads:</strong> PEGS automatically uses each franchise's highest-averaging current SuperCoach player. The average is used only behind the scenes and is not displayed anywhere with the figurehead. You can pin a different current roster player here.</div><div class="figurehead-admin-grid">${D.teams.map(t=>{const fh=figureheadPlayer(t.key),rows=(effectiveRosters()[t.key]||[]).slice().sort((a,b)=>a.player.localeCompare(b.player));return `<div class="figurehead-admin-card"><div class="figurehead-admin-identity">${figurehead(t.key,'md')}<div><strong>${esc(t.name)}</strong><span>${esc(fh.player)}</span><small>${fh.manual?'Commissioner override':'Automatic figurehead'}</small></div></div><div class="field-group"><label for="figurehead-${t.key}">Figurehead</label><select class="select" id="figurehead-${t.key}" data-figurehead-select="${t.key}"><option value="">Automatic · highest average</option>${rows.map(p=>`<option value="${esc(p.player)}" ${canonicalPlayerName(overrides[t.key]||'')===canonicalPlayerName(p.player)?'selected':''}>${esc(p.player)}</option>`).join('')}</select></div></div>`;}).join('')}</div>`;
     } else {
-      panel=`<div class="notice"><strong>Commissioner data:</strong> export a backup of overrides, confirmed transactions, proposals and draft state, or restore one later.</div><div class="button-row" style="margin-top:16px"><button class="secondary-button" id="export-admin-state">Export Commissioner data</button><label class="secondary-button" for="import-admin-state" style="cursor:pointer">Import Commissioner data</label><input class="screen-reader-only" id="import-admin-state" type="file" accept="application/json"></div>${backendConfigured()?'<div class="notice" style="margin-top:14px"><strong>Shared mode enabled.</strong> Team proposals and Commissioner decisions are stored in the configured free backend.</div>':'<div class="notice" style="margin-top:14px"><strong>Local preview mode.</strong> Team proposals and Commissioner decisions stay in this browser until the free shared backend is configured.</div>'}`;
+      panel=`<div class="notice"><strong>Commissioner section unavailable.</strong> Choose another control-centre tab.</div>`;
     }
-    commissionerContent.innerHTML=`<div class="commissioner-body"><div class="commissioner-title-row"><div><span class="eyebrow">Private administration</span><h3>Commissioner Control Centre</h3></div><span class="badge green">Unlocked</span></div>${commissionerTabs()}<div class="admin-panel">${panel}</div></div>`;
+    commissionerContent.innerHTML=`<div class="commissioner-body"><div class="commissioner-title-row"><div><span class="eyebrow">Private administration</span><h3>Commissioner Control Centre</h3></div><div class="commissioner-title-actions"><span class="badge green">Unlocked</span><button class="secondary-button commissioner-logout-button" id="commissioner-logout">Log Out Commissioner</button></div></div>${commissionerTabs()}<div class="admin-panel">${panel}</div></div>`;
     document.querySelectorAll('[data-admin-tab]').forEach(btn=>btn.addEventListener('click',async()=>{commissionerTab=btn.dataset.adminTab;if(commissionerTab==='accounts')await loadTeamAccounts();if(commissionerTab==='backups')await Promise.all([syncBackups(),syncAudit()]);renderCommissionerControls();}));
-    document.getElementById('commissioner-logout')?.addEventListener('click',()=>{teamCredentialCache=[];clearCommissionerSession();dismissDialog(commissionerDialog);toast(`Commissioner Mode disabled.${teamLoggedIn()?' Team Login remains active.':''}`);render();});
+    document.getElementById('commissioner-logout')?.addEventListener('click',()=>{teamCredentialCache=[];clearCommissionerSession();dismissDialog(commissionerDialog);toast(`Commissioner logged out.${teamLoggedIn()?' Team Login remains active.':''}`);enforceAccessAfterLogout('Commissioner logged out. Log in to re-enter PEGS.');});
     document.querySelectorAll('[data-proposal-approve]').forEach(btn=>btn.addEventListener('click',()=>void approveProposal(btn.dataset.proposalApprove)));
     document.querySelectorAll('[data-proposal-reject]').forEach(btn=>btn.addEventListener('click',()=>void rejectProposal(btn.dataset.proposalReject)));
 
@@ -2330,13 +2699,16 @@
       document.getElementById('capture-opening-bank')?.addEventListener('click',()=>captureOpeningRoundBank());
       document.getElementById('finalise-current-round')?.addEventListener('click',()=>void finalizeRound(effectiveCurrentRound(),false));
       document.getElementById('force-finalise-current-round')?.addEventListener('click',()=>{if(confirm('Finalise this round even though the live-feed game check may be incomplete?'))void finalizeRound(effectiveCurrentRound(),true);});
+      document.getElementById('go-season-setup')?.addEventListener('click',()=>{commissionerTab='season';renderCommissionerControls();});
       const roundEl=document.getElementById('comm-round'),teamEl=document.getElementById('comm-team'),playerEl=document.getElementById('comm-player'),selectionEl=document.getElementById('comm-selection');
-      const load=()=>{selectionEl.value=selectionOverride(Number(roundEl.value),teamEl.value,playerEl.value)||'';};
-      const refreshPlayers=()=>{const rd=Number(roundEl.value),key=teamEl.value;playerEl.innerHTML=teamRoundPlayers(rd,key).map(p=>`<option value="${esc(p.player)}">${esc(p.player)}${p.scoreSource==='Opening Round banked'?' · OR bank':''}</option>`).join('');load();};
-      const refreshTeams=()=>{teamEl.innerHTML=D.teams.map(t=>`<option value="${t.key}">${esc(t.name)}</option>`).join('');refreshPlayers();};
-      roundEl.addEventListener('change',refreshTeams);teamEl.addEventListener('change',refreshPlayers);playerEl.addEventListener('change',load);load();
-      document.getElementById('save-selection-override')?.addEventListener('click',()=>{const all=getSelectionOverrides(),id=overrideId(Number(roundEl.value),teamEl.value,playerEl.value),v=String(selectionEl.value||'');if(v)all[id]=v;else delete all[id];saveSelectionOverrides(all);toast(v==='OUT'?`${playerEl.value} forced OUT — projection is 0.`:`${playerEl.value} selection override saved.`);render();});
-      document.getElementById('clear-selection-override')?.addEventListener('click',()=>{const all=getSelectionOverrides();delete all[overrideId(Number(roundEl.value),teamEl.value,playerEl.value)];saveSelectionOverrides(all);selectionEl.value='';toast('Selection returned to live feed.');render();});
+      if(roundEl&&teamEl&&playerEl&&selectionEl){
+        const load=()=>{selectionEl.value=selectionOverride(Number(roundEl.value),teamEl.value,playerEl.value)||'';};
+        const refreshPlayers=()=>{const rd=Number(roundEl.value),key=teamEl.value;playerEl.innerHTML=teamRoundPlayers(rd,key).map(p=>`<option value="${esc(p.player)}">${esc(p.player)}${p.scoreSource==='Opening Round banked'?' · OR bank':''}</option>`).join('');load();};
+        const refreshTeams=()=>{teamEl.innerHTML=D.teams.map(t=>`<option value="${t.key}">${esc(t.name)}</option>`).join('');refreshPlayers();};
+        roundEl.addEventListener('change',refreshTeams);teamEl.addEventListener('change',refreshPlayers);playerEl.addEventListener('change',load);load();
+        document.getElementById('save-selection-override')?.addEventListener('click',()=>{const all=getSelectionOverrides(),id=overrideId(Number(roundEl.value),teamEl.value,playerEl.value),v=String(selectionEl.value||'');if(v)all[id]=v;else delete all[id];saveSelectionOverrides(all);toast(v==='OUT'?`${playerEl.value} forced OUT — projection is 0.`:`${playerEl.value} selection override saved.`);render();});
+        document.getElementById('clear-selection-override')?.addEventListener('click',()=>{const all=getSelectionOverrides();delete all[overrideId(Number(roundEl.value),teamEl.value,playerEl.value)];saveSelectionOverrides(all);selectionEl.value='';toast('Selection returned to live feed.');render();});
+      }
       document.getElementById('open-matchups-from-admin')?.addEventListener('click',()=>{matchupScoreEditOpen=true;commissionerDialog.close();routeTo('matchups/'+effectiveCurrentRound());});
     }
     if(commissionerTab==='finals'){
@@ -2364,10 +2736,10 @@
       let analysed=getSeasonSetup();
       const renderSeasonAnalysis=()=>{document.getElementById('season-round-preview').innerHTML=seasonRoundPreview(analysed);document.getElementById('opening-round-map').innerHTML=openingRoundMappingControls(analysed);};
       const analyse=()=>{
-        const parsed=parseAflFixtureCsv(document.getElementById('afl-fixture-csv').value);
         const year=Number(document.getElementById('season-year').value||currentSeason()+1),regular=Number(document.getElementById('season-regular-rounds').value||20);
+        const parsed=applySeasonFixtureRules(parseAflFixtureCsv(document.getElementById('afl-fixture-csv').value),year);
         const existing=analysed?.openingRound?.bankDestinations||{};
-        const mapped=applyOpeningBankDestinations(parsed,Object.keys(existing).length?existing:parsed.openingRound?.suggestedBankDestinations||{});
+        const mapped=openingRoundBankingAllowed(year)?applyOpeningBankDestinations(parsed,Object.keys(existing).length?existing:parsed.openingRound?.suggestedBankDestinations||{}):parsed;
         analysed={...analysed,season:year,currentRound:Number(document.getElementById('season-current-round').value||1),openingRound:mapped.openingRound,aflFixtureCsv:document.getElementById('afl-fixture-csv').value,aflGameCount:mapped.games.length,rounds:mapped.rounds,pegsRegularRounds:regular,liveScoringEnabled:document.getElementById('season-live-enabled').value==='1'};
         renderSeasonAnalysis(); return analysed;
       };
@@ -2378,12 +2750,12 @@
           document.getElementById('afl-fixture-csv').value=payload.csv;
           analysed={...analysed,fixtureSource:payload.source||'Squiggle AFL fixture API',fixtureRetrievedAt:payload.retrievedAt||new Date().toISOString(),fixtureProviderYear:Number(payload.season||year)};
           analyse();
-          toast(`${year} AFL fixture retrieved: ${analysed.aflGameCount} games, ${analysed.openingRound?.enabled?'Opening Round detected':'no Opening Round'}.`);
+          toast(`${year} AFL fixture retrieved: ${analysed.aflGameCount} games. ${openingRoundBankingAllowed(year)?(analysed.openingRound?.enabled?'Opening Round detected.':'No Opening Round detected.'):'Post-2026 bye counts applied; no Opening Round banking.'}`);
         }catch(e){console.warn(e);toast(e.message||'AFL fixture retrieval failed.');}
         finally{btn.disabled=false;btn.textContent='Retrieve AFL fixture';}
       });
-      document.getElementById('analyse-afl-fixture')?.addEventListener('click',()=>{analyse();toast(`${analysed.openingRound?.enabled?'Opening Round detected':'No Opening Round detected'}. Bye counts recalculated.`);});
-      document.getElementById('afl-fixture-file')?.addEventListener('change',async e=>{const f=e.target.files?.[0];if(!f)return;try{document.getElementById('afl-fixture-csv').value=await f.text();analysed={...analysed,fixtureSource:'Commissioner CSV upload',fixtureRetrievedAt:new Date().toISOString()};analyse();toast(`Fixture loaded: ${analysed.rounds.length} AFL rounds, ${analysed.openingRound?.enabled?'Opening Round detected':'no Opening Round'}.`);}catch(_){toast('The AFL fixture file could not be read.');}});
+      document.getElementById('analyse-afl-fixture')?.addEventListener('click',()=>{analyse();toast(`${openingRoundBankingAllowed(analysed.season)?(analysed.openingRound?.enabled?'Opening Round detected.':'No Opening Round detected.'):'Opening Round banking disabled.'} Bye counts recalculated.`);});
+      document.getElementById('afl-fixture-file')?.addEventListener('change',async e=>{const f=e.target.files?.[0];if(!f)return;try{document.getElementById('afl-fixture-csv').value=await f.text();analysed={...analysed,fixtureSource:'Commissioner CSV upload',fixtureRetrievedAt:new Date().toISOString()};analyse();toast(`Fixture loaded: ${analysed.rounds.length} AFL rounds. ${openingRoundBankingAllowed(analysed.season)?(analysed.openingRound?.enabled?'Opening Round detected.':'No Opening Round detected.'):'Post-2026 bye counts applied.'}`);}catch(_){toast('The AFL fixture file could not be read.');}});
       document.getElementById('opening-round-map')?.addEventListener('change',()=>{analysed=readOpeningRoundMapping(analysed);document.getElementById('season-round-preview').innerHTML=seasonRoundPreview(analysed);});
       document.getElementById('generate-pegs-fixture')?.addEventListener('click',()=>{const regular=Number(document.getElementById('season-regular-rounds').value||20),fixtures=generatePegsFixture(regular);document.getElementById('pegs-fixture-csv').value=pegsFixtureCsv(fixtures);document.getElementById('pegs-fixture-preview').innerHTML=seasonFixturePreview(fixtures);toast(`${regular}-round PEGS fixture generated.`);});
       document.getElementById('pegs-fixture-csv')?.addEventListener('input',e=>{document.getElementById('pegs-fixture-preview').innerHTML=seasonFixturePreview(parsePegsFixtureCsv(e.target.value));});
@@ -2394,7 +2766,7 @@
       startDraftTicker();
       const adminTick=()=>{const el=document.getElementById('admin-draft-countdown');if(el)el.textContent=clockText(draftSecondsRemaining(getDraftState()));};adminTick();
       document.getElementById('admin-draft-type')?.addEventListener('change',e=>{const box=document.getElementById('admin-draft-order-preview'),poolBox=document.getElementById('admin-draft-pool-status');if(box)box.innerHTML=draftOrderPreviewHtml(e.target.value);if(poolBox)poolBox.innerHTML=draftPoolStatusHtml(e.target.value);});
-      document.getElementById('refresh-draft-pool')?.addEventListener('click',async()=>{const btn=document.getElementById('refresh-draft-pool'),type=normalizedDraftType(document.getElementById('admin-draft-type').value),box=document.getElementById('admin-draft-pool-status');btn.disabled=true;try{await refreshCurrentDraftPool(type,(i,club)=>{if(box)box.innerHTML=`<div class="notice"><strong>Refreshing AFL player pool…</strong> ${Math.min(i,18)}/18 clubs${club&&club!=='DONE'?` · ${esc(club)}`:''}</div>`;});toast('Current AFL player pool captured and frozen-ready.');}catch(e){toast(e.message||'Draft pool refresh failed.');}finally{btn.disabled=false;renderCommissionerControls();}});
+      document.getElementById('refresh-draft-pool')?.addEventListener('click',async()=>{const btn=document.getElementById('refresh-draft-pool'),type=normalizedDraftType(document.getElementById('admin-draft-type').value),box=document.getElementById('admin-draft-pool-status');btn.disabled=true;try{await refreshCurrentDraftPool(type,(i,club)=>{if(box)box.innerHTML=`<div class="notice"><strong>Refreshing AFL player pool…</strong> ${Math.min(i,18)}/18 clubs${club&&club!=='DONE'?` · ${esc(club)}`:''}</div>`;});queueAutoBackup('draft_pool');toast('Current AFL player pool captured and frozen-ready.');}catch(e){toast(e.message||'Draft pool refresh failed.');}finally{btn.disabled=false;renderCommissionerControls();}});
       document.getElementById('start-draft')?.addEventListener('click',async()=>{const type=normalizedDraftType(document.getElementById('admin-draft-type').value),pool=draftPoolRecord(),season=draftSeasonFor(type);if(!pool?.complete||Number(pool.season)!==season||normalizedDraftType(pool.phase)!==type){toast('Refresh a complete 18-club current-price player pool before starting this draft.');return;}await syncServerAuthority();const ladderSnapshot=draftLadderOrder(type),picks=draftPickLedger(type,{ladderOrder:ladderSnapshot}),order=picks.map(p=>p.owner),now=new Date().toISOString(),value={active:true,type,season,rounds:draftRoundsFor(type),timerSeconds:180,currentIndex:0,currentPick:1,ladderSnapshot,baseOrder:picks.map(p=>p.originalOwner),picks,order,poolSessionId:pool.session_id,sessionId:'draft-'+Date.now(),startedAt:now,pickStartedAt:now,updatedAt:now,reorders:[]};saveDraftState(value);await logCommissioner('DRAFT_STARTED','draft',value.sessionId,{type,season,poolSessionId:pool.session_id,playerCount:pool.player_count});toast(`${value.season} ${value.type} draft is live. Pick 1 has 3 minutes.`);render();renderCommissionerControls();});
       document.getElementById('push-draft-back')?.addEventListener('click',async()=>{
         const before=getDraftState(),pick=Number(before.currentPick||1),lateTeam=currentDraftTeam(before),promotedTeam=nextDraftTeam(before);
@@ -2424,18 +2796,14 @@
       document.querySelectorAll('[data-reset-team-password]').forEach(btn=>btn.addEventListener('click',async()=>{const k=btn.dataset.resetTeamPassword;if(!confirm(`Generate a new six-letter password for ${team(k).owner}? Their old password will stop working.`))return;try{const x=await teamAccountAdmin('reset',k);teamCredentialCache=x.credential?[x.credential]:[];await loadTeamAccounts();toast(`${team(k).owner} password reset.`);renderCommissionerControls();}catch(e){toast(e.message||'Password reset failed.');}}));
     }
     if(commissionerTab==='backups'){
-      document.getElementById('create-manual-backup')?.addEventListener('click',async()=>{try{const id=await createServerBackup('MANUAL','Commissioner manual backup');await syncAudit();toast(`Backup #${id} created.`);renderCommissionerControls();}catch(e){toast(e.message||'Backup failed.');}});
+      document.getElementById('download-current-archive')?.addEventListener('click',async()=>{const btn=document.getElementById('download-current-archive');if(btn){btn.disabled=true;btn.textContent='Preparing Excel archive…';}try{const id=await exportCurrentLeagueExcel();await Promise.all([syncBackups(),syncAudit()]);toast(id?`Excel archive downloaded from restore point #${id}.`:'Excel archive downloaded.');renderCommissionerControls();}catch(e){if(btn){btn.disabled=false;btn.textContent='Download Excel archive';}toast(e.message||'Excel archive failed.');}});
+      document.getElementById('create-manual-backup')?.addEventListener('click',async()=>{const suggested=`Manual checkpoint · ${roundLabel(effectiveCurrentRound())}`;const entered=prompt('Name this restore point (optional):',suggested);if(entered===null)return;try{const id=await createServerBackup('MANUAL',String(entered||'').trim()||suggested);await syncAudit();toast(`Restore point #${id} created.`);renderCommissionerControls();}catch(e){toast(e.message||'Restore point failed.');}});
       document.getElementById('reload-backups')?.addEventListener('click',async()=>{await Promise.all([syncBackups(),syncAudit()]);renderCommissionerControls();});
-      document.querySelectorAll('[data-backup-json]').forEach(btn=>btn.addEventListener('click',()=>void exportBackupJson(btn.dataset.backupJson).catch(e=>toast(e.message))));
-      document.querySelectorAll('[data-backup-excel]').forEach(btn=>btn.addEventListener('click',()=>void exportBackupExcel(btn.dataset.backupExcel).catch(e=>toast(e.message))));
-      document.querySelectorAll('[data-backup-restore]').forEach(btn=>btn.addEventListener('click',async()=>{try{if(await restoreServerBackup(btn.dataset.backupRestore)){await syncAudit();toast('Backup restored. A pre-restore safeguard was created automatically.');render();renderCommissionerControls();}}catch(e){toast(e.message||'Restore failed.');}}));
+      document.querySelectorAll('[data-backup-excel]').forEach(btn=>btn.addEventListener('click',()=>void exportBackupExcel(btn.dataset.backupExcel).catch(e=>toast(e.message||'Excel archive failed.'))));
+      document.querySelectorAll('[data-backup-restore]').forEach(btn=>btn.addEventListener('click',async()=>{try{if(await restoreServerBackup(btn.dataset.backupRestore)){await syncAudit();toast('Restore completed. A pre-restore safeguard was created automatically.');render();renderCommissionerControls();}}catch(e){toast(e.message||'Restore failed.');}}));
     }
     if(commissionerTab==='figureheads'){
       document.querySelectorAll('[data-figurehead-select]').forEach(el=>el.addEventListener('change',()=>{const all=getFigureheadOverrides(),key=el.dataset.figureheadSelect;if(el.value)all[key]=el.value;else delete all[key];saveFigureheadOverrides(all);toast(el.value?`${team(key).name} figurehead pinned to ${el.value}.`:`${team(key).name} returned to automatic figurehead.`);render();renderCommissionerControls();}));
-    }
-    if(commissionerTab==='data'){
-      document.getElementById('export-admin-state').addEventListener('click',()=>{const data={version:12,exportedAt:new Date().toISOString(),overrides:getOverrides(),selectionOverrides:getSelectionOverrides(),actions:getCommissionerActions(),draftState:getDraftState(),proposalWindows:getProposalWindows(),scoringSnapshots:getScoringSnapshots(),figureheadOverrides:getFigureheadOverrides(),transactionReversals:getTransactionReversals(),proposals:proposalCache,seasonSetup:getSeasonSetup(),seasonResults:getSeasonResults(),liveFeed:getLiveFeed(),openingBank:getOpeningBank()};const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='pegs-commissioner-data-v12.json';a.click();URL.revokeObjectURL(a.href);toast('Commissioner data exported.');});
-      document.getElementById('import-admin-state').addEventListener('change',async e=>{const f=e.target.files?.[0];if(!f)return;try{const x=JSON.parse(await f.text());saveOverrides(x.overrides||{});saveSelectionOverrides(x.selectionOverrides||{});saveCommissionerActions(x.actions||[]);saveDraftState(x.draftState||{});if(x.proposalWindows)saveProposalWindows(x.proposalWindows);if(x.scoringSnapshots)saveScoringSnapshots(x.scoringSnapshots);if(x.figureheadOverrides)saveFigureheadOverrides(x.figureheadOverrides);if(x.transactionReversals)saveTransactionReversals(x.transactionReversals);if(x.seasonSetup)saveSeasonSetup(x.seasonSetup);if(x.seasonResults)saveSeasonResults(x.seasonResults);if(x.liveFeed)saveLiveFeed(x.liveFeed);if(x.openingBank)saveOpeningBank(x.openingBank);if(!backendConfigured())saveLocalProposals((x.proposals||[]).map(normalizeProposal));toast('Commissioner data restored.');render();renderCommissionerControls();}catch(_){toast('That backup could not be imported.');}});
     }
   }
 
@@ -2496,73 +2864,47 @@
     }
   });
 
-  const introLoader={el:document.getElementById('intro-loading-screen'),fill:document.getElementById('intro-loading-fill'),percent:document.getElementById('intro-loading-percent'),label:document.getElementById('intro-loading-label'),skip:document.getElementById('intro-loading-skip'),startedAt:Date.now(),hidden:false};
-
-  function setIntroProgress(value,label){
-    if(!introLoader.el||introLoader.hidden)return;
-    const pct=Math.max(0,Math.min(100,Math.round(Number(value)||0)));
-    if(introLoader.fill)introLoader.fill.style.width=`${pct}%`;
-    if(introLoader.percent)introLoader.percent.textContent=`${pct}%`;
-    if(label&&introLoader.label)introLoader.label.textContent=label;
-  }
-
-  function finishIntroLoader({label='Ready to play',immediate=false}={}){
-    if(!introLoader.el||introLoader.hidden)return Promise.resolve();
-    // Update the visible bar before marking the loader hidden; otherwise
-    // setIntroProgress intentionally ignores the final 100% update.
-    setIntroProgress(100,label);
-    introLoader.hidden=true;
-    if(window.__pegsIntroFailsafe){clearTimeout(window.__pegsIntroFailsafe);window.__pegsIntroFailsafe=0;}
-    const elapsed=Date.now()-introLoader.startedAt;
-    const wait=immediate?0:Math.max(0,1700-elapsed);
-    return new Promise(resolve=>setTimeout(resolve,wait)).then(()=>{
-      introLoader.el.classList.add('is-exiting');
-      setTimeout(()=>introLoader.el?.remove(),700);
-    });
-  }
-
-  setIntroProgress(7,'Warming up stadium lights…');
-  const introAppFailsafe=setTimeout(()=>{void finishIntroLoader({label:'League hub ready',immediate:true});},5500);
-  const finishIntroOriginal=finishIntroLoader;
-  // Keep a local failsafe handle so every normal finish path cancels it.
-  const finishIntroSafely=(options)=>{clearTimeout(introAppFailsafe);return finishIntroOriginal(options);};
-  introLoader.skip?.addEventListener('click',()=>{void finishIntroSafely({label:'Skipping intro…',immediate:true});});
+  setupAccessGate();
 
   document.getElementById('open-team-login')?.addEventListener('click',()=>{void teamLoginUI();teamDialog.showModal();});
-  document.getElementById('open-commissioner').addEventListener('click',()=>{commissionerUI();commissionerDialog.showModal();});
+  document.getElementById('open-commissioner')?.addEventListener('click',()=>{void commissionerUI();commissionerDialog.showModal();});
   commissionerDialog?.addEventListener('close',clearInteractionDraft);
   teamDialog?.addEventListener('close',clearInteractionDraft);
   window.addEventListener('hashchange',()=>{clearInteractionDraft();render();});
-  window.addEventListener('storage',e=>{if([OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,TRANSACTION_REVERSALS_KEY,DRAFT_STATE_KEY,PROPOSALS_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,DRAFT_POOL_KEY].includes(e.key)){if(e.key===PROPOSALS_KEY)proposalCache=getLocalProposals();backgroundRefreshUi();}});
+  window.addEventListener('storage',e=>{if([OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,TRANSACTION_REVERSALS_KEY,DRAFT_STATE_KEY,PROPOSALS_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,DRAFT_POOL_KEY].includes(e.key)){if(e.key===PROPOSALS_KEY)proposalCache=getLocalProposals();backgroundRefreshUi();}if(e.key===REMEMBERED_TEAM_LOGIN_KEY&&!siteAccessGranted())populateAccessGate();});
 
   // Lightweight non-UI test surface used by the bundled QA script.
-  window.__PEGS_TEST__={render,markInteractionDraft,clearInteractionDraft,backgroundRefreshUi,parseAflFixtureCsv,generatePegsFixture,validatePegsFixture,saveSeasonSetup,getSeasonSetup,saveLiveFeed,getLiveFeed,getSelectionOverrides,saveSelectionOverrides,saveOpeningBank,getOpeningBank,calcTeamRound,effectiveRoundRecord,scoreCountForRoundRecord,topPlayersForRound,effectiveLadder,projectedLadderForRound,liveRoundBadge,liveFeedCompleteForRound,normalizeAvailabilityStatus,unavailableForProjection,mergeProviderTeamRecord,preSeasonDraftOrder,draftPickLedger,teamRoundPlayers,availabilityInfo,currentSeason,effectiveCurrentRound,getProposalWindows,saveProposalWindows,proposalWindowOpen,getScoringSnapshots,saveScoringSnapshots,captureScoringSnapshot,scoringSnapshotForRound,scoringRostersForRound,futureScoringRound,nextUnfinalizedScoringRound,effectiveRosters,rosterSummary,rosterIsLegal,getTransactionReversals,saveTransactionReversals,visibleLegacyTransactions,transactionRecords,transactionPickRefs,transactionDependency,reverseTransaction,verifyCommissionerPassword,commissionerLoggedIn,teamLoggedIn,loggedTeamKey,clearBackendSession,clearCommissionerSession,dismissDialog,tradeActionFor,tradeImpactHtml,activeProposalStatus,submitProposal,respondTrade,approveProposal,getDraftState,saveDraftState,draftOrder,currentDraftTeam,nextDraftTeam,draftSecondsRemaining,draftIsOvertime,pushDraftPickBackLocal,advanceDraftLocal,getFigureheadOverrides,saveFigureheadOverrides,figureheadPlayer,figureheadAverage,playerPhotoUrl,playerProfileRoundCeiling,playerSeasonScoreHistory,playerPerformance,ordinal,teamFixtureRows,personalisedCurrentRound,completedTeamFixtures,personalisedLadderData,transactionInvolvesTeam,teamDashboardData,renderPersonalizedHome,finalsConfig,calculatedFinalsBracket,effectiveFinals,roundLabel,finalizeRound};
+  window.__PEGS_TEST__={render,backupSheetRows,currentLocalRecoverySnapshot,markInteractionDraft,clearInteractionDraft,backgroundRefreshUi,parseAflFixtureCsv,applySeasonFixtureRules,openingRoundBankingAllowed,normalizeSeasonSetup,generatePegsFixture,validatePegsFixture,saveSeasonSetup,getSeasonSetup,saveLiveFeed,getLiveFeed,getSelectionOverrides,saveSelectionOverrides,saveOpeningBank,getOpeningBank,calcTeamRound,effectiveRoundRecord,scoreCountForRoundRecord,topPlayersForRound,effectiveLadder,projectedLadderForRound,liveRoundBadge,liveFeedCompleteForRound,normalizeAvailabilityStatus,unavailableForProjection,mergeProviderTeamRecord,preSeasonDraftOrder,draftPickLedger,teamRoundPlayers,availabilityInfo,currentSeason,effectiveCurrentRound,getProposalWindows,saveProposalWindows,proposalWindowOpen,getScoringSnapshots,saveScoringSnapshots,captureScoringSnapshot,scoringSnapshotForRound,scoringRostersForRound,futureScoringRound,nextUnfinalizedScoringRound,effectiveRosters,rosterSummary,rosterIsLegal,getTransactionReversals,saveTransactionReversals,visibleLegacyTransactions,transactionRecords,transactionPickRefs,transactionDependency,reverseTransaction,verifyCommissionerPassword,commissionerLoggedIn,teamLoggedIn,loggedTeamKey,clearBackendSession,clearCommissionerSession,dismissDialog,tradeActionFor,tradeImpactHtml,activeProposalStatus,submitProposal,respondTrade,approveProposal,getDraftState,saveDraftState,draftOrder,currentDraftTeam,nextDraftTeam,draftSecondsRemaining,draftIsOvertime,pushDraftPickBackLocal,advanceDraftLocal,getFigureheadOverrides,saveFigureheadOverrides,figureheadPlayer,figureheadAverage,playerPhotoUrl,playerProfileRoundCeiling,playerSeasonScoreHistory,playerPerformance,ordinal,teamFixtureRows,personalisedCurrentRound,completedTeamFixtures,personalisedLadderData,transactionInvolvesTeam,teamDashboardData,renderPersonalizedHome,finalsConfig,calculatedFinalsBracket,effectiveFinals,roundLabel,finalizeRound,rememberedTeamLogin,saveRememberedTeamLogin,siteAccessGranted,lockSiteForLogin,settleEntryViewport,completeSiteEntry,populateAccessGate};
 
   if('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('./sw.js').catch(()=>{});
-  setIntroProgress(18,'Loading local league settings…');
   proposalCache=getLocalProposals();
-  setIntroProgress(36,'Rendering franchises and fixtures…');
   const seasonPill=document.getElementById('season-pill-year'); if(seasonPill)seasonPill.textContent=String(currentSeason());
   updateSessionUI();render();
-  setIntroProgress(58,'Base site ready…');
+
   if(backendConfigured()){
     (async()=>{
       try{
-        setIntroProgress(68,'Connecting to league server…');
         await refreshIdentity();
         await refreshCommissionerSession();
-        setIntroProgress(82,'Syncing scores, trades and draft state…');
-        await Promise.all([pullSharedState(),syncProposals(),loadDraftPool()]);
-        if(commissionerLoggedIn()){setIntroProgress(92,'Authorising commissioner controls…');await syncServerAuthority();}
-        const pill=document.getElementById('season-pill-year');if(pill)pill.textContent=String(currentSeason());
-        updateSessionUI();render();
-        await finishIntroSafely({label:'League hub ready'});
-      }catch(_){
-        await finishIntroSafely({label:'Loaded in offline mode'});
+        if(siteAccessGranted()){
+          void beginPostLoginSync();
+          if(commissionerLoggedIn())void syncServerAuthority().catch(()=>{});
+          const pill=document.getElementById('season-pill-year');if(pill)pill.textContent=String(currentSeason());
+          updateSessionUI();render();
+          await completeSiteEntry({teamKey:loggedTeamKey(),commissioner:commissionerLoggedIn()&&!teamLoggedIn()});
+        }else{
+          lockSiteForLogin();
+        }
+      }catch(e){
+        console.warn('PEGS login session restore failed',e);
+        lockSiteForLogin('Log in to your franchise to enter PEGS.');
       }
     })();
-    setInterval(()=>Promise.all([pullSharedState(),syncProposals(),loadDraftPool()]).then(()=>{const pill=document.getElementById('season-pill-year');if(pill)pill.textContent=String(currentSeason());backgroundRefreshUi();}).catch(()=>{}),10000);
+    setInterval(()=>{if(!siteAccessGranted())return;Promise.all([pullSharedState(),syncProposals(),loadDraftPool()]).then(()=>{const pill=document.getElementById('season-pill-year');if(pill)pill.textContent=String(currentSeason());backgroundRefreshUi();}).catch(()=>{});},10000);
     const refreshSeconds=Math.max(60,Number(CONFIG.liveRefreshSeconds||90));
-    setInterval(()=>{if(activeSeasonSetup()?.liveScoringEnabled!==false)void syncLiveProvider(false);},refreshSeconds*1000);
-  } else void finishIntroSafely({label:'League hub ready'});
+    setInterval(()=>{if(siteAccessGranted()&&activeSeasonSetup()?.liveScoringEnabled!==false)void syncLiveProvider(false);},refreshSeconds*1000);
+  }else{
+    lockSiteForLogin('Team Login needs the configured league server. Commissioner access remains available for this local preview.');
+  }
+
 })();

@@ -10,32 +10,100 @@
   <link rel="icon" href="pegs-icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="styles.css">
 </head>
-<body>
-  <div id="intro-loading-screen" class="intro-loading-screen intro-prototype3-screen" aria-live="polite" aria-label="Loading PEGS Supercoach Franchise">
-    <div class="intro-prototype3-stage" aria-hidden="true">
-      <img src="assets/intro-prototype3-stage.webp" alt="">
-      <span class="intro-prototype3-core"></span>
-    </div>
-
-    <div class="intro-prototype3-lower">
-      <div class="intro-prototype3-title-row" aria-hidden="true">
-        <span class="intro-prototype3-rule"></span>
-        <strong>LOADING PEGS SUPERCOACH FRANCHISE</strong>
-        <span class="intro-prototype3-rule"></span>
-      </div>
-
-      <div class="intro-prototype3-progress-wrap">
-        <div class="intro-progress" aria-hidden="true">
-          <div id="intro-loading-fill" class="intro-progress__fill"></div>
+<body class="pegs-access-locked">
+  <div id="access-gate" class="access-gate" aria-labelledby="access-login-title">
+    <img class="access-gate-bg" src="assets/stadium-theatrical.webp" alt="" aria-hidden="true">
+    <div class="access-gate-shade" aria-hidden="true"></div>
+    <main class="access-gate-shell">
+      <div class="access-hero-brand" aria-label="PEGS Supercoach Franchise">
+        <div class="access-hero-logos">
+          <img class="access-hero-afl" src="assets/intro/afl-emblem.png" alt="AFL logo">
+          <img class="access-hero-pegs" src="assets/intro/pegs-crest.png" alt="PEGS emblem">
         </div>
-        <strong id="intro-loading-percent" class="intro-prototype3-percent">0%</strong>
+        <strong>Same teams.<br>Higher stakes.</strong>
       </div>
 
-      <p id="intro-loading-label" class="screen-reader-only">Preparing league experience…</p>
-      <div class="intro-prototype3-mark" aria-hidden="true"><span>♛</span><strong>PS</strong></div>
-    </div>
+      <section class="access-login-card">
+        <div class="access-login-panel">
+          <span class="eyebrow">Franchise access</span>
+          <h1 id="access-login-title">Team Login</h1>
+          <p>Enter your franchise credentials to access PEGS.</p>
 
-    <button id="intro-loading-skip" class="intro-loading-skip intro-prototype3-skip" type="button">Skip intro</button>
+          <form id="access-login-form" novalidate>
+            <div class="field-group">
+              <label for="access-team-select">Coach username</label>
+              <select class="select" id="access-team-select" autocomplete="username" aria-describedby="access-team-help"></select>
+              <small id="access-team-help">Choose your PEGS franchise.</small>
+            </div>
+            <div class="field-group">
+              <label for="access-team-password">Password</label>
+              <input class="search-input access-password-input" id="access-team-password" type="password" autocomplete="current-password" spellcheck="false" autocapitalize="characters" placeholder="Enter password">
+            </div>
+            <label class="access-remember-row" for="access-remember-password">
+              <input id="access-remember-password" type="checkbox">
+              <span><strong>Remember password on this device</strong><small>Stored only in this browser. Avoid this option on a shared device.</small></span>
+            </label>
+            <p id="access-login-status" class="access-login-status" role="status" aria-live="polite"></p>
+            <button class="primary-button access-login-submit" id="access-login-submit" type="submit">Log in</button>
+          </form>
+
+          <button class="access-commissioner-link" id="access-commissioner" type="button">Commissioner Login</button>
+        </div>
+      </section>
+
+      <section id="access-auth-stage" class="access-auth-stage" aria-live="polite" aria-label="Authenticating your PEGS login">
+        <div class="access-auth-logos" aria-hidden="true">
+          <img src="assets/intro/afl-emblem.png" alt="">
+          <img src="assets/intro/pegs-crest.png" alt="">
+        </div>
+        <h2>Authenticating…</h2>
+        <div class="access-auth-spinner" aria-hidden="true"></div>
+        <ol class="access-auth-steps">
+          <li id="access-auth-step-1"><span></span>Verifying credentials</li>
+          <li id="access-auth-step-2"><span></span>Loading franchise data</li>
+          <li id="access-auth-step-3"><span></span>Preparing your experience</li>
+        </ol>
+      </section>
+
+      <p class="access-gate-tagline">PEGS Supercoach Franchise</p>
+    </main>
+  </div>
+
+  <div id="entry-transition" class="entry-transition" hidden aria-live="polite" aria-label="Entering PEGS Supercoach Franchise">
+    <img class="entry-transition-bg" src="assets/stadium-theatrical.webp" alt="" aria-hidden="true">
+    <div class="entry-transition-shade" aria-hidden="true"></div>
+    <div class="entry-blackout" aria-hidden="true"></div>
+    <div class="entry-atmosphere entry-atmosphere--one" aria-hidden="true"></div>
+    <div class="entry-atmosphere entry-atmosphere--two" aria-hidden="true"></div>
+    <div class="entry-floodlight entry-floodlight--left" aria-hidden="true"></div>
+    <div class="entry-floodlight entry-floodlight--right" aria-hidden="true"></div>
+
+    <div class="entry-animation-safe-frame">
+      <div class="entry-get-ready" aria-hidden="true">
+        <span>Get ready</span>
+        <i><b></b></i>
+      </div>
+
+      <div class="entry-logo-lockup" aria-hidden="true">
+        <img class="entry-logo-afl" src="assets/intro/afl-emblem.png" alt="">
+        <span class="entry-logo-divider"></span>
+        <img class="entry-logo-pegs" src="assets/intro/pegs-crest.png" alt="">
+      </div>
+
+      <div class="entry-tagline-lockup" aria-hidden="true">
+        <strong><span>Same teams.</span><span>Higher stakes.</span></strong>
+        <i></i>
+      </div>
+
+      <div class="entry-welcome-copy">
+        <span id="entry-welcome-kicker">Welcome back,</span>
+        <strong id="entry-welcome-name">Your franchise</strong>
+        <small id="entry-loading-label">PEGS Supercoach Franchise</small>
+      </div>
+
+      <div class="entry-final-caption" aria-hidden="true">PEGS Supercoach Franchise</div>
+      <span id="entry-animation-sentinel" class="entry-animation-sentinel" aria-hidden="true"></span>
+    </div>
   </div>
 
   <a class="skip-link" href="#main-content">Skip to content</a>
@@ -44,9 +112,7 @@
   <header class="site-header">
     <div class="shell header-inner">
       <a class="brand" href="#home" aria-label="PEGS home">
-        <span class="brand-ball" aria-hidden="true">
-          <svg viewBox="0 0 64 64" role="img"><ellipse cx="32" cy="32" rx="25" ry="16" transform="rotate(-28 32 32)"/><path d="M23 35l18-9M27 29l2 4m5-7l2 4m5-7l2 4"/></svg>
-        </span>
+        <span class="brand-crest" aria-hidden="true"><img src="assets/intro/pegs-crest.png" alt=""></span>
         <span class="brand-copy"><strong>PEGS</strong><small>Supercoach Franchise</small></span>
       </a>
       <nav class="desktop-nav" aria-label="Primary">
@@ -61,7 +127,7 @@
       </nav>
       <div class="header-actions">
         <span class="season-pill"><span class="status-dot"></span><span id="season-pill-year">2026</span></span>
-        <button class="team-login-button" id="open-team-login" aria-label="Team login"><span id="team-login-label">Team Login</span><span id="team-notification-dot" class="notification-dot" hidden></span></button>
+        <button class="team-login-button" id="open-team-login" aria-label="Team login"><span id="team-session-avatar" class="team-session-avatar" aria-hidden="true">T</span><span class="team-session-copy"><small id="team-session-kicker">Franchise</small><strong id="team-login-label">Team Login</strong></span><span id="team-notification-dot" class="notification-dot" hidden></span></button>
         <button class="icon-button" id="open-commissioner" aria-label="Commissioner login" title="Commissioner login">
           <span aria-hidden="true">C</span>
         </button>
@@ -72,12 +138,12 @@
   <main id="main-content" class="shell app-main" tabindex="-1"></main>
 
   <nav class="mobile-nav" aria-label="Mobile primary">
-    <button data-route="home"><span aria-hidden="true">H</span><small>Home</small></button>
-    <button data-route="matchups"><span aria-hidden="true">VS</span><small>Matchups</small></button>
-    <button data-route="teams"><span aria-hidden="true">T</span><small>Teams</small></button>
-    <button data-route="ladder"><span aria-hidden="true">#</span><small>Ladder</small></button>
-    <button data-route="transactions"><span aria-hidden="true">M</span><small>Moves</small></button>
-    <button data-route="draft"><span aria-hidden="true">D</span><small>Draft</small></button>
+    <button data-route="home"><span class="mobile-nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3.5 10.5 12 3l8.5 7.5V21h-6v-6h-5v6h-6Z"/></svg></span><small>Home</small></button>
+    <button data-route="matchups"><span class="mobile-nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M7 4h10v4a5 5 0 0 1-10 0Zm-3 1h3v4a4 4 0 0 1-3-4Zm13 0h3a4 4 0 0 1-3 4ZM12 13v4m-4 4h8m-6-4h4"/></svg></span><small>Matchups</small></button>
+    <button data-route="teams"><span class="mobile-nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm8-1a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5ZM2.5 20v-2.5A4.5 4.5 0 0 1 7 13h2a4.5 4.5 0 0 1 4.5 4.5V20Zm11-6.2h2.2a4 4 0 0 1 4 4V20h-4.2"/></svg></span><small>Team</small></button>
+    <button data-route="ladder"><span class="mobile-nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 20V10h4v10Zm6 0V4h4v16Zm6 0v-7h4v7Z"/></svg></span><small>Ladder</small></button>
+    <button data-route="transactions"><span class="mobile-nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 7h14m-4-4 4 4-4 4M20 17H6m4 4-4-4 4-4"/></svg></span><small>Moves</small></button>
+    <button data-route="draft"><span class="mobile-nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 4 7v5c0 5 3.5 8 8 9 4.5-1 8-4 8-9V7Zm0 4v10m-4-5h8"/></svg></span><small>Draft</small></button>
   </nav>
 
   <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
@@ -103,17 +169,6 @@
     </form>
     <div id="commissioner-content"></div>
   </dialog>
-
-
-  <script>
-    window.__pegsIntroFailsafe = window.setTimeout(function(){
-      var el=document.getElementById('intro-loading-screen');
-      if(!el)return;
-      el.classList.add('is-exiting');
-      window.setTimeout(function(){if(el&&el.parentNode)el.parentNode.removeChild(el);},800);
-    },7000);
-  </script>
-
   <script src="config.js"></script>
   <script src="league-data.js"></script>
   <script src="app.js"></script>

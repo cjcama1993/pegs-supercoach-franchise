@@ -104,6 +104,10 @@
   let lastRenderedHash = '';
   const loadedPlayerPortraits = new Set();
   const failedPlayerPortraits = new Set();
+  // Keep decoded team portraits alive after first load. Mobile Safari/Chrome can
+  // otherwise repeatedly re-rasterize the 28-player field while scrolling or
+  // switching back to Teams, which presents as headshot flicker.
+  const retainedPlayerPortraits = new Map();
 
   const UI_RENDER_STATE_KEYS = [OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,TRANSACTION_REVERSALS_KEY,DRAFT_STATE_KEY,PROPOSALS_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,DRAFT_POOL_KEY,FIGUREHEAD_OVERRIDE_KEY];
   function uiStateFingerprint(){ return UI_RENDER_STATE_KEYS.map(key=>localStorage.getItem(key)||'').join('\u241f') + '\u241e' + JSON.stringify(proposalCache||[]); }
@@ -182,6 +186,22 @@
     const teamCode=AFL_CLUB_TO_CODE[String(club||'').toUpperCase()]||AFL_NAME_TO_CODE[String(club||'').toUpperCase()]||String(club||'').toUpperCase();
     const fn=CONFIG.playerPhotoFunction||'supercoach-photo';
     return `${CONFIG.supabaseUrl.replace(/\/$/,'')}/functions/v1/${encodeURIComponent(fn)}?player=${encodeURIComponent(player)}&team=${encodeURIComponent(teamCode)}&v=3`;
+  }
+  function retainPlayerPortrait(src){
+    if(!src||failedPlayerPortraits.has(src)||retainedPlayerPortraits.has(src))return;
+    const img=new Image();
+    retainedPlayerPortraits.set(src,img);
+    img.decoding='async';
+    img.onload=()=>{
+      const finish=()=>{loadedPlayerPortraits.add(src);failedPlayerPortraits.delete(src);};
+      if(typeof img.decode==='function')img.decode().then(finish).catch(finish);else finish();
+    };
+    img.onerror=()=>{failedPlayerPortraits.add(src);loadedPlayerPortraits.delete(src);retainedPlayerPortraits.delete(src);};
+    img.src=src;
+  }
+  function warmTeamPortraitCache(teamKey){
+    const rows=effectiveRosters()?.[String(teamKey||'').toUpperCase()]||[];
+    for(const rec of rows){const src=playerPhotoUrl(rec.player,rec.club);if(src)retainPlayerPortrait(src);}
   }
   function figurehead(key,size=''){
     const t=team(key),p=figureheadPlayer(key),src=playerPhotoUrl(p.player,p.club),initials=String(p.player||t.owner).split(/\s+/).slice(0,2).map(x=>x[0]||'').join('').toUpperCase();
@@ -895,6 +915,7 @@
     siteEntryCompleted=true;
     siteEntryTransitioning=false;
     updateSessionUI();render();
+    if(k)setTimeout(()=>warmTeamPortraitCache(k),0);
     setTimeout(()=>main?.focus({preventScroll:true}),30);
   }
   function beginPostLoginSync(){
@@ -1848,7 +1869,8 @@
 
   function directPlayerPortrait(player,size=''){
     const src=playerPhotoUrl(player.player,player.club),initials=String(player.player||'').split(/\s+/).slice(0,2).map(x=>x[0]||'').join('').toUpperCase(),usableSrc=src&&!failedPlayerPortraits.has(src),ready=usableSrc&&loadedPlayerPortraits.has(src);
-    return `<span class="field-player-portrait ${size} ${ready?'photo-ready':''}" title="${esc(player.player)}"><span>${esc(initials||'?')}</span>${usableSrc?`<img src="${esc(src)}" data-player-portrait="${esc(src)}" alt="" loading="${size==='field'?'eager':'lazy'}" decoding="async" referrerpolicy="no-referrer">`:''}</span>`;
+    if(usableSrc)retainPlayerPortrait(src);
+    return `<span class="field-player-portrait ${size} ${ready?'photo-ready':''}" title="${esc(player.player)}"><span>${esc(initials||'?')}</span>${usableSrc?`<img src="${esc(src)}" data-player-portrait="${esc(src)}" alt="" loading="${size==='field'?'eager':'lazy'}" decoding="async" fetchpriority="low" referrerpolicy="no-referrer">`:''}</span>`;
   }
 
   function aflFieldPlayerCard(player,teamKey=''){
@@ -1878,6 +1900,27 @@
       </div>
       <div class="afl-field-goals bottom" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
     </div>`;
+  }
+
+  function rookieFieldCard(player,teamKey=''){
+    const onField=String(player.status||'').toLowerCase()==='field';
+    return `<button type="button" class="field-rookie-card player-profile-trigger ${onField?'is-on-field':'is-interchange'}" data-action="open-player-profile" data-team="${esc(teamKey)}" data-player="${esc(player.player)}" aria-label="Open ${esc(player.player)} player profile">
+      ${directPlayerPortrait(player,'rookie')}
+      <span class="field-rookie-copy"><strong>${esc(player.player)}</strong><span>${esc(player.club)} · ${esc(player.position)}</span><small>${money(player.salary)} · ${onField?'Currently on Field':'Interchange'}</small></span>
+      <span class="field-rookie-status ${onField?'field':'interchange'}">${onField?'FIELD':'INT'}</span>
+    </button>`;
+  }
+
+  function teamRookieBench(roster,teamKey=''){
+    const rookies=roster.filter(p=>String(p.contract||'').toLowerCase()==='rookie').sort((a,b)=>{
+      const statusA=String(a.status||'').toLowerCase()==='field'?0:1,statusB=String(b.status||'').toLowerCase()==='field'?0:1;
+      return statusA-statusB||String(a.position||'').localeCompare(String(b.position||''))||String(a.player||'').localeCompare(String(b.player||''));
+    });
+    if(!rookies.length)return '';
+    return `<section class="field-rookie-bench" aria-label="Rookie listed players">
+      <div class="field-rookie-bench-head"><div><span class="eyebrow">Just off the field</span><h3>Rookie List</h3></div><span class="badge neutral">${rookies.length} rookie${rookies.length===1?'':'s'}</span></div>
+      <div class="field-rookie-list">${rookies.map(p=>rookieFieldCard(p,teamKey)).join('')}</div>
+    </section>`;
   }
 
   function rosterListRow(player,teamKey=''){
@@ -1987,6 +2030,7 @@
   function renderTeamDetail(key,personalizedLanding=false) {
     const t = effectiveTeam(key);
     const roster = effectiveRosters()[t.key] || [];
+    warmTeamPortraitCache(t.key);
     const regular=Number(activeSeasonSetup()?.pegsRegularRounds||20),regularScores=completedTeamFixtures(t.key).filter(x=>Number(x.round)<=regular).map(x=>Number(x.ownScore||0)).filter(Number.isFinite);
     const avg = regularScores.length ? Math.round(regularScores.reduce((a,b)=>a+b,0)/regularScores.length) : 0;
     const filters = ['ALL','DEF','MID','FWD','RUC','INTERCHANGE'];
@@ -2009,6 +2053,7 @@
         <div class="team-afl-field-panel">
           <div class="team-roster-panel-head"><div><span class="eyebrow">Starting field</span><h2>On-field 28</h2></div><span class="badge green">${roster.filter(p=>String(p.status).toLowerCase()==='field').length} players</span></div>
           ${teamAflField(roster,t.key)}
+          ${teamRookieBench(roster,t.key)}
         </div>
       </section>`;
     bindInterchangeRequest(t.key);
@@ -2920,7 +2965,7 @@
   window.addEventListener('storage',e=>{if([OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,TRANSACTION_REVERSALS_KEY,DRAFT_STATE_KEY,PROPOSALS_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,DRAFT_POOL_KEY].includes(e.key)){if(e.key===PROPOSALS_KEY)proposalCache=getLocalProposals();backgroundRefreshUi();}if(e.key===REMEMBERED_TEAM_LOGIN_KEY&&!siteAccessGranted())populateAccessGate();});
 
   // Lightweight non-UI test surface used by the bundled QA script.
-  window.__PEGS_TEST__={render,backupSheetRows,currentLocalRecoverySnapshot,markInteractionDraft,clearInteractionDraft,backgroundRefreshUi,parseAflFixtureCsv,applySeasonFixtureRules,openingRoundBankingAllowed,normalizeSeasonSetup,generatePegsFixture,validatePegsFixture,saveSeasonSetup,getSeasonSetup,saveLiveFeed,getLiveFeed,getSelectionOverrides,saveSelectionOverrides,saveOpeningBank,getOpeningBank,calcTeamRound,effectiveRoundRecord,scoreCountForRoundRecord,topPlayersForRound,effectiveLadder,projectedLadderForRound,liveRoundBadge,liveFeedCompleteForRound,normalizeAvailabilityStatus,unavailableForProjection,mergeProviderTeamRecord,preSeasonDraftOrder,draftPickLedger,teamRoundPlayers,availabilityInfo,currentSeason,effectiveCurrentRound,getProposalWindows,saveProposalWindows,proposalWindowOpen,getScoringSnapshots,saveScoringSnapshots,captureScoringSnapshot,scoringSnapshotForRound,scoringRostersForRound,futureScoringRound,nextUnfinalizedScoringRound,effectiveRosters,rosterSummary,rosterIsLegal,getTransactionReversals,saveTransactionReversals,visibleLegacyTransactions,transactionRecords,transactionPickRefs,transactionDependency,reverseTransaction,verifyCommissionerPassword,commissionerLoggedIn,teamLoggedIn,loggedTeamKey,clearBackendSession,clearCommissionerSession,dismissDialog,tradeActionFor,tradeImpactHtml,activeProposalStatus,submitProposal,respondTrade,approveProposal,getDraftState,saveDraftState,draftOrder,currentDraftTeam,nextDraftTeam,draftSecondsRemaining,draftIsOvertime,pushDraftPickBackLocal,advanceDraftLocal,getFigureheadOverrides,saveFigureheadOverrides,figureheadPlayer,figureheadAverage,playerPhotoUrl,playerProfileRoundCeiling,playerSeasonScoreHistory,playerPerformance,ordinal,teamFixtureRows,personalisedCurrentRound,completedTeamFixtures,personalisedLadderData,transactionInvolvesTeam,teamDashboardData,renderPersonalizedHome,finalsConfig,calculatedFinalsBracket,effectiveFinals,roundLabel,finalizeRound,rememberedTeamLogin,saveRememberedTeamLogin,siteAccessGranted,lockSiteForLogin,settleEntryViewport,completeSiteEntry,populateAccessGate};
+  window.__PEGS_TEST__={render,backupSheetRows,currentLocalRecoverySnapshot,markInteractionDraft,clearInteractionDraft,backgroundRefreshUi,parseAflFixtureCsv,applySeasonFixtureRules,openingRoundBankingAllowed,normalizeSeasonSetup,generatePegsFixture,validatePegsFixture,saveSeasonSetup,getSeasonSetup,saveLiveFeed,getLiveFeed,getSelectionOverrides,saveSelectionOverrides,saveOpeningBank,getOpeningBank,calcTeamRound,effectiveRoundRecord,scoreCountForRoundRecord,topPlayersForRound,effectiveLadder,projectedLadderForRound,liveRoundBadge,liveFeedCompleteForRound,normalizeAvailabilityStatus,unavailableForProjection,mergeProviderTeamRecord,preSeasonDraftOrder,draftPickLedger,teamRoundPlayers,availabilityInfo,currentSeason,effectiveCurrentRound,getProposalWindows,saveProposalWindows,proposalWindowOpen,getScoringSnapshots,saveScoringSnapshots,captureScoringSnapshot,scoringSnapshotForRound,scoringRostersForRound,futureScoringRound,nextUnfinalizedScoringRound,effectiveRosters,rosterSummary,rosterIsLegal,getTransactionReversals,saveTransactionReversals,visibleLegacyTransactions,transactionRecords,transactionPickRefs,transactionDependency,reverseTransaction,verifyCommissionerPassword,commissionerLoggedIn,teamLoggedIn,loggedTeamKey,clearBackendSession,clearCommissionerSession,dismissDialog,tradeActionFor,tradeImpactHtml,activeProposalStatus,submitProposal,respondTrade,approveProposal,getDraftState,saveDraftState,draftOrder,currentDraftTeam,nextDraftTeam,draftSecondsRemaining,draftIsOvertime,pushDraftPickBackLocal,advanceDraftLocal,getFigureheadOverrides,saveFigureheadOverrides,figureheadPlayer,figureheadAverage,playerPhotoUrl,warmTeamPortraitCache,teamRookieBench,playerProfileRoundCeiling,playerSeasonScoreHistory,playerPerformance,ordinal,teamFixtureRows,personalisedCurrentRound,completedTeamFixtures,personalisedLadderData,transactionInvolvesTeam,teamDashboardData,renderPersonalizedHome,finalsConfig,calculatedFinalsBracket,effectiveFinals,roundLabel,finalizeRound,rememberedTeamLogin,saveRememberedTeamLogin,siteAccessGranted,lockSiteForLogin,settleEntryViewport,completeSiteEntry,populateAccessGate};
 
   if('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('./sw.js').catch(()=>{});
   proposalCache=getLocalProposals();

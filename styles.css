@@ -1194,3 +1194,86 @@ body:not(.pegs-access-locked) .stadium-glow{
   .final-team,.final-team .team-identity,.final-team .team-meta,.final-score{min-width:0}
   .final-team .team-identity{justify-content:center}
 }
+
+
+/* v14.7.3: stable mobile field portraits + rookie list immediately off field */
+.field-rookie-bench{
+  margin-top:12px;
+  padding:14px;
+  border:1px solid rgba(84,160,232,.22);
+  border-radius:16px;
+  background:linear-gradient(155deg,rgba(13,31,45,.96),rgba(5,17,27,.98));
+  box-shadow:0 12px 26px rgba(0,0,0,.18);
+}
+.field-rookie-bench-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:10px}
+.field-rookie-bench-head h3{margin:2px 0 0;font-size:18px}
+.field-rookie-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
+.field-rookie-card{
+  display:grid;
+  grid-template-columns:auto minmax(0,1fr) auto;
+  align-items:center;
+  gap:9px;
+  width:100%;
+  min-width:0;
+  padding:8px 9px;
+  border:1px solid rgba(255,255,255,.09);
+  border-radius:12px;
+  color:inherit;
+  text-align:left;
+  background:linear-gradient(145deg,rgba(16,36,51,.96),rgba(8,23,34,.96));
+}
+.field-rookie-card:hover{border-color:rgba(84,160,232,.38);background:linear-gradient(145deg,rgba(20,44,62,.98),rgba(9,26,38,.98))}
+.field-rookie-card.is-on-field{border-color:rgba(76,190,119,.24)}
+.field-player-portrait.rookie{width:38px;height:43px;border-radius:10px}
+.field-player-portrait.rookie>span{font-size:8px}
+.field-rookie-copy{min-width:0}
+.field-rookie-copy strong,.field-rookie-copy span,.field-rookie-copy small{display:block;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.field-rookie-copy strong{font-size:11px;color:#f6fbff}
+.field-rookie-copy span{margin-top:2px;font-size:8px;color:#a9bed0;font-weight:800}
+.field-rookie-copy small{margin-top:2px;font-size:8px;color:#71899b}
+.field-rookie-status{padding:4px 6px;border-radius:999px;border:1px solid rgba(255,255,255,.1);font-size:8px;line-height:1;font-weight:950;letter-spacing:.05em;color:#adc1d2;background:rgba(255,255,255,.04)}
+.field-rookie-status.field{color:#a9edbd;border-color:rgba(76,190,119,.24);background:rgba(76,190,119,.07)}
+
+@media(max-width:780px){
+  /* iOS/Android GPU hardening: avoid 28 simultaneous blur/filter/opacity layers. */
+  .afl-field-player{
+    -webkit-backdrop-filter:none!important;
+    backdrop-filter:none!important;
+    background:linear-gradient(180deg,rgba(8,28,17,.97),rgba(3,18,10,.96));
+  }
+  .afl-field-shell::after{mix-blend-mode:normal;opacity:.32}
+  .field-player-portrait.field{
+    contain:layout paint;
+    -webkit-backface-visibility:hidden;
+    backface-visibility:hidden;
+  }
+  .field-player-portrait.field>span{transition:none!important}
+  .field-player-portrait.field img{
+    opacity:1!important;
+    transition:none!important;
+    transform:none!important;
+    filter:none!important;
+    -webkit-backface-visibility:hidden;
+    backface-visibility:hidden;
+    pointer-events:none;
+  }
+  .field-rookie-bench{margin-top:9px;padding:11px 10px;border-radius:14px}
+  .field-rookie-bench-head{align-items:center;margin-bottom:8px}
+  .field-rookie-bench-head h3{font-size:16px}
+  .field-rookie-list{
+    display:flex;
+    gap:7px;
+    overflow-x:auto;
+    scroll-snap-type:x proximity;
+    overscroll-behavior-x:contain;
+    scrollbar-width:none;
+    padding:1px 1px 5px;
+  }
+  .field-rookie-list::-webkit-scrollbar{display:none}
+  .field-rookie-card{flex:0 0 min(82%,270px);scroll-snap-align:start;padding:7px 8px}
+}
+
+@media(max-width:420px){
+  .field-rookie-bench-head .badge{font-size:8px;padding-inline:7px}
+  .field-rookie-card{flex-basis:min(88%,260px)}
+}

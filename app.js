@@ -100,6 +100,13 @@
   // the active DOM until the user navigates or completes an action.
   let interactionDraftDirty = false;
   let backgroundRenderPending = false;
+  let lastRenderedStateFingerprint = '';
+  let lastRenderedHash = '';
+  const loadedPlayerPortraits = new Set();
+  const failedPlayerPortraits = new Set();
+
+  const UI_RENDER_STATE_KEYS = [OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,TRANSACTION_REVERSALS_KEY,DRAFT_STATE_KEY,PROPOSALS_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,DRAFT_POOL_KEY,FIGUREHEAD_OVERRIDE_KEY];
+  function uiStateFingerprint(){ return UI_RENDER_STATE_KEYS.map(key=>localStorage.getItem(key)||'').join('\u241f') + '\u241e' + JSON.stringify(proposalCache||[]); }
 
   const DRAFT_ROUNDS = { 'Pre-Season': 5, 'Mid-Season': 10 };
   const OPENING_ROUND_LAST_SEASON = 2026;
@@ -116,6 +123,8 @@
   }
   function backgroundRefreshUi({commissioner=false}={}){
     updateSessionUI();
+    const nextFingerprint=uiStateFingerprint();
+    if(nextFingerprint===lastRenderedStateFingerprint)return false;
     if(interactionDraftDirty){backgroundRenderPending=true;return false;}
     render();
     if(commissioner&&commissionerDialog.open)renderCommissionerControls();
@@ -1485,7 +1494,10 @@
     const finalized=roundFinalized(round); if(finalized)return {status:'FT',gameStatus:'FT',source:'Finalised',projection:Number(p.score||0),actual:Number(p.score||0)};
     if(futureScoringRound(round))return {status:'TBC',gameStatus:'PRE',source:'Future round - scoring locked',projection:Number(p.projected||baselineProjection(p.player,0)),actual:null};
     if(p.scoreSource==='Workbook result · roster adjusted')return {status:'FT',gameStatus:'FT',source:p.scoreSource,projection:Number(p.projected||p.score||0),actual:Number(p.score||0)};
-    if(!activeSeasonSetup() && !teamLoggedIn() && currentSeason()===Number(D.meta.season) && D.roundScores[String(round)]?.[teamKey]) return {status:'FT',gameStatus:'FT',source:p.scoreSource||'Workbook result',projection:Number(p.projected||p.score||0),actual:Number(p.score||0)};
+    // Once the bundled season is complete, its workbook scores are historical records
+    // and must remain visible to authenticated team users. Team login is now mandatory,
+    // so gating this branch on !teamLoggedIn() incorrectly hid archived 2026 scores.
+    if(!activeSeasonSetup() && currentSeason()===Number(D.meta.season) && D.roundScores[String(round)]?.[teamKey]) return {status:'FT',gameStatus:'FT',source:p.scoreSource||'Workbook result',projection:Number(p.projected||p.score||0),actual:Number(p.score||0)};
     if(openingRoundBankingAllowed(currentSeason())&&p.scoreSource==='Opening Round banked')return {status:'BANKED',gameStatus:'FT',source:'OR bank',projection:Number(p.score||0),actual:Number(p.score||0)};
     const roundRec=effectiveRoundRecord(round),clubCode=normalizeAflCode(p.club),bankApplies=openingRoundBankingAllowed(currentSeason())&&(roundRec.bankClubs||[]).includes(clubCode),onBye=(roundRec.byeClubs||[]).includes(clubCode);
     if(bankApplies){const bank=getOpeningBank()?.[String(currentSeason())]?.players?.[canonicalPlayerName(p.player)];if(bank&&bank.actual!==null&&bank.actual!==undefined)return {status:'BANKED',gameStatus:'FT',source:'Opening Round bank',projection:Number(bank.actual||0),actual:Number(bank.actual||0)};return {status:'BYE',gameStatus:'PRE',source:'AFL bye - no Opening Round score',projection:0,actual:null};}
@@ -1519,14 +1531,23 @@
         score=0; played=false; liveValue=0;
       } else if(info.gameStatus==='LIVE'){
         score=Number(info.actual||0); played=score>0; liveValue=Math.max(score,Number(info.projection||0));
-      } else if(Number(p.score||0)>0 && currentSeason()===Number(D.meta.season) && !activeSeasonSetup() && !teamLoggedIn()){
+      } else if(Number(p.score||0)>0 && currentSeason()===Number(D.meta.season) && !activeSeasonSetup()){
+        // Bundled scores are authoritative history once the season is archived/completed.
+        // Authenticated team users must see the same historical record as public/admin views.
         score=Number(p.score||0); played=true; liveValue=score; status='FT';
       }
       return {...p,score,played,liveValue,availability:status,gameStatus:info.gameStatus,feedSource:info.source,feedProjection:Number(info.projection||0)};
     });
     const actualRank=[...players].sort((a,b)=>b.score-a.score||b.liveValue-a.liveValue),actualCounted=new Set(actualRank.slice(0,topN).map(p=>p.player));
     const liveRank=[...players].sort((a,b)=>b.liveValue-a.liveValue||b.score-a.score),liveCounted=new Set(liveRank.slice(0,topN).map(p=>p.player));
-    const actual=actualRank.slice(0,topN).reduce((s,p)=>s+p.score,0),projected=liveRank.slice(0,topN).reduce((s,p)=>s+p.liveValue,0);
+    let actual=actualRank.slice(0,topN).reduce((s,p)=>s+p.score,0);const projected=liveRank.slice(0,topN).reduce((s,p)=>s+p.liveValue,0);
+    // For the completed bundled season, the official archived team total is authoritative.
+    // The late Round 23 workbook player snapshot has a handful of small source differences
+    // versus the confirmed final team totals. Use the confirmed total unless a Commissioner
+    // has deliberately corrected an individual score for this exact team/round.
+    const archivedTotals=D.roundTotals?.[String(round)]||D.roundTotals?.[round];
+    const teamOverridePrefix=`${round}|${teamKey}|`,hasTeamRoundOverride=Object.keys(getOverrides()).some(id=>String(id).startsWith(teamOverridePrefix));
+    if(!activeSeasonSetup()&&currentSeason()===Number(D.meta.season)&&Boolean(D.meta.seasonComplete)&&archivedTotals&&Object.prototype.hasOwnProperty.call(archivedTotals,teamKey)&&!hasTeamRoundOverride){actual=Number(archivedTotals[teamKey]||0);}
     const preRoundProjection=[...players].map(p=>({...p,effectiveFeedProjection:unavailableForProjection(p.availability)?0:p.feedProjection})).sort((a,b)=>b.effectiveFeedProjection-a.effectiveFeedProjection).slice(0,topN).reduce((s,p)=>s+p.effectiveFeedProjection,0);
     return {players,actual:Math.round(actual),projected:Math.round(projected),preRoundProjection:Math.round(preRoundProjection),actualCounted,liveCounted,topN};
   }
@@ -1566,7 +1587,9 @@
 
   function routeTo(route) {
     clearInteractionDraft();
-    location.hash = route.startsWith('#') ? route : '#' + route;
+    const next=route.startsWith('#')?route:'#'+route;
+    if(location.hash!==next) location.hash=next;
+    render();
   }
 
   function currentRoute() {
@@ -1824,8 +1847,8 @@
   }
 
   function directPlayerPortrait(player,size=''){
-    const src=playerPhotoUrl(player.player,player.club),initials=String(player.player||'').split(/\s+/).slice(0,2).map(x=>x[0]||'').join('').toUpperCase();
-    return `<span class="field-player-portrait ${size}" title="${esc(player.player)}"><span>${esc(initials||'?')}</span>${src?`<img src="${esc(src)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" onload="this.parentElement.classList.add('photo-ready')" onerror="this.remove()">`:''}</span>`;
+    const src=playerPhotoUrl(player.player,player.club),initials=String(player.player||'').split(/\s+/).slice(0,2).map(x=>x[0]||'').join('').toUpperCase(),usableSrc=src&&!failedPlayerPortraits.has(src),ready=usableSrc&&loadedPlayerPortraits.has(src);
+    return `<span class="field-player-portrait ${size} ${ready?'photo-ready':''}" title="${esc(player.player)}"><span>${esc(initials||'?')}</span>${usableSrc?`<img src="${esc(src)}" data-player-portrait="${esc(src)}" alt="" loading="${size==='field'?'eager':'lazy'}" decoding="async" referrerpolicy="no-referrer">`:''}</span>`;
   }
 
   function aflFieldPlayerCard(player,teamKey=''){
@@ -1868,12 +1891,18 @@
   function playerProfileRoundCeiling(){
     const season=currentSeason(),setup=activeSeasonSetup(),setupRound=Number(setup?.currentRound);
     if(Number.isFinite(setupRound)&&setupRound>0)return Math.floor(setupRound);
+    // A completed bundled season is historical, not future data. This check must come
+    // before stale live-feed/finalised-state fallbacks: the old backend may only contain
+    // early 2026 rounds, but it must not truncate the completed archive.
+    if(!setup && season===Number(D.meta?.season||0) && Boolean(D.meta?.seasonComplete)){
+      const bundledRounds=Object.keys(D.roundScores||{}).map(Number).filter(r=>Number.isFinite(r)&&r>0);
+      return Math.max(Number(D.meta?.completedThroughRound||0),Number(D.meta?.currentRound||0),...(bundledRounds.length?bundledRounds:[1]));
+    }
     const feed=getLiveFeed(),feedRound=Number(feed?.round);
     if(Number(feed?.season)===season&&Number.isFinite(feedRound)&&feedRound>0)return Math.floor(feedRound);
     const finalized=Object.keys(getSeasonResults()?.[String(season)]||{}).map(Number).filter(r=>Number.isFinite(r)&&r>0);
     if(finalized.length)return Math.max(...finalized)+1;
-    // The bundled workbook may contain later/final-season rounds for testing/history.
-    // Never use its meta.currentRound as a live profile ceiling because that can expose future scores.
+    // During a live/incomplete season, never expose bundled future rounds.
     return 1;
   }
 
@@ -1939,6 +1968,22 @@
     requestAnimationFrame(()=>dialog.querySelector('[data-player-profile-close]')?.focus());
   }
 
+  function interchangeRequestPanel(teamKey){
+    if(!teamLoggedIn()||String(teamKey)!==loggedTeamKey())return '';
+    return `<section class="card card-pad team-interchange-request"><div class="section-title"><div><span class="eyebrow">Roster management</span><h2>Interchange Request</h2></div><span class="badge neutral">Commissioner approval</span></div><p class="muted-copy">Move one Interchange player onto the Field and one Field player to Interchange. Contracts and salaries stay unchanged. Dual-position players nominate the PEGS position used when entering the Field.</p><input type="hidden" id="proposal-swap-team" value="${esc(teamKey)}"><div class="form-grid interchange-request-grid"><div class="field-group"><label>Interchange → Field</label><select class="select" id="proposal-swap-in">${playerOptions(teamKey,'Interchange','Select interchange player')}</select></div><div class="field-group"><label>Field → Interchange</label><select class="select" id="proposal-swap-out">${playerOptions(teamKey,'Field','Select field player')}</select></div><div class="field-group" id="proposal-swap-position-group" style="display:none"><label for="proposal-swap-position">PEGS Field position</label><select class="select" id="proposal-swap-position"></select><small class="field-help">For a dual-position player, choose the fixed PEGS position used on the Field.</small></div></div><div id="proposal-swap-validation" style="margin-top:14px"></div><div class="button-row"><button class="primary-button" id="submit-swap-proposal" disabled>Submit Interchange Request</button></div></section>`;
+  }
+
+  function bindInterchangeRequest(teamKey){
+    const si=document.getElementById('proposal-swap-in'),so=document.getElementById('proposal-swap-out'),sp=document.getElementById('proposal-swap-position'),spg=document.getElementById('proposal-swap-position-group'),sv=document.getElementById('proposal-swap-validation'),submitSwap=document.getElementById('submit-swap-proposal');
+    if(!si||!so||!sp||!spg||!sv||!submitSwap)return;
+    const usedCount=k=>visibleLegacyTransactions().filter(x=>x.type==='Rookie swap'&&x.team===k).length+getCommissionerActions().filter(x=>x.type==='Rookie swap'&&x.team===k&&x.status==='CONFIRMED').length;
+    const swapIncoming=()=>((effectiveRosters()[teamKey]||[]).find(p=>p.player===si.value)||null);
+    const validateSwap=()=>{const rec=swapIncoming(),choices=positionChoices(rec?.position||''),fieldPosition=String(sp?.value||choices[0]||'').toUpperCase(),before=effectiveRosters(),action={type:'Rookie swap',status:'CONFIRMED',team:teamKey,playerIn:si.value,playerOut:so.value,playerInPosition:fieldPosition},after=effectiveRosters(action),validPosition=Boolean(rec&&choices.includes(fieldPosition)),ok=Boolean(si.value&&so.value)&&validPosition&&usedCount(teamKey)<D.rules.maxSwaps&&rosterIsLegal(after[teamKey]||[]);sv.innerHTML=(si.value&&so.value?rosterImpactTeamHtml(teamKey,before[teamKey]||[],after[teamKey]||[],'After proposed interchange request'):'<div class="notice">Select the Interchange player coming in and the Field player going out.</div>')+`<div class="notice"><strong>Season swaps:</strong> ${usedCount(teamKey)} / ${D.rules.maxSwaps} already confirmed.${choices.length>1?` <strong>${esc(rec.player)}</strong> is dual-position; ${esc(fieldPosition||'choose a position')} will be used on the Field.`:''}</div>`+(!ok&&si.value&&so.value?'<div class="notice danger">This request is blocked until the resulting roster passes every salary, list and Field-position rule.</div>':'');submitSwap.disabled=!ok;return ok;};
+    const refreshSwapPosition=()=>{const rec=swapIncoming(),choices=positionChoices(rec?.position||'');sp.innerHTML=choices.map(pos=>`<option value="${esc(pos)}">${esc(pos)}</option>`).join('');sp.disabled=!choices.length;spg.style.display=choices.length>1?'block':'none';if(choices.length)sp.value=choices[0];validateSwap();};
+    si.addEventListener('change',refreshSwapPosition);so.addEventListener('change',validateSwap);sp.addEventListener('change',validateSwap);refreshSwapPosition();
+    submitSwap.addEventListener('click',async()=>{if(!validateSwap())return;try{await submitProposal({type:'SWAP',phase:'In-Season',proposerTeam:teamKey,payload:{playerIn:si.value,playerOut:so.value,fieldPosition:String(sp.value||'').toUpperCase()}});toast('Interchange Request sent to the Commissioner.');renderTeamDetail(teamKey,true);}catch(e){toast(e.message||'Could not submit the Interchange Request.');}});
+  }
+
   function renderTeamDetail(key,personalizedLanding=false) {
     const t = effectiveTeam(key);
     const roster = effectiveRosters()[t.key] || [];
@@ -1954,6 +1999,7 @@
         <div><span class="badge ${teamValidity(t)?'green':'red'}">${teamValidity(t)?'All cap tests passed':'Roster requires review'}</span><h1>${esc(t.owner)}</h1><p>${esc(t.name)} - ${esc(t.code)}</p><div class="stat-strip" style="grid-template-columns:repeat(3,1fr);margin-bottom:0"><div class="stat-box"><span>Team score avg</span><strong>${avg}</strong></div><div class="stat-box"><span>Field players</span><strong>${t.counts.field}</strong></div><div class="stat-box"><span>Interchange</span><strong>${t.counts.interchange}</strong></div></div></div>
         <div class="cap-stack">${capMeter('Main contract cap',t.caps.main,D.rules.mainContractCap)}${capMeter('Field cap',t.caps.field,D.rules.fieldCap)}${capMeter('Rookie contract cap',t.caps.rookie,D.rules.rookieContractCap)}</div>
       </section>
+      ${interchangeRequestPanel(t.key)}
       <section class="team-roster-field-layout">
         <div class="team-roster-list-panel">
           <div class="team-roster-panel-head"><div><span class="eyebrow">Contracted list</span><h2>Player list</h2></div><span class="badge neutral">${visible.length} shown</span></div>
@@ -1965,6 +2011,7 @@
           ${teamAflField(roster,t.key)}
         </div>
       </section>`;
+    bindInterchangeRequest(t.key);
   }
 
   function recentTeamScores(teamKey, n=5) {
@@ -2200,7 +2247,7 @@
   }
 
   function proposalTypeLabel(p){
-    return p.type==='TRADE'?'Trade proposal':p.type==='SWAP'?'Field / Rookie swap':p.type==='DELIST'?'Delisting request':p.type==='ELEVATION'?'Rookie elevation':'Draft selection';
+    return p.type==='TRADE'?'Trade proposal':p.type==='SWAP'?'Interchange Request':p.type==='DELIST'?'Delisting request':p.type==='ELEVATION'?'Rookie elevation':'Draft selection';
   }
   function proposalSummary(p){
     const x=p.payload||{};
@@ -2244,10 +2291,9 @@
       <div class="trade-sides"><div class="trade-side"><h3 id="proposal-side-a-title">${esc(team(myTeam).name)} sends</h3><div id="proposal-side-a-players">${playerSlots('a',myTeam)}</div><div id="proposal-side-a-picks">${pickSlots('a',myTeam)}</div>${conditionalDelistOpen?`<div class="conditional-delist-builder"><div class="conditional-delist-builder-head"><span class="eyebrow">Conditional on this trade</span><strong>Delist up to 3</strong></div><p>Only occurs if the complete trade is accepted and approved.</p><div id="proposal-side-a-delists">${conditionalDelistSlots('a',myTeam)}</div></div>`:''}</div><div class="trade-arrow">⇄</div><div class="trade-side"><h3 id="proposal-side-b-title">Trade partner sends</h3><div id="proposal-side-b-players">${playerSlots('b')}</div><div id="proposal-side-b-picks">${pickSlots('b')}</div>${conditionalDelistOpen?`<div class="conditional-delist-builder"><div class="conditional-delist-builder-head"><span class="eyebrow">Conditional on this trade</span><strong>Delist up to 3</strong></div><p>The other coach accepts these delistings as part of the whole trade.</p><div id="proposal-side-b-delists">${conditionalDelistSlots('b')}</div></div>`:''}</div></div>
       <div class="trade-visual-title"><div><span class="eyebrow">Visual proposal</span><h3>Complete trade package</h3></div><span>Players, picks and conditional delistings update live as you build the trade.</span></div><div id="proposal-trade-visual" class="trade-visual-shell"><div class="trade-visual-empty trade-visual-empty-wide">Choose a trade partner to open the visual trade board.</div></div>
       <div id="proposal-trade-validation" style="margin-top:14px"><div class="notice">Choose a trade partner and assets. PEGS will show both teams' before/after salary, list and field-position impact.</div></div><div class="button-row"><button class="primary-button" id="submit-trade-proposal" disabled>Send trade request</button></div></article>
-      <div class="proposal-side-stack"><article class="card card-pad"><div class="section-title"><div><span class="eyebrow">My team</span><h2>Field / Rookie swap</h2></div><span class="badge neutral">Commissioner approval</span></div><p class="muted-copy">Move one Interchange player onto the Field and one Field player to Interchange. Contracts and salaries stay unchanged. A dual-position player must nominate the PEGS position used when entering the Field.</p><input type="hidden" id="proposal-swap-team" value="${esc(myTeam)}"><div class="form-grid"><div class="field-group"><label>Interchange → Field</label><select class="select" id="proposal-swap-in">${playerOptions(myTeam,'Interchange','Select interchange player')}</select></div><div class="field-group"><label>Field → Interchange</label><select class="select" id="proposal-swap-out">${playerOptions(myTeam,'Field','Select field player')}</select></div><div class="field-group" id="proposal-swap-position-group" style="display:none"><label for="proposal-swap-position">PEGS Field position</label><select class="select" id="proposal-swap-position"></select><small class="field-help">For a dual-position rookie, this nominates the fixed PEGS position when they first enter the Field.</small></div></div><div id="proposal-swap-validation" style="margin-top:14px"></div><div class="button-row"><button class="primary-button" id="submit-swap-proposal" disabled>Submit my swap</button></div></article>
-      <article class="card card-pad"><div class="section-title"><div><span class="eyebrow">My team</span><h2>Rookie elevation</h2></div>${elevationStatus}</div>${elevationOpen?`<div class="notice"><strong>${esc(elevationPhase)} rookie elevations are open for ${elevationSeason}.</strong> PEGS will retrieve the player's current SuperCoach price and eligible positions before submission.</div>`:`<div class="notice danger"><strong>Rookie elevations are closed.</strong></div>`}<div class="notice"><strong>Elevations used:</strong> ${elevationUsed} / 1${pendingElevation?' · one request is already pending':''}.</div><div class="form-grid"><div class="field-group"><label for="proposal-elevation-player">Rookie player</label><select class="select" id="proposal-elevation-player" ${elevationOpen&&elevationUsed<1&&!pendingElevation?'':'disabled'}>${rookieOptions}</select></div><div class="field-group"><label for="proposal-elevation-position">New Main contract position</label><select class="select" id="proposal-elevation-position" disabled><option value="">Select player first</option></select></div></div><div id="proposal-elevation-validation" style="margin-top:14px"><div class="notice">Select a Rookie contract player to retrieve the live upgrade price and calculate the salary/position impact.</div></div><div class="button-row"><button class="primary-button" id="submit-elevation-proposal" disabled>Request rookie elevation</button></div></article>
+      <div class="proposal-side-stack"><article class="card card-pad"><div class="section-title"><div><span class="eyebrow">My team</span><h2>Rookie elevation</h2></div>${elevationStatus}</div>${elevationOpen?`<div class="notice"><strong>${esc(elevationPhase)} rookie elevations are open for ${elevationSeason}.</strong> PEGS will retrieve the player's current SuperCoach price and eligible positions before submission.</div>`:`<div class="notice danger"><strong>Rookie elevations are closed.</strong></div>`}<div class="notice"><strong>Elevations used:</strong> ${elevationUsed} / 1${pendingElevation?' · one request is already pending':''}.</div><div class="form-grid"><div class="field-group"><label for="proposal-elevation-player">Rookie player</label><select class="select" id="proposal-elevation-player" ${elevationOpen&&elevationUsed<1&&!pendingElevation?'':'disabled'}>${rookieOptions}</select></div><div class="field-group"><label for="proposal-elevation-position">New Main contract position</label><select class="select" id="proposal-elevation-position" disabled><option value="">Select player first</option></select></div></div><div id="proposal-elevation-validation" style="margin-top:14px"><div class="notice">Select a Rookie contract player to retrieve the live upgrade price and calculate the salary/position impact.</div></div><div class="button-row"><button class="primary-button" id="submit-elevation-proposal" disabled>Request rookie elevation</button></div></article>
       <article class="card card-pad"><div class="section-title"><div><span class="eyebrow">My team</span><h2>Delisting request</h2></div>${delistStatus}</div>${delistOpen?`<div class="notice"><strong>${esc(delistPhase)} delisting is open.</strong> Choose one or more players from your roster.</div>`:`<div class="notice danger"><strong>Delisting is closed.</strong></div>`}<input type="hidden" id="proposal-delist-team" value="${esc(myTeam)}"><div id="proposal-delist-players" class="delist-player-grid"></div><div id="proposal-delist-validation" style="margin-top:12px"></div><div class="button-row"><button class="primary-button" id="submit-delist-proposal" disabled>Submit my delisting</button></div></article></div></section>
-      <section class="card card-pad" style="margin-top:16px"><div class="section-title"><div><span class="eyebrow">My requests</span><h2>Pending team actions</h2></div><span class="badge amber">${pendingMine.length}</span></div><div class="proposal-list">${proposalCards(pendingMine)}</div></section>`:`<section class="card card-pad team-login-required"><div class="section-title"><div><span class="eyebrow">Franchise controls</span><h2>Team Login required</h2></div><button class="primary-button" id="moves-open-team-login">Team Login</button></div><p>League moves remain publicly visible, but only the authenticated coach can propose trades, swaps, rookie elevations, delistings or submit draft picks for their franchise.</p></section>`;
+      <section class="card card-pad" style="margin-top:16px"><div class="section-title"><div><span class="eyebrow">My requests</span><h2>Pending team actions</h2></div><span class="badge amber">${pendingMine.length}</span></div><div class="proposal-list">${proposalCards(pendingMine)}</div></section>`:`<section class="card card-pad team-login-required"><div class="section-title"><div><span class="eyebrow">Franchise controls</span><h2>Team Login required</h2></div><button class="primary-button" id="moves-open-team-login">Team Login</button></div><p>League moves remain publicly visible, but only the authenticated coach can propose trades, rookie elevations, delistings or submit draft picks for their franchise. Interchange Requests are available from the Teams page.</p></section>`;
     main.innerHTML=`${pageHeader('League moves','Moves & Trades','Team accounts control submissions. A trade must be legal for both teams, accepted by the other coach, then approved by the Commissioner.')}
       <section class="move-window-strip"><div><span>Trading</span>${tradeStatus}</div><div><span>Draft</span><span class="badge ${getDraftState().active?'green':'red'}">${getDraftState().active?'OPEN · '+esc(getDraftState().type||'Draft'):'CLOSED'}</span></div><div><span>Rookie elevation</span>${elevationStatus}</div><div><span>Delisting</span>${delistStatus}</div></section>${teamTools}
       <section style="margin-top:24px">${pageHeader('Audit trail',logged&&transactionScope==='mine'?'My Confirmed Transactions':'Confirmed Transactions',logged&&transactionScope==='mine'?`Confirmed league moves involving ${team(myTeam).name}. Switch to All League to inspect the full audit trail.`:'Only fully approved moves appear in the official transaction history.')}${logged?`<div class="transaction-scope-toolbar"><button class="tab-button ${transactionScope==='mine'?'active':''}" data-action="tx-scope" data-scope="mine">My Moves</button><button class="tab-button ${transactionScope==='all'?'active':''}" data-action="tx-scope" data-scope="all">All League</button></div>`:''}<div class="transaction-toolbar">${types.map(t=>`<button class="tab-button ${selected===t?'active':''}" data-action="tx-filter" data-type="${esc(t)}">${esc(t)}</button>`).join('')}</div><div class="card card-pad transaction-table"><div class="transaction-list">${rows.length?rows.map(x=>transactionItem(x,true)).join(''):`<div class="empty">No ${transactionScope==='mine'?'franchise ':''}transactions match this filter.</div>`}</div></div></section>`;
@@ -2279,11 +2325,6 @@
     const renderPartnerAssets=()=>{const b=tb.value,type=phase.value;document.getElementById('proposal-side-b-title').textContent=b?team(b).name+' sends':'Trade partner sends';document.getElementById('proposal-side-b-players').innerHTML=playerSlots('b',b);document.getElementById('proposal-side-b-picks').innerHTML=pickSlots('b',b,type);if(conditionalDelistOpen&&document.getElementById('proposal-side-b-delists'))document.getElementById('proposal-side-b-delists').innerHTML=conditionalDelistSlots('b',b);ownerNote.innerHTML=`<strong>${esc(team(myTeam).owner)}</strong> owns ${ownedDraftPicks(myTeam,type).map(p=>'Pick '+p.pick).join(', ')||'no available '+esc(type)+' picks'}.${conditionalDelistOpen?' Conditional delistings are part of this trade and do not execute separately.':''}`;bindTradeAssets();tradeValidation();};
     tb?.addEventListener('change',renderPartnerAssets);bindTradeAssets();tradeValidation();
     submitTrade?.addEventListener('click',async()=>{if(!tradeValidation()){toast('Fix the blocked trade before submitting.');return;}const b=tb.value,assetsA={players:sidePlayers('a'),picks:sidePicks('a')},assetsB={players:sidePlayers('b'),picks:sidePicks('b')},conditionalDelistsA=sideConditionalDelists('a'),conditionalDelistsB=sideConditionalDelists('b');try{await submitProposal({type:'TRADE',phase:phase.value,proposerTeam:myTeam,counterpartyTeam:b,payload:{assetsA,assetsB,conditionalDelistsA,conditionalDelistsB}});toast(`Trade request sent to ${team(b).owner}. Conditional delistings, if any, are locked to this trade.`);renderTransactions();}catch(e){toast(e.message||'Could not submit the trade.');}});
-    const st=document.getElementById('proposal-swap-team'),si=document.getElementById('proposal-swap-in'),so=document.getElementById('proposal-swap-out'),sp=document.getElementById('proposal-swap-position'),spg=document.getElementById('proposal-swap-position-group'),sv=document.getElementById('proposal-swap-validation'),submitSwap=document.getElementById('submit-swap-proposal'),usedCount=k=>visibleLegacyTransactions().filter(x=>x.type==='Rookie swap'&&x.team===k).length+getCommissionerActions().filter(x=>x.type==='Rookie swap'&&x.team===k&&x.status==='CONFIRMED').length;
-    const swapIncoming=()=>((effectiveRosters()[myTeam]||[]).find(p=>p.player===si.value)||null);
-    const refreshSwapPosition=()=>{const rec=swapIncoming(),choices=positionChoices(rec?.position||'');sp.innerHTML=choices.map(pos=>`<option value="${esc(pos)}">${esc(pos)}</option>`).join('');sp.disabled=!choices.length;spg.style.display=choices.length>1?'block':'none';if(choices.length)sp.value=choices[0];validateSwap();};
-    const validateSwap=()=>{const rec=swapIncoming(),choices=positionChoices(rec?.position||''),fieldPosition=String(sp?.value||choices[0]||'').toUpperCase(),before=effectiveRosters(),action={type:'Rookie swap',status:'CONFIRMED',team:myTeam,playerIn:si.value,playerOut:so.value,playerInPosition:fieldPosition},after=effectiveRosters(action),validPosition=Boolean(rec&&choices.includes(fieldPosition)),ok=Boolean(si.value&&so.value)&&validPosition&&usedCount(myTeam)<D.rules.maxSwaps&&rosterIsLegal(after[myTeam]||[]);sv.innerHTML=(si.value&&so.value?rosterImpactTeamHtml(myTeam,before[myTeam]||[],after[myTeam]||[],'After proposed swap'):'<div class="notice">Select the Interchange player coming in and the Field player going out.</div>')+`<div class="notice"><strong>Season swaps:</strong> ${usedCount(myTeam)} / ${D.rules.maxSwaps} already confirmed.${choices.length>1?` <strong>${esc(rec.player)}</strong> is dual-position; ${esc(fieldPosition||'choose a position')} will be used on the Field.`:''}</div>`+(!ok&&si.value&&so.value?'<div class="notice danger">This swap is blocked until the resulting roster passes every salary, list and Field-position rule.</div>':'');submitSwap.disabled=!ok;return ok;};si?.addEventListener('change',refreshSwapPosition);so?.addEventListener('change',validateSwap);sp?.addEventListener('change',validateSwap);refreshSwapPosition();submitSwap?.addEventListener('click',async()=>{if(!validateSwap())return;try{await submitProposal({type:'SWAP',phase:'In-Season',proposerTeam:myTeam,payload:{playerIn:si.value,playerOut:so.value,fieldPosition:String(sp.value||'').toUpperCase()}});toast('Swap sent to the Commissioner.');renderTransactions();}catch(e){toast(e.message||'Could not submit the swap.');}});
-
     const ep=document.getElementById('proposal-elevation-player'),epp=document.getElementById('proposal-elevation-position'),ev=document.getElementById('proposal-elevation-validation'),submitElevation=document.getElementById('submit-elevation-proposal');let elevationQuote=null;
     const validateElevation=()=>{const rows=effectiveRosters()[myTeam]||[],rec=rows.find(r=>r.player===ep?.value),pos=String(epp?.value||'').toUpperCase(),positions=(elevationQuote?.positions||[]).map(x=>String(x).toUpperCase()),used=rookieElevationsUsed(myTeam,elevationSeason),pending=proposalCache.some(p=>activeProposalStatus(p.status)&&p.type==='ELEVATION'&&p.proposerTeam===myTeam&&Number(p.payload?.season||elevationSeason)===elevationSeason),termsOk=Boolean(elevationOpen&&elevationQuote&&rec&&String(rec.contract).toLowerCase()==='rookie'&&Number(elevationQuote.price||0)>0&&positions.includes(pos)&&used<1&&!pending),action=termsOk?{type:'Rookie elevation',status:'CONFIRMED',team:myTeam,player:rec.player,newSalary:Number(elevationQuote.price),newPosition:pos,contractEnd:Number(elevationQuote.contractEnd||elevationSeason+3)}:null,before=effectiveRosters(),after=action?effectiveRosters(action):before,legal=Boolean(action&&rosterIsLegal(after[myTeam]||[])),ok=termsOk&&legal;
       if(!ep?.value){ev.innerHTML='<div class="notice">Select a Rookie contract player to retrieve the live upgrade price and calculate the salary/position impact.</div>';submitElevation.disabled=true;return false;}
@@ -2648,7 +2689,7 @@
         <article class="window-admin-card"><div class="section-title"><div><span class="eyebrow">Delisting</span><h3>Delisting window</h3></div><span class="badge ${delist.open?'green':'red'}">${delist.open?'OPEN':'CLOSED'}</span></div><p class="muted-copy">Teams can submit one request containing one or more currently-owned players. Nothing is removed until you approve it.</p><div class="field-group"><label for="admin-delist-phase">Delisting phase</label><select class="select" id="admin-delist-phase" ${delist.open?'disabled':''}><option ${delist.phase==='Pre-Season'?'selected':''}>Pre-Season</option><option ${delist.phase==='Mid-Season'?'selected':''}>Mid-Season</option></select></div><div class="button-row"><button class="primary-button" id="open-delist-window" ${delist.open?'disabled':''}>Open delisting</button><button class="secondary-button" id="close-delist-window" ${delist.open?'':'disabled'}>Close delisting</button></div>${delist.open?`<div class="notice"><strong>Active:</strong> ${esc(delist.phase)} delisting opened ${fmtDate(delist.openedAt)}.</div>`:''}</article>
         <article class="window-admin-card"><div class="section-title"><div><span class="eyebrow">Rookie elevation</span><h3>Elevation window</h3></div><span class="badge ${elevation.open?'green':'red'}">${elevation.open?'OPEN':'CLOSED'}</span></div><p class="muted-copy">Open only at the Pre-Season or Mid-Season draft stage. Each franchise may complete one Rookie → Main elevation per season, subject to Commissioner approval.</p><div class="field-group"><label for="admin-elevation-phase">Elevation phase</label><select class="select" id="admin-elevation-phase" ${elevation.open?'disabled':''}><option ${elevation.phase==='Pre-Season'?'selected':''}>Pre-Season</option><option ${elevation.phase==='Mid-Season'?'selected':''}>Mid-Season</option></select></div><div class="button-row"><button class="primary-button" id="open-elevation-window" ${elevation.open?'disabled':''}>Open rookie elevations</button><button class="secondary-button" id="close-elevation-window" ${elevation.open?'':'disabled'}>Close rookie elevations</button></div>${elevation.open?`<div class="notice"><strong>Active:</strong> ${esc(elevation.phase)} · ${Number(elevation.season||elevationSeasonFor(elevation.phase))} · opened ${fmtDate(elevation.openedAt)}.</div>`:''}</article>
         <article class="window-admin-card"><div class="section-title"><div><span class="eyebrow">Drafting</span><h3>Draft window</h3></div><span class="badge ${draft.active?'green':'red'}">${draft.active?'OPEN':'CLOSED'}</span></div><p class="muted-copy">Drafting is opened by starting a Pre-Season or Mid-Season Draft in Draft Control. When live, only the franchise on the clock can submit the current pick. Each pick gets 3:00; expiry creates OVERTIME but does not automatically skip anyone. The Commissioner may push an overdue pick back one slot.</p><div class="notice"><strong>${draft.active?'Live now':'Currently closed'}:</strong> ${draft.active?`${esc(draft.type||'Draft')} · Pick ${Number(draft.currentPick||1)} · ${esc(team(currentDraftTeam(draft)).name)}`:'Use Draft Control to open drafting.'}</div><div class="button-row"><button class="secondary-button" id="go-draft-control">Open Draft Control</button></div></article>
-      </div><div class="notice" style="margin-top:14px"><strong>Field / Rookie swaps:</strong> these remain available for teams to propose at any time, but every swap still requires Commissioner approval and must pass the swap-limit/roster checks.</div>`;
+      </div><div class="notice" style="margin-top:14px"><strong>Interchange Requests:</strong> these remain available for teams to propose at any time from their Teams page, but every request still requires Commissioner approval and must pass the swap-limit/roster checks.</div>`;
     } else if(commissionerTab==='approvals'){
       const pending=proposalCache.filter(p=>p.status==='AWAITING_COMMISSIONER'&&p.type!=='DRAFT_PICK');
       panel=`<div class="notice"><strong>Approval inbox:</strong> team proposals do not change any roster until you approve them. All rules are re-checked against the current roster at approval time.</div><div class="proposal-list" style="margin-top:14px">${commissionerProposalCards(pending)}</div>`;
@@ -2821,6 +2862,8 @@
     else if(page==='transactions') renderTransactions();
     else if(page==='history') renderHistory();
     else renderHome();
+    lastRenderedStateFingerprint=uiStateFingerprint();
+    lastRenderedHash=location.hash||'#home';
     main.focus({preventScroll:true});
   }
 
@@ -2831,6 +2874,9 @@
     const state=getDraftState(),key=currentDraftTeam(state),pending=proposalCache.some(x=>x.type==='DRAFT_PICK'&&activeProposalStatus(x.status)&&Number(x.payload?.pick)===Number(state.currentPick||1)&&x.proposerTeam===key),canSubmit=Boolean(state.active&&teamLoggedIn()&&loggedTeamKey()===key);
     out.innerHTML=draftCheckOutput(key,p,document.getElementById('draft-contract').value,document.getElementById('draft-status').value,canSubmit,pending,document.getElementById('draft-fixed-position')?.value||String(p.position||'').split('/')[0]);
   }
+
+  document.addEventListener('load',e=>{const img=e.target;if(!(img instanceof HTMLImageElement)||!img.dataset.playerPortrait)return;loadedPlayerPortraits.add(img.dataset.playerPortrait);failedPlayerPortraits.delete(img.dataset.playerPortrait);img.parentElement?.classList.add('photo-ready');},true);
+  document.addEventListener('error',e=>{const img=e.target;if(!(img instanceof HTMLImageElement)||!img.dataset.playerPortrait)return;failedPlayerPortraits.add(img.dataset.playerPortrait);loadedPlayerPortraits.delete(img.dataset.playerPortrait);img.remove();},true);
 
   document.addEventListener('click', e => {
     const routeBtn=e.target.closest('[data-route]');
@@ -2870,7 +2916,7 @@
   document.getElementById('open-commissioner')?.addEventListener('click',()=>{void commissionerUI();commissionerDialog.showModal();});
   commissionerDialog?.addEventListener('close',clearInteractionDraft);
   teamDialog?.addEventListener('close',clearInteractionDraft);
-  window.addEventListener('hashchange',()=>{clearInteractionDraft();render();});
+  window.addEventListener('hashchange',()=>{clearInteractionDraft();if((location.hash||'#home')===lastRenderedHash)return;render();});
   window.addEventListener('storage',e=>{if([OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,TRANSACTION_REVERSALS_KEY,DRAFT_STATE_KEY,PROPOSALS_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,DRAFT_POOL_KEY].includes(e.key)){if(e.key===PROPOSALS_KEY)proposalCache=getLocalProposals();backgroundRefreshUi();}if(e.key===REMEMBERED_TEAM_LOGIN_KEY&&!siteAccessGranted())populateAccessGate();});
 
   // Lightweight non-UI test surface used by the bundled QA script.

@@ -1160,3 +1160,37 @@ body:not(.pegs-access-locked) .stadium-glow{
   .team-detail-head>div{min-width:0}
   .cap-stack,.cap-row,.cap-label{min-width:0}
 }
+
+/* v14.7.2: mobile navigation stability, portrait stability, team interchange workflow */
+.field-player-portrait img{opacity:0;transition:opacity .12s ease}
+.field-player-portrait.photo-ready img{opacity:1}
+.team-interchange-request{margin-top:18px;border-color:rgba(84,160,232,.3);background:linear-gradient(145deg,rgba(18,46,69,.84),rgba(7,19,29,.94))}
+.team-interchange-request .section-title{margin-bottom:8px}
+.team-interchange-request .muted-copy{max-width:920px;margin:0 0 14px}
+.interchange-request-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+.mobile-nav{isolation:isolate}
+.mobile-nav button{touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none;-webkit-user-select:none}
+@media(max-width:780px){
+  .mobile-nav{z-index:1200!important;pointer-events:auto!important;transform:translateZ(0);-webkit-transform:translateZ(0)}
+  .mobile-nav button{position:relative;z-index:1;pointer-events:auto!important}
+}
+@media(max-width:760px){
+  .team-afl-field-panel{order:-1}
+  .team-interchange-request{margin-top:14px}
+  .interchange-request-grid{grid-template-columns:1fr}
+}
+@supports (-webkit-touch-callout:none){
+  @media(max-width:780px){
+    .mobile-nav{-webkit-backdrop-filter:none;backdrop-filter:none;background:rgba(4,14,22,.985)}
+  }
+}
+@media(prefers-reduced-motion:reduce){
+  .field-player-portrait img{transition:none}
+}
+
+/* v14.7.2: prevent compact finals/ladder cards from widening the mobile layout viewport */
+@media(max-width:780px){
+  .final-card{grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);min-width:0}
+  .final-team,.final-team .team-identity,.final-team .team-meta,.final-score{min-width:0}
+  .final-team .team-identity{justify-content:center}
+}

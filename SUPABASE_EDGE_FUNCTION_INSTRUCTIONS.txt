@@ -1,0 +1,8 @@
+PEGS v14.8.4 - supercoach-sync deployment
+
+1. Open Supabase Dashboard > Edge Functions > supercoach-sync.
+2. Replace the function source with the included:
+   supabase/functions/supercoach-sync/index.ts
+3. Deploy the function.
+
+This function is required so Rookie Elevation quotes come from the matching Commissioner-confirmed SuperCoach master list and use the correct current price, positions and contract term.

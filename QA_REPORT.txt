@@ -1,0 +1,114 @@
+PEGS Supercoach Franchise v14.8.4 - End-to-End QA Report
+================================================================
+Date: 20 September 2026
+Result: 65 PASS / 0 FAIL in isolated browser season simulation
+
+Scope
+-----
+The test ran an isolated 2027 season from preseason setup through season close and 2028 rollover. It used synthetic SuperCoach master-list data and isolated browser storage so no live PEGS league data was changed.
+
+Lifecycle covered
+-----------------
+1. New-season template, fixture generation/validation and activation gates.
+2. Confirmed full SuperCoach master-list prerequisite and LISTED/UNLISTED reconciliation.
+3. Current Roster vs Planner Mode, renewal source/terms and roster-window close readiness.
+4. Trades preserving contracted price/position/expiry; delistings; roster legality and max 3 Rookies.
+5. Preseason and mid-season Rookie elevations using current confirmed SuperCoach price/position.
+6. Automatic preseason delisting of all unelevated Rookies and frozen draft-pool creation.
+7. Pre-Season Draft, 3-round Rookie Draft lifecycle, contract types/expiries, overtime pick pushback and safe draft reversal.
+8. Regular-season scoring rules, post-2026 bye counting, availability normalization and Round 10 mid-season gate.
+9. Mid-season master list, roster window, Mid-Season Draft, 2.5-year Main contracts and scoring snapshot.
+10. Top-4 PAGE finals progression, Grand Final, season close, premier/runner-up and 2028 rollover.
+11. Recovery snapshot coverage and smoke-render of every main route.
+
+Defects found and corrected during QA
+-------------------------------------
+- Contract renewals appeared in Planner Mode but had no submission/approval workflow. Added actionable preseason renewal requests using the confirmed preseason SuperCoach master list and standard 2-year Main terms.
+- Frontend depended on RPCs not represented in the bundled SQL upgrade. Added direct draft-pick confirmation, backup baseline replacement and transaction-reversal RPCs, and brought ELEVATION/RENEWAL into the server proposal model.
+- Server roster legality did not enforce the browser's maximum of 3 Rookie contracts or invalid Field-position rejection. Server/browser legality is now aligned.
+- Server trade validation did not include conditional delistings when calculating the final roster. It now validates the whole transaction together.
+- Draft reversal could remove a completed pick without safely reopening the correct lifecycle phase/snapshot. Reversal is now limited to the latest pick in the current session and rewinds draft/lifecycle state.
+- Rookie Draft contract expiry was one year short. A Rookie drafted in 2027 now expires at the 2028 preseason.
+- Mid-Season Draft Main contract expiry was one year short. A player drafted mid-2027 now has a 2.5-year term and renews before 2030, matching the 2026 historical contract convention.
+- New scoring_snapshots state was not null-guarded in the direct draft RPC. Initial snapshot creation is now safe.
+
+Backend/static integrity checks
+-------------------------------
+- 14/14 frontend Supabase RPC references have definitions across the schema + v14 upgrade + v14.8.4 SQL patch.
+- New SQL references only known PEGS tables/functions from the bundled schema.
+- SQL lexical checks: balanced dollar quotes, strings and parentheses; one BEGIN/COMMIT transaction.
+- app.js, sw.js, config.js, league-data.js and vendor/pegs-xlsx.js pass Node syntax validation.
+- supercoach-sync/index.ts passes TypeScript parsing/type syntax validation with a local Deno shim.
+- Service-worker cache bumped to pegs-v14-8-4-e2e-qa-fixes.
+
+Production verification boundary
+--------------------------------
+The destructive season/draft/finals test was intentionally NOT run against the live league database. This environment also could not retrieve the GitHub Pages deployment or connect to the live Supabase project, so authenticated live RPC/auth/network behaviour cannot be certified from here. The browser lifecycle and source/backend contracts are verified; production requires the included SQL patch and the included supercoach-sync Edge Function to be deployed before v14.8.4 should be treated as the live season baseline.
+
+All 65 browser assertions
+-------------------------
+01. PASS - New season advances to 2027
+02. PASS - Post-2026 Opening Round disabled
+03. PASS - Default regular rounds 20
+04. PASS - Midseason break after round 10
+05. PASS - Finals rounds 21/22/23
+06. PASS - PEGS fixture has 120 H2H games
+07. PASS - Generated PEGS fixture passes schedule validation
+08. PASS - Season activation blocked before roster/draft completion
+09. PASS - Preseason cannot remain open without confirmed SC master
+10. PASS - Confirmed 18-club SC master unlocks preseason window
+11. PASS - Confirmed SC master readiness true
+12. PASS - Master list classifies listed and unlisted players
+13. PASS - Planner is a separate workspace
+14. PASS - Planner shows renewal section
+15. PASS - Renewal rows have an actionable request control
+16. PASS - Preseason renewal source comes from confirmed SC master
+17. PASS - Renewal replaces old price/position terms and advances contract
+18. PASS - Roster-window close readiness detects unresolved expired Main contracts
+19. PASS - Renewal proposal window is preseason-only
+20. PASS - Trade preserves player salary, position and contract expiry
+21. PASS - Delisting removes the selected player
+22. PASS - Browser roster legality rejects a fourth Rookie contract
+23. PASS - Preseason rookie elevation term is 2 years
+24. PASS - Preseason elevation renews before 2029
+25. PASS - Midseason rookie elevation term is 2.5 years
+26. PASS - Midseason elevation renews before 2030
+27. PASS - Preseason close automatically delists all remaining rookies
+28. PASS - Draft pool built from confirmed master list
+29. PASS - Auto-delisted rookies feed draft pool if present in SC master
+30. PASS - Legal Pre-Season Main draft pick passes rules
+31. PASS - Pre-Season draft rejects Rookie contract
+32. PASS - Pre-Season draft Main contract renews before 2029
+33. PASS - Pre-Season draft completion transitions to Rookie Draft
+34. PASS - Rookie Draft enforces Rookie/Interchange and legal cap
+35. PASS - Rookie Draft contract expires at next preseason
+36. PASS - Rookie Draft completion locks rosters
+37. PASS - Rookie Draft captures preseason scoring snapshot
+38. PASS - Overtime push swaps current and next live pick owners
+39. PASS - Reversing the final Preseason pick reopens that draft phase
+40. PASS - Reversing final draft pick rewinds live pick number
+41. PASS - Reversed drafted player is removed from effective roster
+42. PASS - 2027 bye scoring count equals AFL clubs playing
+43. PASS - Opening Round banking is disabled after 2026
+44. PASS - Availability normalizes not-selected
+45. PASS - Availability normalizes emergency
+46. PASS - Round 10 moves lifecycle to midseason SC list gate
+47. PASS - Round 11 remains locked until midseason roster/draft complete
+48. PASS - Confirmed midseason master opens midseason roster window
+49. PASS - Midseason draft readiness true only after Round 10 and window close
+50. PASS - Midseason draft Main contract is 2.5 years / renews before 2030
+51. PASS - Midseason draft completion relocks roster
+52. PASS - Midseason draft captures scoring snapshot for next round
+53. PASS - Round 11 can finalize after midseason lifecycle completes
+54. PASS - Final regular round moves cycle to Finals
+55. PASS - Finals are seeded Top 4 after regular season
+56. PASS - PAGE finals Preliminary uses QF loser vs EF winner
+57. PASS - Grand Final uses QF winner vs PF winner
+58. PASS - Grand Final finalization sets season Awaiting Close
+59. PASS - Season closes after confirmed Grand Final winner
+60. PASS - Closed season status COMPLETE
+61. PASS - Next lifecycle starts at 2028 SC list gate
+62. PASS - Next lifecycle targets 2028
+63. PASS - Local recovery snapshot captures proposal_windows/roster cycle
+64. PASS - Local recovery snapshot captures player master and scoring snapshots
+65. PASS - All main routes render without runtime exceptions

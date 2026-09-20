@@ -306,7 +306,7 @@
   }
   function rosterCyclePending(phaseLabel=''){
     const wanted=normalizedDraftType(phaseLabel||rosterCyclePhaseWindow(rosterCycleState().phase)||'Pre-Season');
-    return proposalCache.filter(p=>['TRADE','DELIST','ELEVATION'].includes(String(p.type||'').toUpperCase())&&activeProposalStatus(p.status)&&normalizedDraftType(p.phase||'Pre-Season')===wanted);
+    return proposalCache.filter(p=>['TRADE','DELIST','ELEVATION','RENEWAL'].includes(String(p.type||'').toUpperCase())&&activeProposalStatus(p.status)&&normalizedDraftType(p.phase||'Pre-Season')===wanted);
   }
   function preSeasonRosterReady(season){
     const target=Number(season||rosterCycleTargetSeason()),snap=getScoringSnapshots()?.[String(target)]?.preSeason,cycle=rosterCycleState();
@@ -393,7 +393,7 @@
     const kind=String(type||'').toUpperCase(),w=getProposalWindows();
     if(kind==='SWAP')return true;
     if(kind==='DRAFT_PICK'){const d=getDraftState();return Boolean(d.active)&&(!phase||String(d.type||'')===String(phase));}
-    const slot=kind==='TRADE'?w.trade:kind==='DELIST'?w.delist:kind==='ELEVATION'?w.elevation:null;
+    const slot=kind==='TRADE'?w.trade:kind==='DELIST'?w.delist:kind==='ELEVATION'?w.elevation:kind==='RENEWAL'?w.delist:null;
     return Boolean(slot?.open)&&(!phase||String(slot.phase||'')===String(phase));
   }
 
@@ -674,6 +674,7 @@
     if(row.type==='TRADE'&&!proposalWindowOpen('TRADE',row.phase))throw new Error('The Commissioner has closed trading submissions.');
     if(row.type==='DELIST'&&!proposalWindowOpen('DELIST',row.phase))throw new Error('The Commissioner has closed delisting submissions.');
     if(row.type==='ELEVATION'&&!proposalWindowOpen('ELEVATION',row.phase))throw new Error('The Commissioner has closed rookie elevation submissions.');
+    if(row.type==='RENEWAL'&&(!proposalWindowOpen('RENEWAL',row.phase)||normalizedDraftType(row.phase)!=='Pre-Season'))throw new Error('Contract renewals are only available during the Preseason Roster Window.');
     if(row.type==='DRAFT_PICK'&&!proposalWindowOpen('DRAFT_PICK',row.phase))throw new Error('The draft is not currently open.');
     if (!backendConfigured()) {
       row.status=row.type==='TRADE'?'AWAITING_COUNTERPARTY':'AWAITING_COMMISSIONER';
@@ -1457,7 +1458,7 @@
   }
   function recoveryStateSnapshot(){
     const archived=Boolean(D.meta.seasonComplete)&&Number(currentSeason())===Number(D.meta.season||2026),setup=archived?normalizeSeasonSetup(legacySeasonSetup()):getSeasonSetup(),results=archived?completedWorkbookSeasonResults():getSeasonResults();
-    return {score_overrides:getOverrides(),selection_overrides:getSelectionOverrides(),commissioner_actions:getCommissionerActions(),transaction_reversals:getTransactionReversals(),draft_state:getDraftState(),proposal_windows:getProposalWindows(),scoring_snapshots:getScoringSnapshots(),player_master:getPlayerMaster(),figurehead_overrides:getFigureheadOverrides(),season_setup:setup,season_results:results,live_feed:archived?{}:getLiveFeed(),opening_bank:getOpeningBank(),archive_model:{version:'14.8.3',baselineCleaned:true,rosterCycleCaptured:true,playerMasterCaptured:true}};
+    return {score_overrides:getOverrides(),selection_overrides:getSelectionOverrides(),commissioner_actions:getCommissionerActions(),transaction_reversals:getTransactionReversals(),draft_state:getDraftState(),proposal_windows:getProposalWindows(),scoring_snapshots:getScoringSnapshots(),player_master:getPlayerMaster(),figurehead_overrides:getFigureheadOverrides(),season_setup:setup,season_results:results,live_feed:archived?{}:getLiveFeed(),opening_bank:getOpeningBank(),archive_model:{version:'14.8.4',baselineCleaned:true,rosterCycleCaptured:true,playerMasterCaptured:true}};
   }
   async function syncCompletedSeasonRecoveryState(){
     if(!backendConfigured()||!commissionerLoggedIn()||!D.meta.seasonComplete||Number(currentSeason())!==Number(D.meta.season||2026))return false;
@@ -1617,6 +1618,8 @@
     } else if(a.type==='Rookie swap'){
       const rows=out[a.team]||[]; const pin=rows.find(p=>p.player===a.playerIn); const pout=rows.find(p=>p.player===a.playerOut); if(pin){pin.status='Field';if(a.playerInPosition)pin.position=String(a.playerInPosition).toUpperCase();} if(pout) pout.status='Interchange';
     } else if(a.type==='Rookie elevation' && a.team && a.player){
+      const rows=out[a.team]||[];const rec=rows.find(p=>p.player===a.player);if(rec){rec.contract='Main';rec.salary=Number(a.newSalary||rec.salary||0);rec.position=String(a.newPosition||rec.position||'').toUpperCase();if(a.contractEnd)rec.contractEnd=Number(a.contractEnd);}
+    } else if(a.type==='Renewal' && a.team && a.player){
       const rows=out[a.team]||[];const rec=rows.find(p=>p.player===a.player);if(rec){rec.contract='Main';rec.salary=Number(a.newSalary||rec.salary||0);rec.position=String(a.newPosition||rec.position||'').toUpperCase();if(a.contractEnd)rec.contractEnd=Number(a.contractEnd);}
     } else if(a.type==='Drafted' && a.team && a.player){
       const rows=out[a.team]||(out[a.team]=[]); if(!rows.some(p=>p.player===a.player)) rows.push({player:a.player,contract:a.contract||'Main',salary:Number(a.salary||0),position:a.position||'',status:a.listStatus||'Field',contractEnd:a.contractEnd||Number(a.draftSeason||a.season||currentSeason())+2,club:a.club||''});
@@ -2249,19 +2252,20 @@
   function plannerProposalInvolvesTeam(p,teamKey){
     const key=String(teamKey||'').toUpperCase(),type=String(p?.type||'').toUpperCase();
     if(type==='TRADE')return String(p.proposerTeam||'').toUpperCase()===key||String(p.counterpartyTeam||'').toUpperCase()===key;
-    return String(p?.proposerTeam||'').toUpperCase()===key&&['DELIST','ELEVATION'].includes(type);
+    return String(p?.proposerTeam||'').toUpperCase()===key&&['DELIST','ELEVATION','RENEWAL'].includes(type);
   }
   function plannerProposalAction(p){
     const x=p?.payload||{},type=String(p?.type||'').toUpperCase();
     if(type==='TRADE')return tradeActionFor(p.proposerTeam,p.counterpartyTeam,x.assetsA||{players:[],picks:[]},x.assetsB||{players:[],picks:[]},x.conditionalDelistsA||[],x.conditionalDelistsB||[]);
     if(type==='DELIST')return {type:'Delisted',status:'CONFIRMED',team:p.proposerTeam,players:[...(x.players||[])]};
     if(type==='ELEVATION'){const phase=normalizedDraftType(p.phase||'Pre-Season'),season=Number(x.season||elevationSeasonFor(phase)),terms=rookieElevationTerms(phase,season),master=currentSupercoachPlayer(x.player,phase);return {type:'Rookie elevation',status:'CONFIRMED',team:p.proposerTeam,player:x.player,newSalary:Number(master?.price||x.newSalary||0),newPosition:String(x.position||'').toUpperCase(),contractEnd:terms.contractEnd,contractTermYears:terms.years};}
+    if(type==='RENEWAL'){const season=Number(x.season||rosterCycleState().season||currentSeason()),master=currentSupercoachPlayer(x.player,'Pre-Season');return {type:'Renewal',status:'CONFIRMED',team:p.proposerTeam,player:x.player,newSalary:Number(master?.price||x.newSalary||0),newPosition:String(x.position||'').toUpperCase(),contractEnd:season+2,contractTermYears:2};}
     return null;
   }
   function plannerProposalAutoIncluded(p){
     const type=String(p?.type||'').toUpperCase(),status=String(p?.status||'').toUpperCase();
     if(type==='TRADE')return status==='AWAITING_COMMISSIONER';
-    return ['DELIST','ELEVATION'].includes(type)&&activeProposalStatus(status);
+    return ['DELIST','ELEVATION','RENEWAL'].includes(type)&&activeProposalStatus(status);
   }
   function plannerProposalIncluded(p){
     return plannerProposalAutoIncluded(p)||(String(p?.type||'').toUpperCase()==='TRADE'&&plannerPreviewTradeIds.has(String(p.id)));
@@ -2303,7 +2307,7 @@
   }
   function plannerMoveCardHtml(teamKey,p){
     const type=String(p.type||'').toUpperCase(),status=String(p.status||'').toUpperCase(),included=plannerProposalIncluded(p),auto=plannerProposalAutoIncluded(p),impact=plannerMoveImpact(teamKey,p),tradeWaiting=type==='TRADE'&&status==='AWAITING_COUNTERPARTY',statusLabel=status.replaceAll('_',' '),tone=included?'green':tradeWaiting?'amber':'neutral';
-    const title=type==='TRADE'?'Trade':type==='DELIST'?'Delisting':'Rookie elevation';
+    const title=type==='TRADE'?'Trade':type==='DELIST'?'Delisting':type==='RENEWAL'?'Contract renewal':'Rookie elevation';
     const signedMoney=v=>`${v>0?'+':'−'}${money(Math.abs(v))}`,impacts=[impact.main?`Main ${signedMoney(impact.main)}`:'Main —',impact.rookie?`Rookie ${signedMoney(impact.rookie)}`:'Rookie —',impact.mainCount?`Main list ${impact.mainCount>0?'+':''}${impact.mainCount}`:'Main list —'];
     const previewButton=tradeWaiting?`<button type="button" class="secondary-button compact-button planner-preview-trade ${included?'is-included':''}" data-action="planner-trade-toggle" data-proposal-id="${esc(String(p.id))}">${included?'Remove from scenario':'Preview in scenario'}</button>`:'';
     return `<article class="planner-move-card ${included?'is-included':''}"><div class="planner-move-head"><div><span class="badge ${tone}">${included?'IN PROJECTED':statusLabel}</span><strong>${esc(title)}</strong></div>${previewButton}</div><p>${esc(proposalSummary(p))}</p><div class="planner-impact-chips">${impacts.map(v=>`<span>${esc(v)}</span>`).join('')}</div><small>${auto?'Automatically included because this move is awaiting Commissioner approval.':tradeWaiting?'Not included until the other coach accepts it, unless you preview it here.':'Included in your current planning scenario.'}</small></article>`;
@@ -2318,11 +2322,22 @@
   }
 
   function plannerRenewalOverviewHtml(teamKey,ctx){
-    const cycle=rosterCycleState(),target=Number(cycle.season||currentSeason()),preseason=String(cycle.phase||'').startsWith('PRESEASON'),expired=ctx.currentRows.filter(r=>Number(r.contractEnd||0)>0&&Number(r.contractEnd)<=target),master=playerMasterReadiness('Pre-Season',target);
+    const cycle=rosterCycleState(),target=Number(cycle.season||currentSeason()),preseason=String(cycle.phase||'').startsWith('PRESEASON'),expired=ctx.projectedRows.filter(r=>String(r.contract||'').toLowerCase()==='main'&&Number(r.contractEnd||0)>0&&Number(r.contractEnd)<=target),master=playerMasterReadiness('Pre-Season',target);
     if(!preseason&&!expired.length)return '';
-    if(!expired.length)return `<section class="planner-renewals is-clear"><div class="planner-subhead"><div><span class="eyebrow">Contract decisions</span><h3>Renewals</h3></div><span class="badge green">NONE DUE</span></div><p>No expired contracts need new-season terms before this draft.</p></section>`;
-    const rows=expired.map(r=>{const sc=currentSupercoachPlayer(r.player,'Pre-Season'),positions=String(sc?.position||'').toUpperCase();return `<div class="planner-renewal-row"><div><strong>${esc(r.player)}</strong><small>Renewal due ${esc(r.contractEnd||'')} · previous PEGS ${esc(r.position)} · ${money(r.salary||0)}</small></div><div>${sc?`<span>${money(sc.price)} · ${esc(positions)}</span><small>Confirmed current SuperCoach price & eligible position${positions.includes('/')?'s':''}</small>`:'<span>Not on confirmed SC list</span><small>No current renewal price is available from the master list</small>'}</div></div>`;}).join('');
-    return `<section class="planner-renewals"><div class="planner-subhead"><div><span class="eyebrow">Preseason decisions</span><h3>Renewals requiring attention</h3></div><span class="badge amber">${expired.length} DUE</span></div><p>${master.ready?'Renewal pricing and eligible positions below come from the SuperCoach master list that was confirmed before this roster window opened.':'The current SuperCoach master list must be confirmed before renewal terms can be set.'} Dual-position players will nominate one fixed PEGS position for the new contract.</p><div class="planner-renewal-list">${rows}</div></section>`;
+    if(!expired.length)return `<section class="planner-renewals is-clear"><div class="planner-subhead"><div><span class="eyebrow">Contract decisions</span><h3>Renewals</h3></div><span class="badge green">NONE DUE</span></div><p>No expired Main contracts remain unresolved in this projected roster.</p></section>`;
+    const rows=expired.map(r=>{const sc=currentSupercoachPlayer(r.player,'Pre-Season'),positions=positionChoices(sc?.position||''),pending=ctx.proposals.some(p=>String(p.type||'').toUpperCase()==='RENEWAL'&&canonicalPlayerName(p.payload?.player)===canonicalPlayerName(r.player)&&activeProposalStatus(p.status)),positionOptions=positions.map(pos=>`<option value="${esc(pos)}" ${String(r.position||'').toUpperCase()===pos?'selected':''}>${esc(pos)}</option>`).join('');return `<div class="planner-renewal-row" data-renewal-player="${esc(r.player)}"><div><strong>${esc(r.player)}</strong><small>Renewal due before ${target} · previous PEGS ${esc(r.position)} · ${money(r.salary||0)}</small></div><div class="planner-renewal-terms">${sc?`<span>${money(sc.price)} · ${esc(positions.join('/'))}</span><small>Confirmed current SuperCoach terms · new 2-year Main contract</small><label class="screen-reader-only">Contract position for ${esc(r.player)}</label><select class="select planner-renewal-position" ${pending?'disabled':''}>${positionOptions}</select><button type="button" class="primary-button compact-button planner-renewal-submit" data-player="${esc(r.player)}" ${pending||!master.ready||!positions.length?'disabled':''}>${pending?'Renewal pending':'Request renewal'}</button>`:'<span>Not on confirmed SC list</span><small>No current renewal price/position is available. This contract must be resolved before the roster window can close.</small>'}</div></div>`;}).join('');
+    return `<section class="planner-renewals"><div class="planner-subhead"><div><span class="eyebrow">Preseason decisions</span><h3>Renewals requiring attention</h3></div><span class="badge amber">${expired.length} DUE</span></div><p>${master.ready?'Every renewal below is repriced from the confirmed SuperCoach master list captured before this roster window opened.':'The current SuperCoach master list must be confirmed before renewal terms can be set.'} A dual-position player must be assigned one eligible PEGS position for the full new contract.</p><div class="planner-renewal-list">${rows}</div></section>`;
+  }
+
+  function bindPlannerRenewals(teamKey,ctx){
+    if(!teamLoggedIn()||String(teamKey)!==loggedTeamKey()||String(rosterCycleState().phase)!=='PRESEASON_WINDOW_OPEN')return;
+    document.querySelectorAll('.planner-renewal-submit').forEach(btn=>btn.addEventListener('click',async()=>{
+      const player=btn.dataset.player||'',row=btn.closest('.planner-renewal-row'),pos=String(row?.querySelector('.planner-renewal-position')?.value||'').toUpperCase(),cycle=rosterCycleState(),season=Number(cycle.season||currentSeason()),rec=(effectiveRosters()[teamKey]||[]).find(r=>canonicalPlayerName(r.player)===canonicalPlayerName(player)),sc=currentSupercoachPlayer(player,'Pre-Season'),positions=positionChoices(sc?.position||'');
+      if(!rec||String(rec.contract||'').toLowerCase()!=='main'||Number(rec.contractEnd||0)>season){toast('This contract no longer requires renewal.');renderTeamDetail(teamKey,true);return;}
+      if(!sc||Number(sc.price||0)<=0||!positions.includes(pos)){toast('Choose a valid position from the confirmed Preseason SuperCoach list.');return;}
+      btn.disabled=true;
+      try{await submitProposal({type:'RENEWAL',phase:'Pre-Season',proposerTeam:teamKey,payload:{player:rec.player,position:pos,season,newSalary:Number(sc.price),oldSalary:Number(rec.salary||0),oldPosition:rec.position||'',oldContractEnd:Number(rec.contractEnd||0),contractEnd:season+2,contractTermYears:2,quoteSource:'Confirmed Pre-Season SuperCoach master list',masterCapturedAt:getPlayerMaster()?.captured_at||'',masterConfirmedAt:getPlayerMaster()?.confirmed_at||''}});toast(`${rec.player} renewal sent to the Commissioner at ${money(sc.price)} · ${pos}.`);renderTeamDetail(teamKey,true);}catch(e){btn.disabled=false;toast(e.message||'Could not submit the renewal request.');}
+    }));
   }
 
   function rosterPlannerHtml(teamKey,ctx){
@@ -2330,7 +2345,7 @@
     const cycle=rosterCycleState(),phase=String(cycle.phase||''),windowOpen=['PRESEASON_WINDOW_OPEN','MIDSEASON_WINDOW_OPEN'].includes(phase),issues=plannerIssueList(ctx.projectedRows),current=ctx.currentSummary,projected=ctx.projectedSummary,phaseLabel=phase==='PRESEASON_WINDOW_OPEN'?'Preseason':phase==='MIDSEASON_WINDOW_OPEN'?'Mid-Season':'Roster planning';
     if(!windowOpen&&!ctx.proposals.length)return '';
     const delta=(after,before)=>after-before,mainDelta=delta(projected.caps.main,current.caps.main),rookieDelta=delta(projected.caps.rookie,current.caps.rookie);
-    return `<section class="card card-pad roster-planner planner-workspace"><div class="planner-workspace-intro"><div><span class="eyebrow">${esc(phaseLabel)} list management</span><h2>Build the roster you want to take into the draft</h2><p>This is a planning workspace. Delistings, rookie elevations and agreed trades that are still awaiting Commissioner approval are applied to the projection below. In preseason, every Rookie contract still remaining after those moves is also treated as expiring at window close. Your Current roster remains untouched until approval/closure.</p></div><div class="planner-workspace-actions"><button type="button" class="primary-button" data-route="transactions">Manage roster requests</button><small>Submit or review trades, delistings and rookie elevations.</small></div></div>
+    return `<section class="card card-pad roster-planner planner-workspace"><div class="planner-workspace-intro"><div><span class="eyebrow">${esc(phaseLabel)} list management</span><h2>Build the roster you want to take into the draft</h2><p>This is a planning workspace. Renewals, delistings, rookie elevations and agreed trades that are still awaiting Commissioner approval are applied to the projection below. In preseason, every Rookie contract still remaining after those moves is also treated as expiring at window close. Your Current roster remains untouched until approval/closure.</p></div><div class="planner-workspace-actions"><button type="button" class="primary-button" data-route="transactions">Manage roster requests</button><small>Submit or review trades, renewals, delistings and rookie elevations.</small></div></div>
       <div class="planner-kpis"><div><span>Projected Main salary</span><strong class="${projected.caps.main>D.rules.mainContractCap?'planner-bad':''}">${money(projected.caps.main)}</strong><small>${mainDelta?`${mainDelta>0?'+':''}${money(mainDelta)} vs official`:'No change'} · cap ${money(D.rules.mainContractCap)}</small></div><div><span>Projected Rookie salary</span><strong class="${projected.caps.rookie>D.rules.rookieContractCap?'planner-bad':''}">${money(projected.caps.rookie)}</strong><small>${rookieDelta?`${rookieDelta>0?'+':''}${money(rookieDelta)} vs official`:'No change'} · cap ${money(D.rules.rookieContractCap)}</small></div><div><span>Main contracts</span><strong>${projected.counts.main||0} / 28</strong><small>${current.counts.main||0} on official roster</small></div><div><span>Rookie contracts</span><strong>${projected.counts.rookie||0} / 3</strong><small>${current.counts.rookie||0} on official roster</small></div></div>
       <div class="planner-position-grid">${Object.entries(D.rules.positionMax).map(([pos,max])=>`<div class="${Number(projected.counts[pos]||0)>Number(max)?'is-over':''}"><span>${pos}</span><strong>${projected.counts[pos]||0} / ${max}</strong><small>${Number(projected.counts[pos]||0)-Number(current.counts[pos]||0)===0?'No change':`${Number(projected.counts[pos]||0)-Number(current.counts[pos]||0)>0?'+':''}${Number(projected.counts[pos]||0)-Number(current.counts[pos]||0)} projected`}</small></div>`).join('')}</div>
       <div class="planner-verdict ${ctx.legal?'is-legal':'is-review'}"><div><span>${ctx.legal?'✓':'!'}</span><div><strong>${ctx.legal?'Projected roster passes the current roster rules':'Projected roster still requires changes'}</strong><small>${ctx.legal?'Use the vacancy and salary-room figures below to plan the draft.':issues.join(' · ')}</small></div></div></div>
@@ -2373,7 +2388,7 @@
           ${teamRookieBench(roster,t.key)}
         </div>
       </section>`;
-    if(!plannerMode)bindInterchangeRequest(t.key);
+    if(plannerMode)bindPlannerRenewals(t.key,planner);else bindInterchangeRequest(t.key);
   }
 
   function recentTeamScores(teamKey, n=5) {
@@ -2529,13 +2544,13 @@
       <article class="card draft-sim"><span class="eyebrow">${ds.active?'Current selection':'Player explorer'}</span><h2>${ds.active?`${esc(team(currentTeam).name)} is on the clock`:'Draft selections are closed'}</h2><p class="muted-copy">${ds.active?'The available pool is the frozen pre-draft AFL/SuperCoach snapshot less players already on a PEGS list.':'You can inspect the most recently loaded player pool.'}</p>
       <div class="field-group"><label for="draft-search">Find available player</label><input class="search-input" id="draft-search" value="${esc(draftSearch)}" placeholder="Search player, club or position"></div>
       <div class="draft-search-results" id="draft-search-results">${results.map(p=>`<button class="player-option ${selected?.player===p.player?'selected':''}" data-action="select-draft-player" data-player="${esc(p.player)}"><span><strong>${esc(p.player)}</strong><small>${esc(p.position)} - ${esc(p.club)}${Number(p.average||0)?` - Avg ${Number(p.average).toFixed(1)}`:''}</small></span><span class="money"><strong>${money(p.price||p.startPrice)}</strong><small>${ds.active?'frozen':'price'}</small></span></button>`).join('')||'<div class="empty">No available players match.</div>'}</div>
-      <div class="form-grid" style="margin-top:14px">${(()=>{const rookie=normalizedDraftType(ds.type)==='Rookie Draft';return `<div class="field-group"><label for="draft-contract">Contract</label><select class="select" id="draft-contract" disabled><option>${rookie?'Rookie':'Main'}</option></select><small>${rookie?'Rookie Draft selections are one-season Rookie contracts.':'Main draft selections use Main contracts.'}</small></div><div class="field-group"><label for="draft-status">List location</label><select class="select" id="draft-status" ${rookie?'disabled':''}>${rookie?'<option>Interchange</option>':'<option>Field</option><option>Interchange</option>'}</select><small>${rookie?'Rookie Draft players start on the Rookie List.':''}</small></div>`;})()}<div class="field-group"><label for="draft-fixed-position">PEGS position for contract</label><select class="select" id="draft-fixed-position" ${selected?'':'disabled'}>${selected?String(selected.position||'').split('/').map(pos=>`<option value="${esc(pos)}">${esc(pos)}</option>`).join(''):'<option>Select player first</option>'}</select></div></div>
+      <div class="form-grid" style="margin-top:14px">${(()=>{const rookie=normalizedDraftType(ds.type)==='Rookie Draft';return `<div class="field-group"><label for="draft-contract">Contract</label><select class="select" id="draft-contract" disabled><option>${rookie?'Rookie':'Main'}</option></select><small>${rookie?'Rookie Draft selections are one-season Rookie contracts, expiring before the next preseason.':normalizedDraftType(ds.type)==='Mid-Season'?'Mid-Season selections are 2.5-year Main contracts (remainder of this season plus two full seasons).':'Pre-Season selections are 2-year Main contracts.'}</small></div><div class="field-group"><label for="draft-status">List location</label><select class="select" id="draft-status" ${rookie?'disabled':''}>${rookie?'<option>Interchange</option>':'<option>Field</option><option>Interchange</option>'}</select><small>${rookie?'Rookie Draft players start on the Rookie List.':''}</small></div>`;})()}<div class="field-group"><label for="draft-fixed-position">PEGS position for contract</label><select class="select" id="draft-fixed-position" ${selected?'':'disabled'}>${selected?String(selected.position||'').split('/').map(pos=>`<option value="${esc(pos)}">${esc(pos)}</option>`).join(''):'<option>Select player first</option>'}</select></div></div>
       <div id="draft-check-output">${selected?draftCheckOutput(currentTeam,selected,normalizedDraftType(ds.type)==='Rookie Draft'?'Rookie':'Main',normalizedDraftType(ds.type)==='Rookie Draft'?'Interchange':'Field',myTurn,false,String(selected.position||'').split('/')[0]):'<div class="notice" style="margin-top:16px">Select an available player to run the salary-cap, list-size and positional checks.</div>'}</div></article></section>`;
     startDraftTicker();
   }
 
   function applyDirectDraftPickLocal(state,key,pick,p,contract,status,fixedPosition){
-    const season=Number(state.season||draftSeasonFor(state.type)),action={type:'Drafted',status:'CONFIRMED',phase:normalizedDraftType(state.type),draftSeason:season,sessionId:state.sessionId||'',pick,team:key,player:p.player,position:fixedPosition,club:p.club||'',contract,listStatus:status,salary:Number(p.price||p.startPrice||0),contractEnd:normalizedDraftType(state.type)==='Rookie Draft'?season:season+2,timestamp:new Date().toISOString(),detail:`${normalizedDraftType(state.type)} pick ${pick}: ${p.player} (${fixedPosition}) · ${money(p.price||p.startPrice||0)}`};
+    const season=Number(state.season||draftSeasonFor(state.type)),draftType=normalizedDraftType(state.type),contractEnd=draftType==='Rookie Draft'?season+1:draftType==='Mid-Season'?season+3:season+2,action={type:'Drafted',status:'CONFIRMED',phase:draftType,draftSeason:season,sessionId:state.sessionId||'',pick,team:key,player:p.player,position:fixedPosition,club:p.club||'',contract,listStatus:status,salary:Number(p.price||p.startPrice||0),contractEnd,timestamp:new Date().toISOString(),detail:`${draftType} pick ${pick}: ${p.player} (${fixedPosition}) · ${money(p.price||p.startPrice||0)}`};
     const all=getCommissionerActions();all.unshift(action);saveCommissionerActions(all);const next=advanceDraftLocal('SELECTED');
     if(!next.active){const dt=normalizedDraftType(state.type);if(dt==='Pre-Season')setRosterCyclePhase('ROOKIE_DRAFT',{season,reason:'preseason_draft_complete'});else if(dt==='Rookie Draft'){captureScoringSnapshot('Pre-Season',1,season);setRosterCyclePhase('ROSTERS_LOCKED',{season,reason:'rookie_draft_complete'});}else if(dt==='Mid-Season'){const from=nextUnfinalizedScoringRound();captureScoringSnapshot('Mid-Season',from,season);setRosterCyclePhase('POST_MIDSEASON_LOCKED',{season,reason:'midseason_draft_complete'});}}
     return action;
@@ -2568,7 +2583,7 @@
   function transactionRecords(){return [...getCommissionerActions().filter(x=>x.status==='CONFIRMED').map(modernTransactionRecord),...visibleLegacyTransactions().map(legacyTransactionRecord)].sort((a,b)=>String(b.timestamp||'').localeCompare(String(a.timestamp||'')));}
   function transactionPlayers(x){
     if(x._source==='legacy')return [...new Set((x._meta?.players||[]).map(canonicalPlayerName).filter(Boolean))];
-    const a=x._action||{},names=[];if(a.type==='Trade'){for(const m of a.moves||[])names.push(m.player);for(const v of Object.values(a.conditionalDelists||{}))names.push(...(v||[]));}else if(a.type==='Rookie swap')names.push(a.playerIn,a.playerOut);else if(['Rookie elevation','Drafted'].includes(a.type))names.push(a.player);else if(a.type==='Delisted')names.push(...(a.players||[a.player]));return [...new Set(names.map(canonicalPlayerName).filter(Boolean))];
+    const a=x._action||{},names=[];if(a.type==='Trade'){for(const m of a.moves||[])names.push(m.player);for(const v of Object.values(a.conditionalDelists||{}))names.push(...(v||[]));}else if(a.type==='Rookie swap')names.push(a.playerIn,a.playerOut);else if(['Rookie elevation','Renewal','Drafted'].includes(a.type))names.push(a.player);else if(a.type==='Delisted')names.push(...(a.players||[a.player]));return [...new Set(names.map(canonicalPlayerName).filter(Boolean))];
   }
   function transactionPickRefs(x){
     if(x._source==='legacy'){
@@ -2599,13 +2614,33 @@
   }
 
   async function reverseTransaction(key){
-    if(!commissionerLoggedIn())throw new Error('Commissioner Mode is not active. Log in again.');const tx=transactionRecords().find(x=>x._txKey===key);if(!tx)throw new Error('That transaction no longer exists.');const dep=transactionDependency(tx);if(dep)throw new Error(`Reverse the later ${dep.type} transaction first: ${dep.detail}`);
+    if(!commissionerLoggedIn())throw new Error('Commissioner Mode is not active. Log in again.');
+    const tx=transactionRecords().find(x=>x._txKey===key);if(!tx)throw new Error('That transaction no longer exists.');
+    const dep=transactionDependency(tx);if(dep)throw new Error(`Reverse the later ${dep.type} transaction first: ${dep.detail}`);
+    const action=tx._action||{};
+    if(tx._source==='modern'&&action.type==='Drafted'){
+      const state=getDraftState();
+      if(!action.sessionId||state.sessionId!==action.sessionId||Number(state.currentPick||0)!==Number(action.pick||0)+1)throw new Error('A draft pick can only be reversed while it is the most recent pick from the current draft session. Reverse later draft activity first.');
+    }
     const backupId=backendConfigured()?await createServerBackup('TRANSACTION_REVERSAL',`${tx.type} · ${tx.detail}`):null;
     if(tx._source==='modern'){
       if(backendConfigured()){
-        const updated=await commissionerFetch('/rest/v1/rpc/pegs_reverse_commissioner_action',{method:'POST',body:JSON.stringify({p_action:tx._action})});localStorage.setItem(COMM_ACTIONS_KEY,JSON.stringify(Array.isArray(updated)?updated:[]));
+        const updated=await commissionerFetch('/rest/v1/rpc/pegs_reverse_commissioner_action',{method:'POST',body:JSON.stringify({p_action:action})});localStorage.setItem(COMM_ACTIONS_KEY,JSON.stringify(Array.isArray(updated)?updated:[]));
       }else{saveCommissionerActions(getCommissionerActions().filter(a=>modernTransactionKey(a)!==key));}
-      const a=tx._action||{},state=getDraftState();if(a.type==='Drafted'&&a.sessionId&&state.sessionId===a.sessionId&&Number(state.currentPick||0)===Number(a.pick||0)+1){saveDraftState({...state,active:true,currentIndex:Math.max(0,Number(a.pick||1)-1),currentPick:Number(a.pick||1),pickStartedAt:new Date().toISOString(),endedAt:null,updatedAt:new Date().toISOString()});}
+      if(action.type==='Drafted'){
+        const state=getDraftState(),now=new Date().toISOString(),reopened={...state,active:true,currentIndex:Math.max(0,Number(action.pick||1)-1),currentPick:Number(action.pick||1),pickStartedAt:now,endedAt:null,updatedAt:now};
+        saveDraftState(reopened);if(backendConfigured())await pushSharedState('draft_state',reopened);
+        const phase=normalizedDraftType(action.phase||state.type||'Pre-Season'),season=Number(action.draftSeason||state.season||rosterCycleState().season);
+        if(phase==='Pre-Season')setRosterCyclePhase('PRESEASON_DRAFT',{season,reason:'draft_pick_reversed'});
+        else if(phase==='Rookie Draft'){
+          const all=getScoringSnapshots(),bucket={...(all[String(season)]||{})};delete bucket.preSeason;all[String(season)]=bucket;saveScoringSnapshots(all);if(backendConfigured())await pushSharedState('scoring_snapshots',all);
+          setRosterCyclePhase('ROOKIE_DRAFT',{season,reason:'rookie_draft_pick_reversed'});
+        }else{
+          const all=getScoringSnapshots(),bucket={...(all[String(season)]||{})};delete bucket.midSeason;all[String(season)]=bucket;saveScoringSnapshots(all);if(backendConfigured())await pushSharedState('scoring_snapshots',all);
+          setRosterCyclePhase('MIDSEASON_DRAFT',{season,reason:'midseason_draft_pick_reversed'});
+        }
+        if(backendConfigured())await pushSharedState('proposal_windows',getProposalWindows());
+      }
     }else{
       const all=getTransactionReversals();all[key]={deletedAt:new Date().toISOString(),type:tx.type,team:tx.team,detail:tx.detail,timestamp:tx.timestamp};saveTransactionReversals(all);if(backendConfigured())await pushSharedState('transaction_reversals',all);
       if(backendConfigured()&&String(tx.type).toUpperCase()==='ROOKIE UPGRADE')await commissionerFetch('/rest/v1/rpc/pegs_reverse_legacy_rookie_elevation',{method:'POST',body:JSON.stringify({p_team:tx.team,p_player:tx._meta?.players?.[0]||'',p_season:actionSeason(tx)})});
@@ -2615,7 +2650,7 @@
   }
 
   function proposalTypeLabel(p){
-    return p.type==='TRADE'?'Trade proposal':p.type==='SWAP'?'Interchange Request':p.type==='DELIST'?'Delisting request':p.type==='ELEVATION'?'Rookie elevation':'Draft selection';
+    return p.type==='TRADE'?'Trade proposal':p.type==='SWAP'?'Interchange Request':p.type==='DELIST'?'Delisting request':p.type==='ELEVATION'?'Rookie elevation':p.type==='RENEWAL'?'Contract renewal':'Draft selection';
   }
   function proposalSummary(p){
     const x=p.payload||{};
@@ -2628,6 +2663,7 @@
     if(p.type==='SWAP') return `${x.playerIn||''} → Field · ${x.playerOut||''} → Interchange`;
     if(p.type==='DELIST') return `${(x.players||[]).join(', ')||'No players selected'}`;
     if(p.type==='ELEVATION') return `${x.player||''}: Rookie → Main · ${x.position||''} · ${money(x.newSalary||0)}`;
+    if(p.type==='RENEWAL') return `${x.player||''}: renew ${money(x.oldSalary||0)} → ${money(x.newSalary||0)} · ${x.oldPosition||''} → ${x.position||''} · next renewal before ${x.contractEnd||''}`;
     if(p.type==='DRAFT_PICK') return `Pick ${x.pick}: ${x.player||''} (${x.position||''})`;
     return '';
   }
@@ -2897,6 +2933,10 @@
       const x=p.payload||{},phase=normalizedDraftType(p.phase||'Pre-Season'),season=Number(x.season||elevationSeasonFor(phase)),terms=rookieElevationTerms(phase,season),master=currentSupercoachPlayer(x.player,phase),price=Number(master?.price||x.newSalary||0),positions=positionChoices(master?.position||''),chosen=String(x.position||'').toUpperCase(),action={type:'Rookie elevation',status:'CONFIRMED',team:p.proposerTeam,player:x.player,newSalary:price,newPosition:chosen,contractEnd:terms.contractEnd},before=effectiveRosters(),after=effectiveRosters(action);
       return `<div class="notice"><strong>Upgrade terms:</strong> ${esc(x.player||'')} · ${money(x.oldSalary||0)} → ${money(price)} · ${esc(x.oldPosition||'')} → ${esc(chosen)} · ${esc(terms.label)} Main contract · expires before ${terms.contractEnd}</div><div class="notice"><strong>Confirmed SuperCoach source:</strong> ${esc(phase)} master list · eligible ${esc(positions.join('/')||'-')}. The Rookie-contract salary/position is not carried into the Main contract.</div>${rosterImpactTeamHtml(p.proposerTeam,before[p.proposerTeam]||[],after[p.proposerTeam]||[],'After rookie elevation')}<div class="notice"><strong>Elevations used:</strong> ${rookieElevationsUsed(p.proposerTeam,season)} / 1 before this request.</div>${commissionerProjectedRosterHtml(p.proposerTeam)}`;
     }
+    if(p.type==='RENEWAL'){
+      const x=p.payload||{},season=Number(x.season||rosterCycleState().season||currentSeason()),rows=effectiveRosters()[p.proposerTeam]||[],rec=rows.find(r=>canonicalPlayerName(r.player)===canonicalPlayerName(x.player)),sc=currentSupercoachPlayer(x.player,'Pre-Season'),positions=positionChoices(sc?.position||''),chosen=String(x.position||'').toUpperCase(),price=Number(sc?.price||0),action={type:'Renewal',status:'CONFIRMED',team:p.proposerTeam,player:x.player,newSalary:price,newPosition:chosen,contractEnd:season+2},after=effectiveRosters(action);
+      return `<div class="notice"><strong>Renewal terms:</strong> ${esc(x.player||'')} · ${money(rec?.salary||x.oldSalary||0)} → ${money(price)} · ${esc(rec?.position||x.oldPosition||'')} → ${esc(chosen)} · new 2-year Main contract · next renewal due before ${season+2}</div><div class="notice"><strong>Confirmed SuperCoach source:</strong> Preseason master list · eligible ${esc(positions.join('/')||'-')}. Approval may temporarily leave the roster over a cap/list limit; the roster must be legal before the window can close.</div>${rosterImpactTeamHtml(p.proposerTeam,rows,after[p.proposerTeam]||[],'After contract renewal')}${commissionerProjectedRosterHtml(p.proposerTeam)}`;
+    }
     if(p.type==='DRAFT_PICK'){
       const x=p.payload||{},pl={player:x.player,club:x.club||'',position:x.position||'',price:Number(x.salary||0),startPrice:Number(x.salary||0)},checks=validateDraft(p.proposerTeam,pl,x.contract||'Main',x.listStatus||'Field',x.position||'');
       return `<div class="notice"><strong>Frozen draft salary:</strong> ${money(x.salary||0)} · ${esc(x.position||'')}</div>`+checks.map(c=>`<div class="rule-check"><span>${esc(c.label)}</span><span class="${c.pass?'check-pass':'check-fail'}">${c.pass?'PASS':'FAIL'} · ${esc(c.detail)}</span></div>`).join('');
@@ -2941,6 +2981,13 @@
       if(!positions.includes(chosen)){toast(`Rookie elevation approval blocked: ${chosen||'the selected position'} is not eligible in the confirmed ${phase} SuperCoach list.`);return;}
       action={type:'Rookie elevation',status:'CONFIRMED',team:p.proposerTeam,player:rec.player,oldSalary:Number(rec.salary||0),newSalary:price,oldPosition:rec.position||'',newPosition:chosen,contractEnd:terms.contractEnd,contractTermYears:terms.years,season,phase,timestamp:new Date().toISOString(),detail:`${rec.player}: Rookie → Main (${money(rec.salary||0)} → ${money(price)}) · ${chosen} · ${terms.label} contract`};
       const rosters=effectiveRosters(action);if(!rosterIsLegal(rosters[p.proposerTeam]||[])){toast('Rookie elevation approval blocked by the current salary, list or Field-position rules.');return;}
+    }else if(p.type==='RENEWAL'){
+      const x=p.payload||{},phase=normalizedDraftType(p.phase||'Pre-Season'),season=Number(x.season||rosterCycleState().season||currentSeason()),rows=effectiveRosters()[p.proposerTeam]||[],rec=rows.find(r=>canonicalPlayerName(r.player)===canonicalPlayerName(x.player)),master=currentSupercoachPlayer(x.player,'Pre-Season'),positions=positionChoices(master?.position||''),chosen=String(x.position||'').toUpperCase(),price=Number(master?.price||0);
+      if(phase!=='Pre-Season'||String(rosterCycleState().phase)!=='PRESEASON_WINDOW_OPEN'){toast('Renewal approval blocked: the Preseason Roster Window is not open.');return;}
+      if(!rec||String(rec.contract||'').toLowerCase()!=='main'||Number(rec.contractEnd||0)>season){toast('Renewal approval blocked: that Main contract is no longer due for renewal.');return;}
+      if(!master||price<=0||!positions.length){toast(`Renewal approval blocked: ${x.player||'this player'} has no confirmed Preseason SuperCoach price/position.`);return;}
+      if(!positions.includes(chosen)){toast(`Renewal approval blocked: ${chosen||'the selected position'} is not eligible in the confirmed Preseason SuperCoach list.`);return;}
+      action={type:'Renewal',status:'CONFIRMED',team:p.proposerTeam,player:rec.player,oldSalary:Number(rec.salary||0),newSalary:price,oldPosition:rec.position||'',newPosition:chosen,oldContractEnd:Number(rec.contractEnd||0),contractEnd:season+2,contractTermYears:2,season,phase:'Pre-Season',timestamp:new Date().toISOString(),detail:`${rec.player}: renewed at ${money(price)} · ${chosen} · 2-year Main contract · next renewal before ${season+2}`};
     }else if(p.type==='DRAFT_PICK'){
       const x=p.payload||{},pl={player:x.player,club:x.club||'',position:x.position||'',price:Number(x.salary||0),startPrice:Number(x.salary||0)},checks=validateDraft(p.proposerTeam,pl,x.contract||'Main',x.listStatus||'Field',x.position||'');if(!checks.length||!checks.every(c=>c.pass)){toast('Draft pick approval blocked by current roster rules.');return;}action={type:'Drafted',status:'CONFIRMED',phase:p.phase||'Draft',draftSeason:Number(x.draftSeason||getDraftState().season||D.meta.season),sessionId:x.sessionId||'',pick:Number(x.pick||0),team:p.proposerTeam,player:x.player,position:x.position||'',club:x.club||'',contract:x.contract||'Main',listStatus:x.listStatus||'Field',salary:Number(x.salary||0),timestamp:new Date().toISOString(),detail:`${p.phase||'Draft'} pick ${Number(x.pick||0)}: ${x.player} (${x.position||''}) · ${money(x.salary||0)}`};
     }
@@ -3146,21 +3193,21 @@
   }
 
   function rosterWindowOfficialReadiness(){
-    const official=effectiveRosters(),illegal=(D.teams||[]).filter(t=>!rosterIsLegal(official[t.key]||[]));
-    return {official,illegal,ready:illegal.length===0};
+    const official=effectiveRosters(),cycle=rosterCycleState(),target=Number(cycle.season||currentSeason()),preseason=String(cycle.phase||'').startsWith('PRESEASON'),illegal=(D.teams||[]).filter(t=>!rosterIsLegal(official[t.key]||[])),expired=preseason?(D.teams||[]).flatMap(t=>(official[t.key]||[]).filter(r=>String(r.contract||'').toLowerCase()==='main'&&Number(r.contractEnd||0)>0&&Number(r.contractEnd)<=target).map(r=>({teamKey:t.key,owner:t.owner,player:r.player,contractEnd:Number(r.contractEnd||0)}))):[];
+    return {official,illegal,expired,ready:illegal.length===0&&expired.length===0};
   }
   function rosterWindowLeagueReadinessHtml(){
-    const {official,illegal:officialIllegal}=rosterWindowOfficialReadiness();
+    const {official,illegal:officialIllegal,expired}=rosterWindowOfficialReadiness();
     const cards=(D.teams||[]).map(t=>{
       const currentRows=official[t.key]||[],ctx=plannerContext(t.key,{includePreview:false}),currentLegal=rosterIsLegal(currentRows),projectedLegal=ctx.legal,pending=ctx.included.length,issues=plannerIssueList(ctx.projectedRows);
       return `<article class="cycle-readiness-team ${currentLegal?'is-ready':'is-review'}"><div class="cycle-readiness-team-head">${teamIdentity(t.key,'sm')}<div><strong>${esc(t.name)}</strong><small>${esc(t.owner)}</small></div><span class="badge ${currentLegal?'green':'red'}">${currentLegal?'OFFICIAL LEGAL':'OFFICIAL REVIEW'}</span></div><div class="cycle-readiness-team-meta"><span>Pending included <b>${pending}</b></span><span>Projected <b class="${projectedLegal?'planner-good':'planner-bad'}">${projectedLegal?'LEGAL':'REVIEW'}</b></span></div>${!projectedLegal&&issues.length?`<small class="cycle-readiness-issues">${esc(issues.join(' · '))}</small>`:''}</article>`;
     }).join('');
-    return `<section class="cycle-league-readiness"><div class="section-title"><div><span class="eyebrow">League readiness</span><h3>Official and projected roster check</h3><p>Projected includes submitted delistings/elevations, trades already accepted by both coaches, and automatic expiry of any remaining Rookie contracts in the preseason window. Every <strong>official</strong> roster must be legal before the window can close.</p></div><span class="badge ${officialIllegal.length?'amber':'green'}">${officialIllegal.length?`${officialIllegal.length} TO REVIEW`:'ALL OFFICIAL ROSTERS LEGAL'}</span></div><div class="cycle-readiness-grid">${cards}</div></section>`;
+    return `<section class="cycle-league-readiness"><div class="section-title"><div><span class="eyebrow">League readiness</span><h3>Official and projected roster check</h3><p>Projected includes submitted renewals/delistings/elevations, trades already accepted by both coaches, and automatic expiry of any remaining Rookie contracts in the preseason window. Every <strong>official</strong> roster must be legal and every expired Main contract must be renewed or removed before the window can close.</p></div><span class="badge ${officialIllegal.length||expired.length?'amber':'green'}">${officialIllegal.length||expired.length?`${officialIllegal.length+expired.length} TO REVIEW`:'ALL OFFICIAL ROSTERS READY'}</span></div><div class="cycle-readiness-grid">${cards}</div></section>`;
   }
   function rosterCycleStatusCopy(cycle=rosterCycleState()){
     const setup=getSeasonSetup(),mid=midSeasonDraftRound(setup.midSeasonDraftAfterRound,setup.pegsRegularRounds);
     if(cycle.phase==='PRESEASON_LIST_PENDING')return 'The roster window is locked until the Commissioner captures and confirms the full current SuperCoach player list. Every player is then marked LISTED or UNLISTED against the official PEGS rosters.';
-    if(cycle.phase==='PRESEASON_WINDOW_OPEN')return 'The confirmed SuperCoach list supplies current prices and positions for renewal/elevation decisions. Any Rookie still on a Rookie contract when this window closes is automatically delisted into the draft pool.';
+    if(cycle.phase==='PRESEASON_WINDOW_OPEN')return 'The confirmed SuperCoach list supplies current prices and positions for renewal/elevation decisions. Every expired Main contract must be renewed or removed before this window can close. Any Rookie still on a Rookie contract when this window closes is automatically delisted into the draft pool.';
     if(cycle.phase==='PRESEASON_DRAFT')return 'List management is closed. Complete the Pre-Season Draft first; the Rookie Draft opens immediately afterwards in the same order.';
     if(cycle.phase==='ROOKIE_DRAFT')return 'The Pre-Season Draft is complete. Run the Rookie Draft now; there is no mid-season Rookie Draft.';
     if(cycle.phase==='ROSTERS_LOCKED')return `Teams are locked. After Round ${mid} closes, PEGS pauses for a fresh SuperCoach player-list capture before the Mid-Season Roster Window can open.`;
@@ -3339,8 +3386,12 @@
         const cycle=rosterCycleState(),phase=rosterCyclePhaseWindow(cycle.phase);if(!phase)return;
         const pending=rosterCyclePending(phase);
         if(pending.length){toast(`${pending.length} unresolved ${phase} request${pending.length===1?' remains':'s remain'}. Resolve every request before closing the roster window.`);commissionerTab='approvals';renderCommissionerControls();return;}
-        const readiness=rosterWindowOfficialReadiness(),illegal=readiness.illegal;
-        if(!readiness.ready){toast(`Roster window cannot close: ${illegal.map(t=>t.owner).join(', ')} ${illegal.length===1?'still has':'still have'} an illegal official roster.`);renderCommissionerControls();return;}
+        const readiness=rosterWindowOfficialReadiness(),illegal=readiness.illegal,expired=readiness.expired||[];
+        if(!readiness.ready){
+          if(expired.length){const preview=expired.slice(0,4).map(x=>`${x.owner}: ${x.player}`).join(', ');toast(`Roster window cannot close: ${expired.length} expired Main contract${expired.length===1?' remains':'s remain'} unresolved${preview?` (${preview}${expired.length>4?', …':''})`:''}. Renew or delist them first.`);}
+          else toast(`Roster window cannot close: ${illegal.map(t=>t.owner).join(', ')} ${illegal.length===1?'still has':'still have'} an illegal official roster.`);
+          renderCommissionerControls();return;
+        }
         try{
           const rookieExpiry=phase==='Pre-Season'?await autoDelistRemainingPreseasonRookies(cycle.season):{playerCount:0};
           const pool=await buildDraftPoolFromPlayerMaster(phase);

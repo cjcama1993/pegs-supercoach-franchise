@@ -76,6 +76,8 @@
     'SYDNEY':'SYD','SYDNEY SWANS':'SYD','WESTERN BULLDOGS':'WBD','WEST COAST':'WCE','WEST COAST EAGLES':'WCE'
   };
   let selectedRosterFilter = 'ALL';
+  let teamRosterViewMode = 'CURRENT';
+  const plannerPreviewTradeIds = new Set();
   let draftSelection = null;
   let draftSearch = '';
   let commissionerTab = 'scores';
@@ -112,7 +114,7 @@
   const UI_RENDER_STATE_KEYS = [OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,TRANSACTION_REVERSALS_KEY,DRAFT_STATE_KEY,PROPOSALS_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,DRAFT_POOL_KEY,FIGUREHEAD_OVERRIDE_KEY];
   function uiStateFingerprint(){ return UI_RENDER_STATE_KEYS.map(key=>localStorage.getItem(key)||'').join('\u241f') + '\u241e' + JSON.stringify(proposalCache||[]); }
 
-  const DRAFT_ROUNDS = { 'Pre-Season': 5, 'Mid-Season': 10 };
+  const DRAFT_ROUNDS = { 'Pre-Season': 5, 'Rookie Draft': 3, 'Mid-Season': 10 };
   const OPENING_ROUND_LAST_SEASON = 2026;
   function openingRoundBankingAllowed(season){ return Number(season||0) <= OPENING_ROUND_LAST_SEASON; }
 
@@ -242,21 +244,70 @@
     try { return JSON.parse(localStorage.getItem(DRAFT_STATE_KEY) || '{}'); } catch (_) { return {}; }
   }
   function saveDraftState(value) { localStorage.setItem(DRAFT_STATE_KEY, JSON.stringify(value)); void pushSharedState('draft_state', value); }
+  function rosterCycleTargetSeason(){
+    const setup=getSeasonSetup(),status=String(setup?.status||'').toUpperCase();
+    return Number(!setup?.active&&status==='COMPLETE'?Number(setup.season||D.meta.season||2026)+1:setup?.season||D.meta.season||2026);
+  }
+  function defaultRosterCycle(season=rosterCycleTargetSeason()){
+    const target=Number(season||rosterCycleTargetSeason()),setup=getSeasonSetup(),draft=getDraftState(),snaps=getScoringSnapshots()?.[String(target)]||{},isActive=Boolean(setup?.active&&Number(setup.season)===target),completed=Number(setup?.completedThroughRound||0),regular=Number(setup?.pegsRegularRounds||20),midAfter=midSeasonDraftRound(setup?.midSeasonDraftAfterRound,regular);
+    let phase='PRESEASON_WINDOW_OPEN';
+    if(draft?.active&&Number(draft.season)===target){const dt=normalizedDraftType(draft.type);phase=dt==='Mid-Season'?'MIDSEASON_DRAFT':dt==='Rookie Draft'?'ROOKIE_DRAFT':'PRESEASON_DRAFT';}
+    else if(isActive&&completed>=regular)phase='FINALS';
+    else if(isActive&&snaps.midSeason)phase='POST_MIDSEASON_LOCKED';
+    else if(isActive&&completed>=midAfter)phase='MIDSEASON_WINDOW_OPEN';
+    else if(snaps.preSeason)phase='ROSTERS_LOCKED';
+    return {season:target,phase,updatedAt:null,preSeasonWindowOpenedAt:phase==='PRESEASON_WINDOW_OPEN'?new Date().toISOString():null,preSeasonWindowClosedAt:null,preSeasonDraftCompletedAt:snaps.preSeason?.capturedAt||null,midSeasonWindowOpenedAt:phase==='MIDSEASON_WINDOW_OPEN'?new Date().toISOString():null,midSeasonWindowClosedAt:null,midSeasonDraftCompletedAt:snaps.midSeason?.capturedAt||null};
+  }
+  function rosterCyclePhaseWindow(phase){return phase==='PRESEASON_WINDOW_OPEN'?'Pre-Season':phase==='MIDSEASON_WINDOW_OPEN'?'Mid-Season':'';}
   function defaultProposalWindows(){
+    const cycle=defaultRosterCycle(),windowPhase=rosterCyclePhaseWindow(cycle.phase),open=Boolean(windowPhase),season=cycle.season;
     return {
-      trade:{open:false,phase:'Pre-Season',openedAt:null,closedAt:null},
-      delist:{open:false,phase:'Pre-Season',openedAt:null,closedAt:null},
-      elevation:{open:false,phase:'Pre-Season',season:null,openedAt:null,closedAt:null}
+      trade:{open,phase:windowPhase||'Pre-Season',openedAt:open?new Date().toISOString():null,closedAt:null},
+      delist:{open,phase:windowPhase||'Pre-Season',openedAt:open?new Date().toISOString():null,closedAt:null},
+      elevation:{open,phase:windowPhase||'Pre-Season',season,openedAt:open?new Date().toISOString():null,closedAt:null},
+      rosterCycle:cycle
+    };
+  }
+  function normalizeProposalWindows(saved){
+    const base=defaultProposalWindows(),target=rosterCycleTargetSeason(),prior=saved&&typeof saved==='object'?saved:{},savedCycle=prior.rosterCycle&&Number(prior.rosterCycle.season)===target?prior.rosterCycle:null,cycle={...defaultRosterCycle(target),...(savedCycle||{}),season:target},windowPhase=rosterCyclePhaseWindow(cycle.phase),open=Boolean(windowPhase),stamp=cycle.updatedAt||new Date().toISOString();
+    return {
+      trade:{...base.trade,...(prior.trade||{}),open,phase:windowPhase||prior.trade?.phase||'Pre-Season',openedAt:open?(prior.trade?.openedAt||stamp):prior.trade?.openedAt||null,closedAt:open?null:prior.trade?.closedAt||stamp},
+      delist:{...base.delist,...(prior.delist||{}),open,phase:windowPhase||prior.delist?.phase||'Pre-Season',openedAt:open?(prior.delist?.openedAt||stamp):prior.delist?.openedAt||null,closedAt:open?null:prior.delist?.closedAt||stamp},
+      elevation:{...base.elevation,...(prior.elevation||{}),open,phase:windowPhase||prior.elevation?.phase||'Pre-Season',season:target,openedAt:open?(prior.elevation?.openedAt||stamp):prior.elevation?.openedAt||null,closedAt:open?null:prior.elevation?.closedAt||stamp},
+      rosterCycle:cycle
     };
   }
   function getProposalWindows(){
-    try{
-      const saved=JSON.parse(localStorage.getItem(PROPOSAL_WINDOWS_KEY)||'null'),base=defaultProposalWindows();
-      if(!saved||typeof saved!=='object')return base;
-      return {trade:{...base.trade,...(saved.trade||{})},delist:{...base.delist,...(saved.delist||{})},elevation:{...base.elevation,...(saved.elevation||{})}};
-    }catch(_){return defaultProposalWindows();}
+    try{return normalizeProposalWindows(JSON.parse(localStorage.getItem(PROPOSAL_WINDOWS_KEY)||'null'));}
+    catch(_){return normalizeProposalWindows(null);}
   }
-  function saveProposalWindows(value){localStorage.setItem(PROPOSAL_WINDOWS_KEY,JSON.stringify(value));void pushSharedState('proposal_windows',value);}
+  function saveProposalWindows(value){const clean=normalizeProposalWindows(value);localStorage.setItem(PROPOSAL_WINDOWS_KEY,JSON.stringify(clean));void pushSharedState('proposal_windows',clean);return clean;}
+  function rosterCycleState(){return getProposalWindows().rosterCycle||defaultRosterCycle();}
+  function setRosterCyclePhase(phase,{season=null,reason=''}={}){
+    const w=getProposalWindows(),now=new Date().toISOString(),target=Number(season||w.rosterCycle?.season||rosterCycleTargetSeason()),cycle={...(w.rosterCycle||defaultRosterCycle()),season:target,phase:String(phase),updatedAt:now,lastReason:reason||''},windowPhase=rosterCyclePhaseWindow(phase),open=Boolean(windowPhase);
+    if(phase==='PRESEASON_WINDOW_OPEN')cycle.preSeasonWindowOpenedAt=now;
+    if(phase==='PRESEASON_DRAFT')cycle.preSeasonWindowClosedAt=now;
+    if(phase==='ROOKIE_DRAFT')cycle.preSeasonDraftCompletedAt=now;
+    if(phase==='ROSTERS_LOCKED')cycle.rookieDraftCompletedAt=now;
+    if(phase==='MIDSEASON_WINDOW_OPEN')cycle.midSeasonWindowOpenedAt=now;
+    if(phase==='MIDSEASON_DRAFT')cycle.midSeasonWindowClosedAt=now;
+    if(phase==='POST_MIDSEASON_LOCKED')cycle.midSeasonDraftCompletedAt=now;
+    if(phase==='FINALS')cycle.finalsLockedAt=cycle.finalsLockedAt||now;
+    const slot=(prev)=>({...prev,open,phase:windowPhase||prev?.phase||'Pre-Season',openedAt:open?now:prev?.openedAt||null,closedAt:open?null:now});
+    return saveProposalWindows({...w,trade:slot(w.trade),delist:slot(w.delist),elevation:{...slot(w.elevation),season:target},rosterCycle:cycle});
+  }
+  function rosterCyclePending(phaseLabel=''){
+    const wanted=normalizedDraftType(phaseLabel||rosterCyclePhaseWindow(rosterCycleState().phase)||'Pre-Season');
+    return proposalCache.filter(p=>['TRADE','DELIST','ELEVATION'].includes(String(p.type||'').toUpperCase())&&activeProposalStatus(p.status)&&normalizedDraftType(p.phase||'Pre-Season')===wanted);
+  }
+  function preSeasonRosterReady(season){
+    const target=Number(season||rosterCycleTargetSeason()),snap=getScoringSnapshots()?.[String(target)]?.preSeason,cycle=rosterCycleState();
+    return Boolean(snap&&Number(cycle.season)===target&&!['PRESEASON_WINDOW_OPEN','PRESEASON_DRAFT','ROOKIE_DRAFT'].includes(cycle.phase));
+  }
+  function rosterCycleBlocksRound(setup=getSeasonSetup()){
+    const c=rosterCycleState();if(!setup?.active||Number(c.season)!==Number(setup.season))return false;
+    return ['MIDSEASON_WINDOW_OPEN','MIDSEASON_DRAFT'].includes(c.phase);
+  }
   function getScoringSnapshots(){try{return JSON.parse(localStorage.getItem(SCORING_SNAPSHOTS_KEY)||'{}');}catch(_){return {};}}
   function saveScoringSnapshots(value){localStorage.setItem(SCORING_SNAPSHOTS_KEY,JSON.stringify(value));void pushSharedState('scoring_snapshots',value);}
   function cloneRosters(rosters){const out={};for(const [k,rows] of Object.entries(rosters||{}))out[k]=(rows||[]).map(r=>({...r}));return out;}
@@ -266,8 +317,8 @@
     const last=done.length?Math.max(...done):Number(setup.completedThroughRound||0);
     return Math.max(1,Number(setup.currentRound||1),last+1);
   }
-  function captureScoringSnapshot(stage,effectiveFromRound){
-    const season=String(currentSeason()),all=getScoringSnapshots();all[season]=all[season]||{};
+  function captureScoringSnapshot(stage,effectiveFromRound,seasonOverride=null){
+    const season=String(Number(seasonOverride||currentSeason())),all=getScoringSnapshots();all[season]=all[season]||{};
     const key=stage==='Mid-Season'?'midSeason':'preSeason';
     all[season][key]={stage,capturedAt:new Date().toISOString(),effectiveFromRound:Number(effectiveFromRound||1),rosters:cloneRosters(effectiveRosters())};
     saveScoringSnapshots(all);return all[season][key];
@@ -359,14 +410,26 @@
       aflFixtureCsv:'',rounds,pegsRegularRounds:20,pegsFixtures:(D.fixtures||[]).filter(x=>Number(x.round)<=20).map(x=>({...x})),
       finals:{enabled:true,format:'TOP4_PAGE',week1Round:21,preliminaryRound:22,grandFinalRound:23,bracket:null},liveScoringEnabled:true,updatedAt:null};
   }
-  function newSeasonTemplate(){
-    const season=Number(D.meta.season||2026)+1, regularRounds=20;
-    return {active:false,status:'SETUP',season,currentRound:1,completedThroughRound:0,openingRound:{enabled:false,label:'Opening Round (retired after 2026)',participants:[],bankDestinations:{}},aflFixtureCsv:'',rounds:[],pegsRegularRounds:regularRounds,pegsFixtures:generatePegsFixture(regularRounds),
-      finals:{enabled:true,format:'TOP4_PAGE',week1Round:regularRounds+1,preliminaryRound:regularRounds+2,grandFinalRound:regularRounds+3,bracket:null},liveScoringEnabled:true,updatedAt:null};
+  function seasonFinalsForRegularRounds(regularRounds,bracket=null){
+    const regular=Math.max(1,Math.round(Number(regularRounds||20)));
+    return {enabled:true,format:'TOP4_PAGE',week1Round:regular+1,preliminaryRound:regular+2,grandFinalRound:regular+3,bracket:bracket||null};
+  }
+  function midSeasonDraftRound(value,regularRounds){
+    const regular=Math.max(2,Math.round(Number(regularRounds||20))),fallback=Math.max(1,Math.floor(regular/2));
+    return Math.max(1,Math.min(regular-1,Math.round(Number(value||fallback))));
+  }
+  function newSeasonTemplate(previousSetup=null){
+    const priorSeason=Number(previousSetup?.season||D.meta.season||2026),season=priorSeason+1,regularRounds=20;
+    return {active:false,status:'SETUP',season,currentRound:1,completedThroughRound:0,openingRound:{enabled:false,label:'Opening Round (retired after 2026)',participants:[],bankDestinations:{}},aflFixtureCsv:'',aflGameCount:0,rounds:[],fixtureVerified:false,fixtureVerifiedAt:null,fixtureProviderYear:null,pegsRegularRounds:regularRounds,midSeasonDraftAfterRound:midSeasonDraftRound(null,regularRounds),pegsFixtures:generatePegsFixture(regularRounds),
+      finals:seasonFinalsForRegularRounds(regularRounds),liveScoringEnabled:true,updatedAt:null};
   }
   function normalizeSeasonSetup(value){
     const x=value&&typeof value==='object'?JSON.parse(JSON.stringify(value)):legacySeasonSetup(),season=Number(x.season||D.meta.season||2026),staticSeason=Number(D.meta.season||2026);
     x.season=season;
+    x.pegsRegularRounds=Math.max(1,Math.round(Number(x.pegsRegularRounds||20)));
+    x.midSeasonDraftAfterRound=midSeasonDraftRound(x.midSeasonDraftAfterRound,x.pegsRegularRounds);
+    x.finals=seasonFinalsForRegularRounds(x.pegsRegularRounds,x.finals?.bracket||null);
+    x.fixtureVerified=Boolean(x.fixtureVerified);
     if(Boolean(D.meta.seasonComplete)&&season===staticSeason){
       x.active=false;x.status='COMPLETE';x.currentRound=Number(D.meta.currentRound||23);x.completedThroughRound=Number(D.meta.completedThroughRound||D.meta.currentRound||23);
     }
@@ -391,8 +454,13 @@
   function getOpeningBank(){ try { return JSON.parse(localStorage.getItem(OPENING_BANK_KEY)||'{}'); } catch(_){ return {}; } }
   function saveOpeningBank(value){ localStorage.setItem(OPENING_BANK_KEY,JSON.stringify(value)); void pushSharedState('opening_bank',value); }
   function activeSeasonSetup(){ const x=getSeasonSetup(); return x&&x.active?x:null; }
-  function currentSeason(){ return Number(activeSeasonSetup()?.season||D.meta.season||2026); }
-  function effectiveCurrentRound(){ return Number(activeSeasonSetup()?.currentRound||D.meta.currentRound||1); }
+  function completedDynamicSeasonSetup(){
+    const x=getSeasonSetup(),staticSeason=Number(D.meta.season||2026);
+    return x&&!x.active&&String(x.status||'').toUpperCase()==='COMPLETE'&&Number(x.season||0)>staticSeason?x:null;
+  }
+  function seasonDisplaySetup(){ return activeSeasonSetup()||completedDynamicSeasonSetup(); }
+  function currentSeason(){ return Number(seasonDisplaySetup()?.season||D.meta.season||2026); }
+  function effectiveCurrentRound(){ return Number(seasonDisplaySetup()?.currentRound||D.meta.currentRound||1); }
   function finalsConfig(setup=activeSeasonSetup()||getSeasonSetup()){
     const regular=Number(setup?.pegsRegularRounds||20),f=setup?.finals||{};
     return {enabled:f.enabled!==false,format:'TOP4_PAGE',week1Round:Number(f.week1Round||regular+1),preliminaryRound:Number(f.preliminaryRound||regular+2),grandFinalRound:Number(f.grandFinalRound||regular+3),bracket:f.bracket||null};
@@ -413,19 +481,20 @@
     return {...b,qf,ef,pf,gf};
   }
   function effectiveFinals(){
-    const setup=activeSeasonSetup();
+    const setup=seasonDisplaySetup();
     if(!setup)return (D.finals||[]).map((x,i)=>{const base={...x,label:Number(x.round)===23?'Grand Final':Number(x.round)===22?'Preliminary Final':i===0?'Qualifying Final':'Elimination Final'};if(!hasScoreCorrections()||!x.home||!x.away)return base;const homeScore=calcTeamRound(Number(x.round),x.home).actual,awayScore=calcTeamRound(Number(x.round),x.away).actual;return {...base,homeScore,awayScore,winner:homeScore>awayScore?x.home:awayScore>homeScore?x.away:null};});
     const b=calculatedFinalsBracket(setup); if(!b)return [];
     return [b.qf,b.ef,b.pf,b.gf].filter(x=>x?.home).map(x=>{const r=x.away?finalsResult(x.round,x.home,x.away):null;return {...x,homeScore:r?.homeScore,awayScore:r?.awayScore,winner:r?.winner};});
   }
   function roundLabel(round){
     const n=Number(round),f=finalsConfig();
-    if(activeSeasonSetup()?.finals?.enabled!==false){if(n===f.week1Round)return 'Finals Week 1';if(n===f.preliminaryRound)return 'Preliminary Final';if(n===f.grandFinalRound)return 'Grand Final';}
-    if(!activeSeasonSetup()){if(n===23)return 'Grand Final';if(n===22)return 'Preliminary Final';if(n===21)return 'Finals Week 1';}
+    const context=seasonDisplaySetup();
+    if(context?.finals?.enabled!==false){if(n===f.week1Round)return 'Finals Week 1';if(n===f.preliminaryRound)return 'Preliminary Final';if(n===f.grandFinalRound)return 'Grand Final';}
+    if(!context){if(n===23)return 'Grand Final';if(n===22)return 'Preliminary Final';if(n===21)return 'Finals Week 1';}
     return `Round ${n}`;
   }
   function effectiveFixtures(){
-    const x=activeSeasonSetup(); if(!x)return D.fixtures;
+    const x=seasonDisplaySetup(); if(!x)return D.fixtures;
     const regular=Array.isArray(x.pegsFixtures)?x.pegsFixtures:[];
     const finals=effectiveFinals().filter(f=>f.away).map(f=>({round:Number(f.round),home:f.home,away:f.away,finalType:f.label}));
     return [...regular,...finals];
@@ -619,6 +688,8 @@
   }
   async function respondTrade(id,accept){
     if(!teamLoggedIn())throw new Error('Team login required.');
+    const proposal=proposalCache.find(p=>String(p.id)===String(id));
+    if(accept&&proposal&&!proposalWindowOpen('TRADE',proposal.phase||'Pre-Season'))throw new Error('This trade expired when the roster window closed.');
     const out=await backendFetch('/rest/v1/rpc/pegs_respond_trade',{method:'POST',body:JSON.stringify({p_proposal_id:Number(id),p_accept:Boolean(accept)})});
     await syncProposals();updateSessionUI();return normalizeProposal(out);
   }
@@ -745,20 +816,11 @@
     const who=await whoRes.json();if(String(who?.role||'').toLowerCase()!=='commissioner')throw new Error('This password is not for the Commissioner account.');
     return true;
   }
-  const AUTO_BACKUP_STATE_KEYS=new Set(['score_overrides','selection_overrides','commissioner_actions','transaction_reversals','draft_state','season_setup','season_results','proposal_windows','scoring_snapshots','figurehead_overrides','opening_bank','proposal_status','draft_pool']);
-  const AUTO_BACKUP_LABELS={score_overrides:'score correction',selection_overrides:'selection correction',commissioner_actions:'league transaction',transaction_reversals:'transaction reversal',draft_state:'draft state',season_setup:'season / finals setup',season_results:'season results',proposal_windows:'league windows',scoring_snapshots:'scoring roster lock',figurehead_overrides:'figureheads',opening_bank:'Opening Round bank',proposal_status:'proposal decision',draft_pool:'draft pool'};
+  // v14.7.5 archive model: PEGS creates automatic archives only when a round
+  // is formally finalised. All other Commissioner changes are covered by the
+  // single manual archive action in Data & Recovery.
   function cancelPendingAutoBackup(){if(autoBackupTimer){clearTimeout(autoBackupTimer);autoBackupTimer=null;}autoBackupKeys.clear();}
-  function queueAutoBackup(key){
-    if(!AUTO_BACKUP_STATE_KEYS.has(key)||!backendConfigured()||!commissionerLoggedIn())return;
-    autoBackupKeys.add(key);if(autoBackupTimer)clearTimeout(autoBackupTimer);
-    autoBackupTimer=setTimeout(async()=>{
-      autoBackupTimer=null;const keys=[...autoBackupKeys];autoBackupKeys.clear();
-      const labels=[...new Set(keys.map(k=>AUTO_BACKUP_LABELS[k]||k))];
-      const label=`Automatic checkpoint · ${labels.slice(0,3).join(', ')}${labels.length>3?' + more':''}`;
-      try{await createServerBackup('AUTO_CHANGE',label);if(commissionerTab==='backups'&&commissionerDialog.open)renderCommissionerControls();}
-      catch(e){console.warn('Automatic PEGS checkpoint failed',e);}
-    },1800);
-  }
+  function queueAutoBackup(){ /* intentionally disabled - round finalisation owns automatic archiving */ }
   async function pushSharedState(key,value) {
     if(!backendConfigured() || !commissionerLoggedIn()) return;
     try { await commissionerFetch('/rest/v1/pegs_state?on_conflict=key',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({key,value,updated_at:new Date().toISOString()})}); queueAutoBackup(key); } catch(e){ console.warn('Shared PEGS state update failed',e); }
@@ -1212,8 +1274,8 @@
     const created=await commissionerFetch('/rest/v1/pegs_draft_pools',{method:'POST',headers:{Prefer:'return=representation'},body:JSON.stringify(rec)});draftPoolCache=created?.[0]||rec;localStorage.setItem(DRAFT_POOL_KEY,JSON.stringify(draftPoolCache));onProgress(18,'DONE');return draftPoolCache;
   }
   function draftPoolStatusHtml(type){
-    const p=draftPoolRecord(),phase=normalizedDraftType(type),season=draftSeasonFor(phase),match=p&&p.complete&&Number(p.season)===season&&normalizedDraftType(p.phase)===phase;
-    if(!match)return `<div class="notice danger"><strong>No complete ${esc(phase)} draft pool.</strong> Refresh all 18 AFL clubs immediately before starting the draft. PEGS will freeze current prices and remove every player already on a PEGS list.</div>`;
+    const p=draftPoolRecord(),phase=normalizedDraftType(type),poolPhase=draftPoolPhase(phase),season=draftSeasonFor(phase),match=p&&p.complete&&Number(p.season)===season&&normalizedDraftType(p.phase)===poolPhase;
+    if(!match)return `<div class="notice danger"><strong>No complete ${esc(poolPhase)} player pool.</strong> ${phase==='Rookie Draft'?'The Rookie Draft reuses the frozen Pre-Season pool, so complete the Pre-Season pool refresh first.':'Refresh all 18 AFL clubs immediately before starting the draft.'} PEGS freezes current prices and removes every player already on a PEGS list.</div>`;
     return `<div class="notice"><strong>Frozen draft pool ready:</strong> ${p.player_count||p.players?.length||0} unrostered AFL players · 18/18 clubs · captured ${fmtDate(p.captured_at)}. Prices will not change once the draft starts.</div>`;
   }
 
@@ -1241,17 +1303,24 @@
   async function loadTeamAccounts(){try{const x=await teamAccountAdmin('list');teamAccountsCache=x.accounts||[];}catch(e){console.warn(e);teamAccountsCache=[];}return teamAccountsCache;}
   function credentialsTable(credentials){if(!credentials?.length)return '<div class="notice">No new passwords were generated.</div>';return `<div class="credential-sheet" id="credential-sheet"><div class="credential-head"><span>Coach</span><span>Username</span><span>6-letter password</span></div>${credentials.map(c=>`<div><strong>${esc(c.coachName)}</strong><span>${esc(c.username)}</span><code>${esc(c.password)}</code></div>`).join('')}</div><div class="notice danger"><strong>Copy these now.</strong> Passwords are not stored in PEGS and cannot be displayed again; you can reset a team later.</div>`;}
 
+  function archivedSeasonRound(){const setup=getSeasonSetup();if(Boolean(D.meta.seasonComplete)&&!activeSeasonSetup()&&Number(currentSeason())===Number(D.meta.season||2026))return Number(D.meta.completedThroughRound||D.meta.currentRound||23);return Number(setup?.completedThroughRound||setup?.currentRound||effectiveCurrentRound());}
   function backupDerivedData(){
-    return {meta:{league:D.meta.league,season:currentSeason(),round:effectiveCurrentRound(),createdAt:new Date().toISOString(),archiveVersion:'14.4'},rules:D.rules,teams:D.teams,rosters:effectiveRosters(),ladder:effectiveLadder(),fixtures:effectiveFixtures(),finals:effectiveFinals(),transactions:[...getCommissionerActions().filter(x=>x.status==='CONFIRMED'),...visibleLegacyTransactions()],draftHistory:[...D.draft.filter(d=>!Object.keys(getTransactionReversals()).map(k=>LEGACY_TRANSACTION_META[k]).filter(m=>m?.type==='Drafted'&&m.pick).some(m=>Number(m.pick)===Number(d.pick)&&m.team===d.team&&canonicalPlayerName(m.players?.[0]||'')===canonicalPlayerName(d.player))),...getCommissionerActions().filter(x=>x.type==='Drafted'&&x.status==='CONFIRMED')],pickOwnership:{preSeason:draftPickLedger('Pre-Season'),midSeason:draftPickLedger('Mid-Season')},honours:D.honours};
+    return {meta:{league:D.meta.league,season:currentSeason(),round:archivedSeasonRound(),createdAt:new Date().toISOString(),archiveVersion:'14.8.0'},rules:D.rules,teams:D.teams,rosters:effectiveRosters(),ladder:effectiveLadder(),fixtures:effectiveFixtures(),finals:effectiveFinals(),transactions:[...getCommissionerActions().filter(x=>x.status==='CONFIRMED'),...visibleLegacyTransactions()],draftHistory:[...D.draft.filter(d=>!Object.keys(getTransactionReversals()).map(k=>LEGACY_TRANSACTION_META[k]).filter(m=>m?.type==='Drafted'&&m.pick).some(m=>Number(m.pick)===Number(d.pick)&&m.team===d.team&&canonicalPlayerName(m.players?.[0]||'')===canonicalPlayerName(d.player))),...getCommissionerActions().filter(x=>x.type==='Drafted'&&x.status==='CONFIRMED')],pickOwnership:{preSeason:draftPickLedger('Pre-Season'),rookieDraft:draftPickLedger('Rookie Draft'),midSeason:draftPickLedger('Mid-Season')},honours:D.honours};
   }
   async function syncBackups(){if(!commissionerLoggedIn())return [];try{backupCache=await commissionerFetch('/rest/v1/pegs_backups?select=id,created_at,season,round,label,reason&order=created_at.desc&limit=100')||[];}catch(e){console.warn(e);backupCache=[];}return backupCache;}
   async function createServerBackup(reason='MANUAL',label=''){
-    if(reason!=='AUTO_CHANGE')cancelPendingAutoBackup();
+    cancelPendingAutoBackup();
+    await syncCompletedSeasonRecoveryState();
     const id=await commissionerFetch('/rest/v1/rpc/pegs_create_backup',{method:'POST',body:JSON.stringify({p_label:label,p_reason:reason,p_derived:backupDerivedData()})});await syncBackups();return id;
   }
   async function getBackupSnapshot(id){const rows=await commissionerFetch('/rest/v1/pegs_backups?select=*&id=eq.'+encodeURIComponent(id)+'&limit=1');if(!rows?.[0])throw new Error('Restore point not found.');return rows[0];}
   function downloadBlob(name,blob){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),500);}
-  async function ensureSheetJs(){if(globalThis.XLSX)return globalThis.XLSX;await new Promise((resolve,reject)=>{const sc=document.createElement('script');sc.src='https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';sc.onload=resolve;sc.onerror=()=>reject(new Error('Excel library could not be loaded.'));document.head.appendChild(sc);});return globalThis.XLSX;}
+  let localExcelWriterPromise=null;
+  async function ensureLocalExcelWriter(){
+    if(globalThis.PEGS_XLSX?.buildWorkbook)return globalThis.PEGS_XLSX;
+    if(!localExcelWriterPromise)localExcelWriterPromise=new Promise((resolve,reject)=>{const sc=document.createElement('script');sc.src='./vendor/pegs-xlsx.js';sc.onload=()=>globalThis.PEGS_XLSX?.buildWorkbook?resolve(globalThis.PEGS_XLSX):reject(new Error('Local Excel writer did not initialise.'));sc.onerror=()=>reject(new Error('Local Excel writer could not be loaded.'));document.head.appendChild(sc);});
+    return localExcelWriterPromise;
+  }
   let legacyArchiveLoadPromise=null;
   async function ensureLegacyArchiveLoaded(){
     if(D.legacyArchive)return D.legacyArchive;
@@ -1259,8 +1328,43 @@
     if(!legacyArchiveLoadPromise)legacyArchiveLoadPromise=new Promise((resolve,reject)=>{const sc=document.createElement('script');sc.src='./legacy-archive-data.js';sc.onload=()=>{if(globalThis.PEGS_LEGACY_ARCHIVE){D.legacyArchive=globalThis.PEGS_LEGACY_ARCHIVE;resolve(D.legacyArchive);}else reject(new Error('Legacy archive data did not initialise.'));};sc.onerror=()=>reject(new Error('Legacy archive data could not be loaded.'));document.head.appendChild(sc);});
     return legacyArchiveLoadPromise;
   }
+  function completedWorkbookSeasonResults(){
+    const existing=getSeasonResults(),out={...existing},season=String(Number(D.meta.season||2026));
+    if(!D.meta.seasonComplete)return out;
+    const rounds={};
+    const maxRound=Number(D.meta.completedThroughRound||D.meta.currentRound||23);
+    for(let round=1;round<=maxRound;round++){
+      const teamScores={...(D.roundTotals?.[String(round)]||{})},players={};
+      for(const t of D.teams||[]){
+        players[t.key]=(D.roundScores?.[String(round)]?.[t.key]||[]).filter(p=>String(p.status||'Field').toLowerCase()==='field').map(p=>({...p,scoreSource:p.scoreSource||'2026 completed workbook archive'}));
+      }
+      rounds[String(round)]={round,teamScores,players,finalizedAt:'2026-09-20T00:00:00+10:00',topPlayers:Number(D.roundSchedule?.[String(round)]?.topPlayers||D.roundSchedule?.[String(round)]?.aflTeamsPlaying||D.meta.topPlayersDefault||18),feedGames:{archived:true,source:'Completed 2026 workbook'}};
+    }
+    out[season]=rounds;return out;
+  }
+  function recoveryStateSnapshot(){
+    const archived=Boolean(D.meta.seasonComplete)&&Number(currentSeason())===Number(D.meta.season||2026),setup=archived?normalizeSeasonSetup(legacySeasonSetup()):getSeasonSetup(),results=archived?completedWorkbookSeasonResults():getSeasonResults();
+    return {score_overrides:getOverrides(),selection_overrides:getSelectionOverrides(),commissioner_actions:getCommissionerActions(),transaction_reversals:getTransactionReversals(),draft_state:getDraftState(),proposal_windows:getProposalWindows(),scoring_snapshots:getScoringSnapshots(),figurehead_overrides:getFigureheadOverrides(),season_setup:setup,season_results:results,live_feed:archived?{}:getLiveFeed(),opening_bank:getOpeningBank(),archive_model:{version:'14.7.8',baselineCleaned:true,rosterCycleCaptured:true}};
+  }
+  async function syncCompletedSeasonRecoveryState(){
+    if(!backendConfigured()||!commissionerLoggedIn()||!D.meta.seasonComplete||Number(currentSeason())!==Number(D.meta.season||2026))return false;
+    const state=recoveryStateSnapshot(),now=new Date().toISOString(),rows=[{key:'season_setup',value:state.season_setup,updated_at:now},{key:'season_results',value:state.season_results,updated_at:now},{key:'live_feed',value:{},updated_at:now}];
+    await commissionerFetch('/rest/v1/pegs_state?on_conflict=key',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(rows)});
+    localStorage.setItem(SEASON_SETUP_KEY,JSON.stringify(state.season_setup));localStorage.setItem(SEASON_RESULTS_KEY,JSON.stringify(state.season_results));localStorage.setItem(LIVE_FEED_KEY,'{}');return true;
+  }
   function currentLocalRecoverySnapshot(){
-    return {schemaVersion:14,createdAt:new Date().toISOString(),state:{score_overrides:getOverrides(),selection_overrides:getSelectionOverrides(),commissioner_actions:getCommissionerActions(),transaction_reversals:getTransactionReversals(),draft_state:getDraftState(),proposal_windows:getProposalWindows(),scoring_snapshots:getScoringSnapshots(),figurehead_overrides:getFigureheadOverrides(),season_setup:getSeasonSetup(),season_results:getSeasonResults(),live_feed:getLiveFeed(),opening_bank:getOpeningBank()},proposals:proposalCache||[],draftPools:draftPoolCache?[draftPoolCache]:[],rosterAuthority:effectiveRosters(),pickAuthority:[...draftPickLedger('Pre-Season'),...draftPickLedger('Mid-Season')],auditLog:auditCache||[],derived:backupDerivedData()};
+    return {schemaVersion:14,createdAt:new Date().toISOString(),state:recoveryStateSnapshot(),proposals:proposalCache||[],draftPools:draftPoolCache?[draftPoolCache]:[],rosterAuthority:effectiveRosters(),pickAuthority:[...draftPickLedger('Pre-Season'),...draftPickLedger('Mid-Season')],auditLog:auditCache||[],derived:backupDerivedData()};
+  }
+  async function ensure2026ArchiveBaseline(){
+    if(!commissionerLoggedIn()||!backendConfigured()||!D.meta.seasonComplete||activeSeasonSetup()||Number(currentSeason())!==Number(D.meta.season||2026))return false;
+    try{
+      const marker=await commissionerFetch('/rest/v1/pegs_state?select=value&key=eq.archive_model&limit=1');
+      if(String(marker?.[0]?.value?.version||'')==='14.7.8'&&marker?.[0]?.value?.baselineCleaned===true&&marker?.[0]?.value?.rosterCycleCaptured===true)return false;
+      cancelPendingAutoBackup();await syncCompletedSeasonRecoveryState();await Promise.all([syncProposals(),loadDraftPool(),syncAudit()]);
+      const snapshot=currentLocalRecoverySnapshot(),season=Number(D.meta.season||2026),round=Number(D.meta.completedThroughRound||D.meta.currentRound||23),label=`Round ${round} · ${season} season closed`;
+      await commissionerFetch('/rest/v1/rpc/pegs_replace_backups_with_snapshot',{method:'POST',body:JSON.stringify({p_label:label,p_reason:'ROUND_FINALIZED',p_snapshot:snapshot})});
+      await syncBackups();return true;
+    }catch(e){console.warn('2026 archive baseline migration failed',e);throw new Error((e.message||'Archive baseline migration failed.')+' Run V14_7_5_ARCHIVE_MODEL.sql in Supabase, then refresh Data & Recovery.');}
   }
   function archiveJson(value){try{return JSON.stringify(value??null);}catch(_){return String(value??'');}}
   function archiveTeamName(key){const t=team(key);return {TeamKey:String(key||''),Franchise:t.name||key,Coach:t.owner||key};}
@@ -1306,7 +1410,7 @@
       {Sheet:'System State',Purpose:'Every persisted PEGS state object as JSON for audit/recovery'},
       {Sheet:'Recovery Snapshot',Purpose:'Complete machine-readable restore snapshot split across Excel rows'}
     ];
-    const summary=[{League:d.meta?.league||D.meta.league,ArchiveVersion:'14.4',SnapshotCreated:snapshot?.createdAt||d.meta?.createdAt||new Date().toISOString(),CurrentSeason:current,CurrentRound:Number(d.meta?.round||state.season_setup?.currentRound||effectiveCurrentRound()),LegacyWorkbookSeason:staticSeason,LegacyWorkbook:D.meta.generatedFrom||'PEGS legacy workbook',SeasonStatus:current===staticSeason?(D.meta.seasonStatus||''):(state.season_setup?.status||'ACTIVE'),Premier:current===staticSeason?team(D.meta.premier).name:'',RunnerUp:current===staticSeason?team(D.meta.runnerUp).name:''}];
+    const summary=[{League:d.meta?.league||D.meta.league,ArchiveVersion:'14.7.5',SnapshotCreated:snapshot?.createdAt||d.meta?.createdAt||new Date().toISOString(),CurrentSeason:current,CurrentRound:Number(d.meta?.round||state.season_setup?.currentRound||effectiveCurrentRound()),LegacyWorkbookSeason:staticSeason,LegacyWorkbook:D.meta.generatedFrom||'PEGS legacy workbook',SeasonStatus:current===staticSeason?(D.meta.seasonStatus||''):(state.season_setup?.status||'ACTIVE'),Premier:current===staticSeason?team(D.meta.premier).name:'',RunnerUp:current===staticSeason?team(D.meta.runnerUp).name:''}];
     const rules=[];for(const [k,v] of Object.entries(D.rules||{})){if(k==='positionMax'){for(const [pos,max] of Object.entries(v||{}))rules.push({Category:'Position maximum',Setting:pos,Value:max});}else if(k==='notes'){(v||[]).forEach((note,i)=>rules.push({Category:'Rule note',Setting:`Note ${i+1}`,Value:note}));}else rules.push({Category:'League rule',Setting:k,Value:typeof v==='object'?archiveJson(v):v});}for(const [k,v] of Object.entries(D.settings||{}))rules.push({Category:`${staticSeason} workbook setting`,Setting:k,Value:typeof v==='object'?archiveJson(v):v});if(D.openingRound){rules.push({Category:`${staticSeason} Opening Round archive`,Setting:'Historical only',Value:Boolean(D.openingRound.historicalOnly)});rules.push({Category:`${staticSeason} Opening Round archive`,Setting:'AFL teams playing',Value:Number(D.openingRound.aflTeamsPlaying||0)});rules.push({Category:`${staticSeason} Opening Round archive`,Setting:'Banking note',Value:D.openingRound.bankingNote||''});rules.push({Category:`${staticSeason} Opening Round archive`,Setting:'Bye banks',Value:archiveJson(D.openingRound.byeBanks||{})});rules.push({Category:`${staticSeason} Opening Round archive`,Setting:'Retired after season',Value:Number(D.openingRound.retiredAfterSeason||staticSeason)});}for(const [k,v] of Object.entries(legacy.draftSettings||{}))rules.push({Category:`${staticSeason} legacy draft setting`,Setting:k,Value:typeof v==='object'?archiveJson(v):v});(legacy.consolidationNotes||[]).forEach((note,i)=>rules.push({Category:'Archive consolidation',Setting:`Note ${i+1}`,Value:note}));
     const teams=(D.teams||[]).map(t=>({TeamKey:t.key,Coach:t.owner,Franchise:t.name,Code:t.code,MainSalary:Number(t.caps?.main||0),FieldSalary:Number(t.caps?.field||0),RookieSalary:Number(t.caps?.rookie||0),FieldPlayers:Number(t.counts?.field||0),InterchangePlayers:Number(t.counts?.interchange||0),DEF:Number(t.counts?.DEF||0),MID:Number(t.counts?.MID||0),FWD:Number(t.counts?.FWD||0),RUC:Number(t.counts?.RUC||0)}));
     const teamLists=[];for(const [k,rows] of Object.entries(d.rosters||effectiveRosters()))for(const p of rows||[])teamLists.push({...archiveTeamName(k),Player:p.player,AFLClub:p.club,Position:p.position,Contract:p.contract,Salary:Number(p.salary||0),ContractEnd:p.contractEnd,ListLocation:p.status});
@@ -1345,25 +1449,23 @@
     const proposals=(snapshot?.proposals||[]).map(p=>({ID:p.id||'',CreatedAt:p.created_at||p.createdAt||'',Type:p.type||'',Phase:p.phase||'',Proposer:p.proposer_team||p.proposerTeam||'',Counterparty:p.counterparty_team||p.counterpartyTeam||'',Status:p.status||'',DecidedAt:p.decided_at||p.decidedAt||'',PayloadJSON:archiveJson(p.payload||{}),RawJSON:archiveJson(p)}));
     const draftPools=[],draftPoolPlayers=[];for(const pool of snapshot?.draftPools||[]){draftPools.push({SessionID:pool.session_id||pool.sessionId||'',Season:Number(pool.season||0),Phase:pool.phase||'',CapturedAt:pool.captured_at||pool.capturedAt||'',Source:pool.source||'',Complete:Boolean(pool.complete),ClubCount:Number(pool.club_count||pool.clubCount||0),PlayerCount:Number(pool.player_count||pool.playerCount||((pool.players||[]).length))});for(const p of pool.players||[])draftPoolPlayers.push({SessionID:pool.session_id||pool.sessionId||'',Season:Number(pool.season||0),Phase:pool.phase||'',Player:p.player||p.name||'',AFLClub:p.club||'',Position:p.position||'',Price:Number(p.price||p.salary||0),RawJSON:archiveJson(p)});}
     const auditLog=(snapshot?.auditLog||[]).map(a=>({ID:a.id||'',CreatedAt:a.created_at||a.createdAt||'',ActorRole:a.actor_role||a.actorRole||'',ActorTeam:a.actor_team||a.actorTeam||'',Action:a.action||'',EntityType:a.entity_type||a.entityType||'',EntityID:a.entity_id||a.entityId||'',DetailJSON:archiveJson(a.detail||{})}));
-    const systemState=Object.entries(state||{}).map(([key,value])=>({StateKey:key,JSON:archiveJson(value)}));
+    const systemState=[];for(const [key,value] of Object.entries(state||{})){const text=archiveJson(value);for(let i=0,part=1;i<Math.max(1,text.length);i+=30000,part++)systemState.push({StateKey:key,Part:part,JSON:text.slice(i,i+30000)});}
     const snapshotText=archiveJson(snapshot),recoverySnapshot=[];for(let i=0,part=1;i<snapshotText.length;i+=30000,part++)recoverySnapshot.push({Part:part,JSON:snapshotText.slice(i,i+30000)});
     return {guide,summary,rules,teams,teamLists,rosterHistory,fixtures,roundSchedule,roundResults,legacyRoundTotals,playerScores,pegsScoreSource,aflScoreHistory,ladder,finals,gfHistorySummary,gfPlayerHistory,honours,legacyRulebook,teamIdentityHistory,delistingHistory,tradeHistoryAll,legacyDraftHistory,weeklyPlayerHistory,workbookMap,transactions,legacyTransactionSource,draftHistory,draftSourceLog,draftOrderHistory,draftTiming,pickOwnership,playerMaster,seasonSettings,proposals,draftPools,draftPoolPlayers,auditLog,systemState,recoverySnapshot};
   }
   async function writeArchiveWorkbook(snapshot,filename){
     await ensureLegacyArchiveLoaded();
-    const X=await ensureSheetJs(),rows=backupSheetRows(snapshot),wb=X.utils.book_new();
-    const add=(name,data,widths=[])=>{const ws=X.utils.json_to_sheet(data?.length?data:[{Info:'No records'}]);if(widths.length)ws['!cols']=widths.map(w=>({wch:w}));X.utils.book_append_sheet(wb,ws,name);};
+    const writer=await ensureLocalExcelWriter(),rows=backupSheetRows(snapshot),sheets=[];
+    const add=(name,data,widths=[])=>sheets.push({name,data:data?.length?data:[{Info:'No records'}],widths});
     add('Archive Guide',rows.guide,[26,88]);add('League Summary',rows.summary,[24,22,22,16,16,20,34,18,28,28]);add('Rules',rows.rules,[24,30,88]);add('Teams',rows.teams);add('Team Lists',rows.teamLists);add('Roster History',rows.rosterHistory);add('Fixtures',rows.fixtures);add('Round Schedule',rows.roundSchedule);add('Round Results',rows.roundResults);add('Legacy Round Totals',rows.legacyRoundTotals);add('Player Scores',rows.playerScores);add('PEGS Score Source',rows.pegsScoreSource);add('AFL Score History',rows.aflScoreHistory);add('Ladder',rows.ladder);add('Finals',rows.finals);add('GF History Summary',rows.gfHistorySummary);add('GF Player History',rows.gfPlayerHistory);add('Honours',rows.honours);add('Legacy Rulebook',rows.legacyRulebook,[34,14,100,12]);add('Team Identity History',rows.teamIdentityHistory,[16,34,20,55,40,12]);add('Delisting History',rows.delistingHistory);add('Trade History',rows.tradeHistoryAll);add('Legacy Draft History',rows.legacyDraftHistory);add('Weekly Player History',rows.weeklyPlayerHistory);add('Workbook Map',rows.workbookMap,[34,12,12,28,48]);add('Transactions',rows.transactions);add('Legacy Transaction Source',rows.legacyTransactionSource);add('Draft History',rows.draftHistory);add('Draft Source Log',rows.draftSourceLog);add('Draft Order History',rows.draftOrderHistory);add('Draft Timing',rows.draftTiming);add('Draft Pick Ownership',rows.pickOwnership);add('Player Master',rows.playerMaster);add('Season Settings',rows.seasonSettings);add('Proposals',rows.proposals);add('Draft Pools',rows.draftPools);add('Draft Pool Players',rows.draftPoolPlayers);add('Audit Log',rows.auditLog);add('System State',rows.systemState,[26,120]);add('Recovery Snapshot',rows.recoverySnapshot,[10,120]);
-    X.writeFile(wb,filename);
+    const blob=await writer.buildWorkbook(sheets);downloadBlob(filename,blob);
   }
   async function exportBackupExcel(id){const rec=await getBackupSnapshot(id);await writeArchiveWorkbook(rec.snapshot,`PEGS-League-Archive-${rec.season||currentSeason()}-R${rec.round||0}-${id}.xlsx`);}
   async function exportCurrentLeagueExcel(){
-    if(backendConfigured()&&commissionerLoggedIn()){
-      const id=await createServerBackup('MANUAL_EXPORT','Excel league archive exported'),rec=await getBackupSnapshot(id);await writeArchiveWorkbook(rec.snapshot,`PEGS-League-Archive-${rec.season||currentSeason()}-${new Date().toISOString().slice(0,10)}.xlsx`);return id;
-    }
-    await writeArchiveWorkbook(currentLocalRecoverySnapshot(),`PEGS-League-Archive-${currentSeason()}-${new Date().toISOString().slice(0,10)}.xlsx`);return null;
+    if(backendConfigured()&&commissionerLoggedIn())await syncCompletedSeasonRecoveryState();
+    const snapshot=currentLocalRecoverySnapshot();await writeArchiveWorkbook(snapshot,`PEGS-League-Archive-${currentSeason()}-${new Date().toISOString().slice(0,10)}.xlsx`);return null;
   }
-  async function restoreServerBackup(id){if(!commissionerLoggedIn())throw new Error('Commissioner login required.');const rec=backupCache.find(x=>String(x.id)===String(id));const when=rec?.created_at?fmtDate(rec.created_at):`#${id}`;const typed=prompt(`Restore PEGS to ${when}? A safeguard of the current state will be created first. Type RESTORE to continue.`);if(typed!=='RESTORE')return false;cancelPendingAutoBackup();await commissionerFetch('/rest/v1/rpc/pegs_restore_backup',{method:'POST',body:JSON.stringify({p_backup_id:Number(id)})});[OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,TRANSACTION_REVERSALS_KEY,DRAFT_STATE_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,FIGUREHEAD_OVERRIDE_KEY,DRAFT_POOL_KEY].forEach(k=>localStorage.removeItem(k));draftPoolCache=null;proposalCache=[];await pullSharedState();await syncProposals();await loadDraftPool();await syncBackups();await syncServerAuthority();return true;}
+  async function restoreServerBackup(id){if(!commissionerLoggedIn())throw new Error('Commissioner login required.');const rec=backupCache.find(x=>String(x.id)===String(id));const when=rec?.created_at?fmtDate(rec.created_at):`#${id}`;const label=rec?.label||'this archive';const typed=prompt(`Restore PEGS to ${label} (${when})? This replaces the current league state. Team login passwords are not affected. Type RESTORE to continue.`);if(typed!=='RESTORE')return false;cancelPendingAutoBackup();await commissionerFetch('/rest/v1/rpc/pegs_restore_backup',{method:'POST',body:JSON.stringify({p_backup_id:Number(id)})});[OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,TRANSACTION_REVERSALS_KEY,DRAFT_STATE_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,FIGUREHEAD_OVERRIDE_KEY,DRAFT_POOL_KEY].forEach(k=>localStorage.removeItem(k));draftPoolCache=null;proposalCache=[];await pullSharedState();await syncProposals();await loadDraftPool();await syncBackups();await syncServerAuthority();return true;}
   async function syncAudit(){if(!commissionerLoggedIn())return [];try{auditCache=await commissionerFetch('/rest/v1/pegs_audit_log?select=*&order=created_at.desc&limit=100')||[];}catch(e){auditCache=[];}return auditCache;}
 
   function validPegsPosition(value){return Object.prototype.hasOwnProperty.call(D.rules.positionMax,String(value||'').trim().toUpperCase());}
@@ -1373,11 +1475,11 @@
     const field=Math.round(rows.filter(x=>String(x.status).toLowerCase()==='field').reduce((s,x)=>s+Number(x.salary||0),0));
     const rookie=Math.round(rows.filter(x=>String(x.contract).toLowerCase()==='rookie').reduce((s,x)=>s+Number(x.salary||0),0));
     const fieldRows=rows.filter(x=>String(x.status).toLowerCase()==='field');
-    const counts={main:rows.filter(x=>String(x.contract).toLowerCase()==='main').length,field:fieldRows.length,interchange:rows.filter(x=>String(x.status).toLowerCase()==='interchange').length,invalidFieldPositions:fieldRows.filter(x=>!validPegsPosition(x.position)).length};
+    const counts={main:rows.filter(x=>String(x.contract).toLowerCase()==='main').length,rookie:rows.filter(x=>String(x.contract).toLowerCase()==='rookie').length,field:fieldRows.length,interchange:rows.filter(x=>String(x.status).toLowerCase()==='interchange').length,invalidFieldPositions:fieldRows.filter(x=>!validPegsPosition(x.position)).length};
     for(const pos of Object.keys(D.rules.positionMax)) counts[pos]=fieldRows.filter(x=>String(x.position||'').toUpperCase()===pos).length;
     return {caps:{main,field,rookie},counts};
   }
-  function rosterIsLegal(rows){const x=rosterSummary(rows);return x.caps.main<=D.rules.mainContractCap&&x.caps.field<=D.rules.fieldCap&&x.caps.rookie<=D.rules.rookieContractCap&&x.counts.main<=28&&x.counts.field<=D.rules.maxFieldPlayers&&x.counts.invalidFieldPositions===0&&Object.entries(D.rules.positionMax).every(([p,m])=>(x.counts[p]||0)<=m);}
+  function rosterIsLegal(rows){const x=rosterSummary(rows);return x.caps.main<=D.rules.mainContractCap&&x.caps.field<=D.rules.fieldCap&&x.caps.rookie<=D.rules.rookieContractCap&&x.counts.main<=28&&x.counts.rookie<=3&&x.counts.field<=D.rules.maxFieldPlayers&&x.counts.invalidFieldPositions===0&&Object.entries(D.rules.positionMax).every(([p,m])=>(x.counts[p]||0)<=m);}
   function applyLegacyTransactionInverse(out,meta){
     const inv=meta?.inverse||{};
     if(inv.kind==='REMOVE_PLAYER'){
@@ -1394,25 +1496,29 @@
       for(const move of inv.moves||[]){const from=out[move.from]||[],idx=from.findIndex(p=>canonicalPlayerName(p.player)===canonicalPlayerName(move.player));if(idx>=0){const [rec]=from.splice(idx,1);(out[move.to]||(out[move.to]=[])).push(rec);}}
     }
   }
+  function applyRosterAction(out,a){
+    if(!a)return out;
+    if(a.type==='Trade'){
+      for(const move of a.moves||[]){const from=out[move.from]||[];const idx=from.findIndex(p=>p.player===move.player);if(idx>=0){const [rec]=from.splice(idx,1);(out[move.to]||(out[move.to]=[])).push(rec);}}
+      for(const [teamKey,names] of Object.entries(a.conditionalDelists||{})){const remove=new Set((names||[]).filter(Boolean));if(remove.size)out[teamKey]=(out[teamKey]||[]).filter(p=>!remove.has(p.player));}
+    } else if(a.type==='Rookie swap'){
+      const rows=out[a.team]||[]; const pin=rows.find(p=>p.player===a.playerIn); const pout=rows.find(p=>p.player===a.playerOut); if(pin){pin.status='Field';if(a.playerInPosition)pin.position=String(a.playerInPosition).toUpperCase();} if(pout) pout.status='Interchange';
+    } else if(a.type==='Rookie elevation' && a.team && a.player){
+      const rows=out[a.team]||[];const rec=rows.find(p=>p.player===a.player);if(rec){rec.contract='Main';rec.salary=Number(a.newSalary||rec.salary||0);rec.position=String(a.newPosition||rec.position||'').toUpperCase();if(a.contractEnd)rec.contractEnd=Number(a.contractEnd);}
+    } else if(a.type==='Drafted' && a.team && a.player){
+      const rows=out[a.team]||(out[a.team]=[]); if(!rows.some(p=>p.player===a.player)) rows.push({player:a.player,contract:a.contract||'Main',salary:Number(a.salary||0),position:a.position||'',status:a.listStatus||'Field',contractEnd:a.contractEnd||Number(a.draftSeason||a.season||currentSeason())+2,club:a.club||''});
+    } else if(a.type==='Delisted' && a.team){
+      const names=new Set((a.players||[a.player]).filter(Boolean));
+      if(names.size) out[a.team]=(out[a.team]||[]).filter(p=>!names.has(p.player));
+    }
+    return out;
+  }
   function effectiveRosters(extraAction=null){
     const out={}; for(const [k,rows] of Object.entries(D.rosters)) out[k]=rows.map(x=>({...x}));
     const reversed=getTransactionReversals();Object.keys(reversed).filter(k=>LEGACY_TRANSACTION_META[k]).map(k=>LEGACY_TRANSACTION_META[k]).sort((a,b)=>String(b.timestamp||'').localeCompare(String(a.timestamp||''))).forEach(meta=>applyLegacyTransactionInverse(out,meta));
-    const actions=[...getCommissionerActions(),...(extraAction?[extraAction]:[])].filter(x=>x.status==='CONFIRMED');
-    for(const a of actions){
-      if(a.type==='Trade'){
-        for(const move of a.moves||[]){const from=out[move.from]||[];const idx=from.findIndex(p=>p.player===move.player);if(idx>=0){const [rec]=from.splice(idx,1);(out[move.to]||(out[move.to]=[])).push(rec);}}
-        for(const [teamKey,names] of Object.entries(a.conditionalDelists||{})){const remove=new Set((names||[]).filter(Boolean));if(remove.size)out[teamKey]=(out[teamKey]||[]).filter(p=>!remove.has(p.player));}
-      } else if(a.type==='Rookie swap'){
-        const rows=out[a.team]||[]; const pin=rows.find(p=>p.player===a.playerIn); const pout=rows.find(p=>p.player===a.playerOut); if(pin){pin.status='Field';if(a.playerInPosition)pin.position=String(a.playerInPosition).toUpperCase();} if(pout) pout.status='Interchange';
-      } else if(a.type==='Rookie elevation' && a.team && a.player){
-        const rows=out[a.team]||[];const rec=rows.find(p=>p.player===a.player);if(rec){rec.contract='Main';rec.salary=Number(a.newSalary||rec.salary||0);rec.position=String(a.newPosition||rec.position||'').toUpperCase();if(a.contractEnd)rec.contractEnd=Number(a.contractEnd);}
-      } else if(a.type==='Drafted' && a.team && a.player){
-        const rows=out[a.team]||(out[a.team]=[]); if(!rows.some(p=>p.player===a.player)) rows.push({player:a.player,contract:a.contract||'Main',salary:Number(a.salary||0),position:a.position||'',status:a.listStatus||'Field',contractEnd:a.contractEnd||D.meta.season+2,club:a.club||''});
-      } else if(a.type==='Delisted' && a.team){
-        const names=new Set((a.players||[a.player]).filter(Boolean));
-        if(names.size) out[a.team]=(out[a.team]||[]).filter(p=>!names.has(p.player));
-      }
-    }
+    const extras=Array.isArray(extraAction)?extraAction:(extraAction?[extraAction]:[]);
+    const actions=[...getCommissionerActions(),...extras].filter(x=>x.status==='CONFIRMED');
+    for(const a of actions)applyRosterAction(out,a);
     return out;
   }
   function effectiveTeam(key){const base=team(key);const rows=effectiveRosters()[base.key]||[];const sum=rosterSummary(rows);return {...base,...sum};}
@@ -2027,9 +2133,81 @@
     submitSwap.addEventListener('click',async()=>{if(!validateSwap())return;try{await submitProposal({type:'SWAP',phase:'In-Season',proposerTeam:teamKey,payload:{playerIn:si.value,playerOut:so.value,fieldPosition:String(sp.value||'').toUpperCase()}});toast('Interchange Request sent to the Commissioner.');renderTeamDetail(teamKey,true);}catch(e){toast(e.message||'Could not submit the Interchange Request.');}});
   }
 
+  function plannerProposalInvolvesTeam(p,teamKey){
+    const key=String(teamKey||'').toUpperCase(),type=String(p?.type||'').toUpperCase();
+    if(type==='TRADE')return String(p.proposerTeam||'').toUpperCase()===key||String(p.counterpartyTeam||'').toUpperCase()===key;
+    return String(p?.proposerTeam||'').toUpperCase()===key&&['DELIST','ELEVATION'].includes(type);
+  }
+  function plannerProposalAction(p){
+    const x=p?.payload||{},type=String(p?.type||'').toUpperCase();
+    if(type==='TRADE')return tradeActionFor(p.proposerTeam,p.counterpartyTeam,x.assetsA||{players:[],picks:[]},x.assetsB||{players:[],picks:[]},x.conditionalDelistsA||[],x.conditionalDelistsB||[]);
+    if(type==='DELIST')return {type:'Delisted',status:'CONFIRMED',team:p.proposerTeam,players:[...(x.players||[])]};
+    if(type==='ELEVATION')return {type:'Rookie elevation',status:'CONFIRMED',team:p.proposerTeam,player:x.player,newSalary:Number(x.newSalary||0),newPosition:String(x.position||'').toUpperCase(),contractEnd:Number(x.contractEnd||0)};
+    return null;
+  }
+  function plannerProposalAutoIncluded(p){
+    const type=String(p?.type||'').toUpperCase(),status=String(p?.status||'').toUpperCase();
+    if(type==='TRADE')return status==='AWAITING_COMMISSIONER';
+    return ['DELIST','ELEVATION'].includes(type)&&activeProposalStatus(status);
+  }
+  function plannerProposalIncluded(p){
+    return plannerProposalAutoIncluded(p)||(String(p?.type||'').toUpperCase()==='TRADE'&&plannerPreviewTradeIds.has(String(p.id)));
+  }
+  function plannerProposals(teamKey){
+    const windowPhase=rosterCyclePhaseWindow(rosterCycleState().phase),wanted=windowPhase?normalizedDraftType(windowPhase):'';
+    return proposalCache.filter(p=>activeProposalStatus(p.status)&&plannerProposalInvolvesTeam(p,teamKey)&&(!wanted||normalizedDraftType(p.phase||'Pre-Season')===wanted)).sort((a,b)=>String(a.createdAt||'').localeCompare(String(b.createdAt||'')));
+  }
+  function plannerContext(teamKey,{includePreview=true}={}){
+    const current=effectiveRosters(),proposals=plannerProposals(teamKey),included=proposals.filter(p=>plannerProposalAutoIncluded(p)||(includePreview&&String(p?.type||'').toUpperCase()==='TRADE'&&plannerPreviewTradeIds.has(String(p.id)))),actions=included.map(plannerProposalAction).filter(Boolean),projected=effectiveRosters(actions),currentRows=current[teamKey]||[],projectedRows=projected[teamKey]||[];
+    return {current,currentRows,projected,projectedRows,proposals,included,actions,currentSummary:rosterSummary(currentRows),projectedSummary:rosterSummary(projectedRows),legal:rosterIsLegal(projectedRows)};
+  }
+  function plannerIssueList(rows){
+    const x=rosterSummary(rows),issues=[];
+    if(x.caps.main>D.rules.mainContractCap)issues.push(`${money(x.caps.main-D.rules.mainContractCap)} over the Main salary cap`);
+    if(x.caps.field>D.rules.fieldCap)issues.push(`${money(x.caps.field-D.rules.fieldCap)} over the Field salary cap`);
+    if(x.caps.rookie>D.rules.rookieContractCap)issues.push(`${money(x.caps.rookie-D.rules.rookieContractCap)} over the Rookie salary cap`);
+    if((x.counts.main||0)>28)issues.push(`${x.counts.main-28} too many Main contracts`);
+    if((x.counts.rookie||0)>3)issues.push(`${x.counts.rookie-3} too many Rookie contracts`);
+    if((x.counts.field||0)>D.rules.maxFieldPlayers)issues.push(`${x.counts.field-D.rules.maxFieldPlayers} too many Field players`);
+    if(x.counts.invalidFieldPositions)issues.push(`${x.counts.invalidFieldPositions} Field player${x.counts.invalidFieldPositions===1?' has':'s have'} an invalid PEGS position`);
+    Object.entries(D.rules.positionMax).forEach(([pos,max])=>{const over=Number(x.counts[pos]||0)-Number(max);if(over>0)issues.push(`${over} too many ${pos}`);});
+    return issues;
+  }
+  function plannerDraftNeedsHtml(rows){
+    const x=rosterSummary(rows),mainVacancies=Math.max(0,28-Number(x.counts.main||0)),rookieVacancies=Math.max(0,3-Number(x.counts.rookie||0)),mainRoom=Number(D.rules.mainContractCap)-Number(x.caps.main||0),rookieRoom=Number(D.rules.rookieContractCap)-Number(x.caps.rookie||0),avg=mainVacancies&&mainRoom>0?Math.floor(mainRoom/mainVacancies):0;
+    const positionRoom=Object.entries(D.rules.positionMax).map(([pos,max])=>({pos,room:Math.max(0,Number(max)-Number(x.counts[pos]||0))}));
+    return `<section class="planner-draft-needs"><div class="planner-subhead"><div><span class="eyebrow">Draft planning</span><h3>What this roster leaves you</h3></div></div><div class="planner-draft-grid"><div><span>Main vacancies</span><strong>${mainVacancies}</strong><small>to 28 Main contracts</small></div><div><span>Main salary room</span><strong class="${mainRoom<0?'planner-bad':''}">${money(mainRoom)}</strong><small>${mainVacancies&&mainRoom>0?`${money(avg)} average per vacancy`:'after projected moves'}</small></div><div><span>Rookie vacancies</span><strong>${rookieVacancies}</strong><small>${money(rookieRoom)} Rookie cap room</small></div></div><div class="planner-position-room">${positionRoom.map(v=>`<span><b>${v.pos}</b>${v.room} Field opening${v.room===1?'':'s'}</span>`).join('')}</div></section>`;
+  }
+  function plannerMoveImpact(teamKey,p){
+    const action=plannerProposalAction(p),before=effectiveRosters(),after=action?effectiveRosters(action):before,b=rosterSummary(before[teamKey]||[]),a=rosterSummary(after[teamKey]||[]);
+    return {main:a.caps.main-b.caps.main,rookie:a.caps.rookie-b.caps.rookie,field:a.counts.field-b.counts.field,mainCount:a.counts.main-b.counts.main};
+  }
+  function plannerMoveCardHtml(teamKey,p){
+    const type=String(p.type||'').toUpperCase(),status=String(p.status||'').toUpperCase(),included=plannerProposalIncluded(p),auto=plannerProposalAutoIncluded(p),impact=plannerMoveImpact(teamKey,p),tradeWaiting=type==='TRADE'&&status==='AWAITING_COUNTERPARTY',statusLabel=status.replaceAll('_',' '),tone=included?'green':tradeWaiting?'amber':'neutral';
+    const title=type==='TRADE'?'Trade':type==='DELIST'?'Delisting':'Rookie elevation';
+    const signedMoney=v=>`${v>0?'+':'−'}${money(Math.abs(v))}`,impacts=[impact.main?`Main ${signedMoney(impact.main)}`:'Main —',impact.rookie?`Rookie ${signedMoney(impact.rookie)}`:'Rookie —',impact.mainCount?`Main list ${impact.mainCount>0?'+':''}${impact.mainCount}`:'Main list —'];
+    const previewButton=tradeWaiting?`<button type="button" class="secondary-button compact-button planner-preview-trade ${included?'is-included':''}" data-action="planner-trade-toggle" data-proposal-id="${esc(String(p.id))}">${included?'Remove from scenario':'Preview in scenario'}</button>`:'';
+    return `<article class="planner-move-card ${included?'is-included':''}"><div class="planner-move-head"><div><span class="badge ${tone}">${included?'IN PROJECTED':statusLabel}</span><strong>${esc(title)}</strong></div>${previewButton}</div><p>${esc(proposalSummary(p))}</p><div class="planner-impact-chips">${impacts.map(v=>`<span>${esc(v)}</span>`).join('')}</div><small>${auto?'Automatically included because this move is awaiting Commissioner approval.':tradeWaiting?'Not included until the other coach accepts it, unless you preview it here.':'Included in your current planning scenario.'}</small></article>`;
+  }
+  function rosterPlannerHtml(teamKey,ctx){
+    if(!teamLoggedIn()||String(teamKey)!==loggedTeamKey())return '';
+    const cycle=rosterCycleState(),phase=String(cycle.phase||''),windowOpen=['PRESEASON_WINDOW_OPEN','MIDSEASON_WINDOW_OPEN'].includes(phase),issues=plannerIssueList(ctx.projectedRows),current=ctx.currentSummary,projected=ctx.projectedSummary,phaseLabel=phase==='PRESEASON_WINDOW_OPEN'?'Preseason':phase==='MIDSEASON_WINDOW_OPEN'?'Mid-Season':'Roster planning';
+    if(!windowOpen&&!ctx.proposals.length)return '';
+    const delta=(after,before)=>after-before,mainDelta=delta(projected.caps.main,current.caps.main),rookieDelta=delta(projected.caps.rookie,current.caps.rookie);
+    const expiredContracts=ctx.currentRows.filter(r=>Number(r.contractEnd||0)>0&&Number(r.contractEnd)<Number(cycle.season||currentSeason()));
+    const contractWarning=expiredContracts.length?`<div class="notice danger planner-contract-warning"><strong>Contract refresh required.</strong> ${expiredContracts.length} expired contract${expiredContracts.length===1?' needs':'s need'} new-season price/position terms before this projection can be treated as final. PEGS will keep the planner visible, but the roster window must not close until those terms are refreshed.</div>`:'';
+    return `<section class="card card-pad roster-planner"><div class="roster-planner-head"><div><span class="eyebrow">${esc(phaseLabel)} list management</span><h2>Roster Planner</h2><p>Official list changes only after approval. Projected applies your submitted moves and agreed trades so you can plan the full roster before the Commissioner confirms anything.</p></div><div class="roster-view-switch" role="group" aria-label="Roster view"><button type="button" class="${teamRosterViewMode==='CURRENT'?'active':''}" data-action="roster-planner-view" data-view="CURRENT">Current</button><button type="button" class="${teamRosterViewMode==='PROJECTED'?'active':''}" data-action="roster-planner-view" data-view="PROJECTED">Projected <span>${ctx.included.length}</span></button></div></div><div class="planner-kpis"><div><span>Projected Main salary</span><strong class="${projected.caps.main>D.rules.mainContractCap?'planner-bad':''}">${money(projected.caps.main)}</strong><small>${mainDelta?`${mainDelta>0?'+':''}${money(mainDelta)} vs current`:'No change'} · cap ${money(D.rules.mainContractCap)}</small></div><div><span>Projected Rookie salary</span><strong class="${projected.caps.rookie>D.rules.rookieContractCap?'planner-bad':''}">${money(projected.caps.rookie)}</strong><small>${rookieDelta?`${rookieDelta>0?'+':''}${money(rookieDelta)} vs current`:'No change'} · cap ${money(D.rules.rookieContractCap)}</small></div><div><span>Main contracts</span><strong>${projected.counts.main||0} / 28</strong><small>${current.counts.main||0} current</small></div><div><span>Rookie contracts</span><strong>${projected.counts.rookie||0} / 3</strong><small>${current.counts.rookie||0} current</small></div></div><div class="planner-position-grid">${Object.entries(D.rules.positionMax).map(([pos,max])=>`<div class="${Number(projected.counts[pos]||0)>Number(max)?'is-over':''}"><span>${pos}</span><strong>${projected.counts[pos]||0} / ${max}</strong><small>${Number(projected.counts[pos]||0)-Number(current.counts[pos]||0)===0?'No change':`${Number(projected.counts[pos]||0)-Number(current.counts[pos]||0)>0?'+':''}${Number(projected.counts[pos]||0)-Number(current.counts[pos]||0)} projected`}</small></div>`).join('')}</div><div class="planner-verdict ${ctx.legal?'is-legal':'is-review'}"><div><span>${ctx.legal?'✓':'!'}</span><div><strong>${ctx.legal?'Roster compliant if included moves are approved':'Roster still requires changes'}</strong><small>${ctx.legal?'You can continue planning or proceed once the roster window closes.':issues.join(' · ')}</small></div></div></div>${contractWarning}<div class="planner-layout"><section><div class="planner-subhead"><div><span class="eyebrow">Planned / pending moves</span><h3>${ctx.proposals.length?`${ctx.proposals.length} move${ctx.proposals.length===1?'':'s'} in flight`:'No moves submitted yet'}</h3></div><button type="button" class="secondary-button compact-button" data-route="transactions">Open Moves</button></div><div class="planner-move-list">${ctx.proposals.length?ctx.proposals.map(p=>plannerMoveCardHtml(teamKey,p)).join(''):'<div class="empty">Submit a delisting, trade or rookie elevation during the open roster window and its projected effect will appear here before Commissioner approval.</div>'}</div></section>${plannerDraftNeedsHtml(ctx.projectedRows)}</div></section>`;
+  }
+  function commissionerProjectedRosterHtml(teamKey){
+    const ctx=plannerContext(teamKey,{includePreview:false}),issues=plannerIssueList(ctx.projectedRows),x=ctx.projectedSummary;
+    return `<div class="commissioner-planner-summary"><strong>Combined pending-move outlook · ${esc(team(teamKey).name)}</strong><span class="badge ${ctx.legal?'green':'red'}">${ctx.legal?'PROJECTED LEGAL':'PROJECTED REVIEW'}</span><small>Main ${money(x.caps.main)} / ${money(D.rules.mainContractCap)} · Rookie ${money(x.caps.rookie)} / ${money(D.rules.rookieContractCap)} · Main list ${x.counts.main||0}/28${issues.length?` · ${esc(issues.join(' · '))}`:''}</small></div>`;
+  }
+
   function renderTeamDetail(key,personalizedLanding=false) {
     const t = effectiveTeam(key);
-    const roster = effectiveRosters()[t.key] || [];
+    const planner=plannerContext(t.key),plannerEnabled=teamLoggedIn()&&String(t.key)===loggedTeamKey()&&(['PRESEASON_WINDOW_OPEN','MIDSEASON_WINDOW_OPEN'].includes(String(rosterCycleState().phase||''))||planner.proposals.length>0),projectedView=plannerEnabled&&teamRosterViewMode==='PROJECTED';
+    const roster = projectedView ? planner.projectedRows : (effectiveRosters()[t.key] || []);
+    const displaySummary=rosterSummary(roster),displayLegal=rosterIsLegal(roster);
     warmTeamPortraitCache(t.key);
     const regular=Number(activeSeasonSetup()?.pegsRegularRounds||20),regularScores=completedTeamFixtures(t.key).filter(x=>Number(x.round)<=regular).map(x=>Number(x.ownScore||0)).filter(Number.isFinite);
     const avg = regularScores.length ? Math.round(regularScores.reduce((a,b)=>a+b,0)/regularScores.length) : 0;
@@ -2040,18 +2218,19 @@
     main.innerHTML = `${pageHeader(personalizedLanding?'My Franchise':'Franchise profile',t.name,`Coach: ${t.owner} - ${roster.length} contracted players`,teamViewControls)}
       <section class="card team-detail-head">
         <div class="team-figurehead-hero">${figurehead(t.key,'lg')}<span>${esc(figureheadPlayer(t.key).player)}</span></div>
-        <div><span class="badge ${teamValidity(t)?'green':'red'}">${teamValidity(t)?'All cap tests passed':'Roster requires review'}</span><h1>${esc(t.owner)}</h1><p>${esc(t.name)} - ${esc(t.code)}</p><div class="stat-strip" style="grid-template-columns:repeat(3,1fr);margin-bottom:0"><div class="stat-box"><span>Team score avg</span><strong>${avg}</strong></div><div class="stat-box"><span>Field players</span><strong>${t.counts.field}</strong></div><div class="stat-box"><span>Interchange</span><strong>${t.counts.interchange}</strong></div></div></div>
-        <div class="cap-stack">${capMeter('Main contract cap',t.caps.main,D.rules.mainContractCap)}${capMeter('Field cap',t.caps.field,D.rules.fieldCap)}${capMeter('Rookie contract cap',t.caps.rookie,D.rules.rookieContractCap)}</div>
+        <div><span class="badge ${displayLegal?'green':'red'}">${displayLegal?(projectedView?'Projected roster compliant':'All cap tests passed'):'Roster requires review'}</span><h1>${esc(t.owner)}</h1><p>${esc(t.name)} - ${esc(t.code)}</p><div class="stat-strip" style="grid-template-columns:repeat(3,1fr);margin-bottom:0"><div class="stat-box"><span>Team score avg</span><strong>${avg}</strong></div><div class="stat-box"><span>Field players</span><strong>${displaySummary.counts.field}</strong></div><div class="stat-box"><span>Interchange</span><strong>${displaySummary.counts.interchange}</strong></div></div></div>
+        <div class="cap-stack">${capMeter('Main contract cap',displaySummary.caps.main,D.rules.mainContractCap)}${capMeter('Field cap',displaySummary.caps.field,D.rules.fieldCap)}${capMeter('Rookie contract cap',displaySummary.caps.rookie,D.rules.rookieContractCap)}</div>
       </section>
+      ${rosterPlannerHtml(t.key,planner)}
       ${interchangeRequestPanel(t.key)}
-      <section class="team-roster-field-layout">
+      <section class="team-roster-field-layout ${projectedView?'is-projected':''}">
         <div class="team-roster-list-panel">
-          <div class="team-roster-panel-head"><div><span class="eyebrow">Contracted list</span><h2>Player list</h2></div><span class="badge neutral">${visible.length} shown</span></div>
+          <div class="team-roster-panel-head"><div><span class="eyebrow">Contracted list</span><h2>Player list</h2></div><span class="badge ${projectedView?'blue':'neutral'}">${projectedView?'PROJECTED · ':''}${visible.length} shown</span></div>
           <div class="roster-tabs" role="group" aria-label="Roster filter">${filters.map(f=>`<button class="tab-button ${selectedRosterFilter===f?'active':''}" data-action="roster-filter" data-filter="${f}">${f==='INTERCHANGE'?'Interchange':f}</button>`).join('')}</div>
           <div class="team-roster-list">${rows.map(p=>rosterListRow(p,t.key)).join('')||'<div class="empty">No players match this filter.</div>'}</div>
         </div>
         <div class="team-afl-field-panel">
-          <div class="team-roster-panel-head"><div><span class="eyebrow">Starting field</span><h2>On-field 28</h2></div><span class="badge green">${roster.filter(p=>String(p.status).toLowerCase()==='field').length} players</span></div>
+          <div class="team-roster-panel-head"><div><span class="eyebrow">Starting field</span><h2>On-field 28</h2></div><span class="badge ${projectedView?'blue':'green'}">${projectedView?'PROJECTED · ':''}${roster.filter(p=>String(p.status).toLowerCase()==='field').length} players</span></div>
           ${teamAflField(roster,t.key)}
           ${teamRookieBench(roster,t.key)}
         </div>
@@ -2084,7 +2263,7 @@
   }
 
   function effectiveLadder(){
-    const setup=activeSeasonSetup(),results=getSeasonResults()?.[String(currentSeason())]||{};
+    const setup=seasonDisplaySetup(),results=getSeasonResults()?.[String(currentSeason())]||{};
     if(!setup&&!hasScoreCorrections())return D.ladder;
     if(!setup&&hasScoreCorrections()){const rows=Object.fromEntries(D.teams.map(t=>[t.key,{position:0,team:t.key,played:0,wins:0,losses:0,draws:0,pf:0,pa:0,points:0,percentage:0}]));for(const f of (D.fixtures||[]).filter(x=>Number(x.round)<=20&&x.home&&x.away)){const hs=Number(calcTeamRound(Number(f.round),f.home).actual||0),as=Number(calcTeamRound(Number(f.round),f.away).actual||0);if(!hs&&!as)continue;const h=rows[f.home],a=rows[f.away];if(!h||!a)continue;h.played++;a.played++;h.pf+=hs;h.pa+=as;a.pf+=as;a.pa+=hs;if(hs>as){h.wins++;a.losses++;h.points+=4;}else if(as>hs){a.wins++;h.losses++;a.points+=4;}else{h.draws++;a.draws++;h.points+=2;a.points+=2;}}const arr=Object.values(rows);arr.forEach(r=>r.percentage=r.pa?100*r.pf/r.pa:(r.pf?999:0));arr.sort((a,b)=>b.points-a.points||b.percentage-a.percentage||b.pf-a.pf);arr.forEach((r,i)=>r.position=i+1);return arr;}
     const regular=Number(setup.pegsRegularRounds||20),regularFixtures=(setup.pegsFixtures||[]).filter(f=>Number(f.round)<=regular&&f.away),hasRegularResults=Object.keys(results).some(r=>Number(r)<=regular);
@@ -2112,22 +2291,24 @@
   function availablePlayers() {
     const q=draftSearch.trim().toLowerCase(),pool=frozenDraftPlayers();
     const rostered=new Set(Object.values(effectiveRosters()).flat().map(p=>canonicalPlayerName(p.player)));
-    const reserved=new Set(proposalCache.filter(x=>x.type==='DRAFT_PICK'&&activeProposalStatus(x.status)).map(x=>canonicalPlayerName(x.payload?.player)).filter(Boolean));
-    return pool.filter(p=>!rostered.has(canonicalPlayerName(p.player))&&!reserved.has(canonicalPlayerName(p.player))&&(!q||String(p.player).toLowerCase().includes(q)||String(p.club).toLowerCase().includes(q)||String(p.position).toLowerCase().includes(q))).slice(0,120);
+    return pool.filter(p=>!rostered.has(canonicalPlayerName(p.player))&&(!q||String(p.player).toLowerCase().includes(q)||String(p.club).toLowerCase().includes(q)||String(p.position).toLowerCase().includes(q))).slice(0,120);
   }
 
   function validateDraft(teamKey, player, contract, status, fixedPosition='') {
     const t=effectiveTeam(teamKey),price=Number(player?.price||player?.startPrice||0),pos=String(fixedPosition||String(player?.position||'').split('/')[0]).toUpperCase();
     const checks=[];if(!player)return checks;
-    const isMain=contract==='Main',isField=status==='Field',newMain=t.caps.main+(isMain?price:0),newField=t.caps.field+(isField?price:0),newRookie=t.caps.rookie+(!isMain?price:0),newMainCount=(t.counts.main||0)+(isMain?1:0),newFieldCount=t.counts.field+(isField?1:0),newPos=(t.counts[pos]||0)+(isField?1:0);
+    const draftType=normalizedDraftType(getDraftState().type||'Pre-Season'),isRookieDraft=draftType==='Rookie Draft',isMain=contract==='Main',isField=status==='Field',newMain=t.caps.main+(isMain?price:0),newField=t.caps.field+(isField?price:0),newRookie=t.caps.rookie+(!isMain?price:0),newMainCount=(t.counts.main||0)+(isMain?1:0),newRookieCount=(t.counts.rookie||0)+(!isMain?1:0),newFieldCount=t.counts.field+(isField?1:0),newPos=(t.counts[pos]||0)+(isField?1:0);
     const rostered=new Set(Object.values(effectiveRosters()).flat().map(p=>canonicalPlayerName(p.player)));
     const validPositions=String(player?.position||'').toUpperCase().split('/').filter(Boolean);
     checks.push({label:'Player is currently unrostered',pass:!rostered.has(canonicalPlayerName(player.player)),detail:player.player});
     checks.push({label:'Frozen draft price available',pass:price>0,detail:money(price)});
     checks.push({label:'PEGS contract position',pass:Boolean(pos)&&validPositions.includes(pos),detail:pos||'Choose position'});
+    checks.push({label:'Draft contract type',pass:isRookieDraft?!isMain:isMain,detail:isRookieDraft?'Rookie contract required':'Main contract required'});
+    if(isRookieDraft)checks.push({label:'Rookie List placement',pass:!isField,detail:'Rookie Draft selections start on the Rookie List'});
     checks.push({label:'Main contract cap',pass:newMain<=D.rules.mainContractCap,detail:`${compactMoney(newMain)} / ${compactMoney(D.rules.mainContractCap)}`});
     checks.push({label:'Field salary cap',pass:newField<=D.rules.fieldCap,detail:`${compactMoney(newField)} / ${compactMoney(D.rules.fieldCap)}`});
     checks.push({label:'Rookie contract cap',pass:newRookie<=D.rules.rookieContractCap,detail:`${compactMoney(newRookie)} / ${compactMoney(D.rules.rookieContractCap)}`});
+    checks.push({label:'Rookie List size',pass:newRookieCount<=3,detail:`${newRookieCount} / 3`});
     checks.push({label:'Main contract list size',pass:newMainCount<=28,detail:`${newMainCount} / 28`});
     checks.push({label:'Field list size',pass:newFieldCount<=D.rules.maxFieldPlayers,detail:`${newFieldCount} / ${D.rules.maxFieldPlayers}`});
     if(isField&&pos)checks.push({label:`${pos} position limit`,pass:newPos<=(D.rules.positionMax[pos]||99),detail:`${newPos} / ${D.rules.positionMax[pos]||'-'}`});
@@ -2198,23 +2379,28 @@
     const reversedDraftPicks=new Set(Object.keys(getTransactionReversals()).map(k=>LEGACY_TRANSACTION_META[k]).filter(m=>m?.type==='Drafted'&&m.pick).map(m=>`${m.pick}|${m.team}|${canonicalPlayerName(m.players?.[0]||'')}`));
     const draftSource=[...D.draft.filter(d=>!reversedDraftPicks.has(`${Number(d.pick||0)}|${d.team}|${canonicalPlayerName(d.player)}`)),...liveDraftActions.map(a=>({pick:a.pick,team:a.team,player:a.player,position:a.position,club:a.club,salary:a.salary,type:a.phase||''}))];
     const draftRows=draftSource.sort((a,b)=>(a.pick||0)-(b.pick||0)).map(d=>`<div class="draft-pick"><span class="pick-no">${d.pick}</span>${figurehead(d.team,'sm')}<span class="draft-player"><strong>${esc(d.player)}</strong><small>${esc(d.position)} - ${esc(d.club)} - ${esc(team(d.team).name)}</small></span><span class="money">${money(d.salary)}</span></div>`).join('');
-    const pendingCurrent=proposalCache.find(p=>p.type==='DRAFT_PICK'&&p.status==='AWAITING_COMMISSIONER'&&Number(p.payload?.pick)===currentPick&&p.proposerTeam===currentTeam);
     const myTurn=ds.active&&teamLoggedIn()&&loggedTeamKey()===currentTeam;
-    const draftSub=ds.active?`${Number(ds.season||draftSeasonFor(ds.type))} ${esc(ds.type||'Draft')} · Pick <strong>${currentPick}</strong> · ${team(currentTeam).name} (${team(currentTeam).owner}) · <strong id="draft-countdown" class="${draftIsOvertime(ds)?'overtime-clock':''}">${draftClockText(ds)}</strong>${currentPickRec&&currentPickRec.originalOwner!==currentPickRec.owner?` · <span class="muted-copy">slot originally ${esc(team(currentPickRec.originalOwner).owner)}</span>`:''}`:'The Commissioner starts and ends both pre-season and mid-season drafts.';
+    const draftSub=ds.active?`${Number(ds.season||draftSeasonFor(ds.type))} ${esc(ds.type||'Draft')} · Pick <strong>${currentPick}</strong> · ${team(currentTeam).name} (${team(currentTeam).owner}) · <strong id="draft-countdown" class="${draftIsOvertime(ds)?'overtime-clock':''}">${draftClockText(ds)}</strong>${currentPickRec&&currentPickRec.originalOwner!==currentPickRec.owner?` · <span class="muted-copy">slot originally ${esc(team(currentPickRec.originalOwner).owner)}</span>`:''}`:'The Commissioner starts the Pre-Season, Rookie and Mid-Season drafts at the correct Roster Cycle stage.';
     const accessNotice=!ds.active?'Draft selections are closed.':!teamLoggedIn()?'<strong>Team Login required.</strong> Sign in as the coach whose franchise is on the clock to submit a pick.':myTurn?`<strong>Your pick is live.</strong> ${esc(team(currentTeam).name)} can submit the current selection.`:`<strong>Watching draft.</strong> You are signed in as ${esc(team(loggedTeamKey()).owner)}; only ${esc(team(currentTeam).owner)} can submit Pick ${currentPick}.`;
     const myDraftPhase=teamLoggedIn()?(ds.active?normalizedDraftType(ds.type):dashboardDraftPhase()):'',myDraftPicks=teamLoggedIn()?ownedDraftPicks(loggedTeamKey(),myDraftPhase,{excludePending:false}):[],myDraftAssets=teamLoggedIn()?`<section class="card my-draft-assets"><div>${teamIdentity(loggedTeamKey(),'sm')}<div><span class="eyebrow">Your draft assets · ${esc(myDraftPhase)}</span><h2>${myDraftPicks.length} pick${myDraftPicks.length===1?'':'s'} owned</h2></div></div><div class="my-draft-pick-row">${myDraftPicks.length?myDraftPicks.slice(0,12).map(p=>`<span><b>Pick ${p.pick}</b><small>R${p.round}${p.originalOwner!==p.owner?` · from ${esc(team(p.originalOwner).owner)}`:''}</small></span>`).join(''):'<span class="muted-copy">No picks currently owned in this draft.</span>'}</div></section>`:'';
     main.innerHTML=`${pageHeader('Draft centre',`${currentSeason()} Draft Room`,'Only the logged-in franchise on the clock can submit a player. Current prices are frozen when the Commissioner starts the draft.')}${myDraftAssets}
       <section class="card draft-status-card ${ds.active?'live-draft-card':''}"><div><span class="eyebrow">Draft status</span><h2>${ds.active?'LIVE - '+esc(ds.type||'Draft'):'Draft closed'}</h2><p>${draftSub}</p>${ds.active?`<div style="margin-top:12px">${teamIdentity(currentTeam,'sm')}</div>`:''}</div><span id="draft-clock-badge" class="badge ${ds.active?(draftIsOvertime(ds)?'amber':'red'):'neutral'}">${ds.active?(draftIsOvertime(ds)?'OVERTIME':'3 MIN CLOCK'):'CLOSED'}</span></section>
       ${ds.active?`<div class="notice ${myTurn?'':'warning-notice'}" style="margin-bottom:14px">${accessNotice}</div>`:''}
       ${ds.active?`<div id="draft-overtime-notice" class="notice danger" style="display:${draftIsOvertime(ds)?'block':'none'};margin-bottom:14px"><strong>Clock expired — ${esc(team(currentTeam).name)} remains on the clock.</strong> Nothing advances automatically. The Commissioner may push the overdue pick back one slot.</div>`:''}
-      ${pendingCurrent?`<div class="notice pending-pick-notice"><strong>Selection awaiting Commissioner:</strong> ${esc(pendingCurrent.payload?.player||'')} is provisionally reserved.</div>`:''}
-      <section class="draft-layout"><article class="card draft-board"><div class="section-title" style="padding:18px 18px 0"><div><span class="eyebrow">Completed</span><h2>Draft history</h2></div><span class="badge neutral">${draftSource.length} recorded picks</span></div>${draftRows}</article>
-      <article class="card draft-sim"><span class="eyebrow">${ds.active?'Current selection':'Player explorer'}</span><h2>${ds.active?`${esc(team(currentTeam).name)} is on the clock`:'Draft selections are closed'}</h2><p class="muted-copy">${ds.active?'The available pool is the frozen pre-draft AFL/SuperCoach snapshot less PEGS-owned and provisionally selected players.':'You can inspect the most recently loaded player pool.'}</p>
+            <section class="draft-layout"><article class="card draft-board"><div class="section-title" style="padding:18px 18px 0"><div><span class="eyebrow">Completed</span><h2>Draft history</h2></div><span class="badge neutral">${draftSource.length} recorded picks</span></div>${draftRows}</article>
+      <article class="card draft-sim"><span class="eyebrow">${ds.active?'Current selection':'Player explorer'}</span><h2>${ds.active?`${esc(team(currentTeam).name)} is on the clock`:'Draft selections are closed'}</h2><p class="muted-copy">${ds.active?'The available pool is the frozen pre-draft AFL/SuperCoach snapshot less players already on a PEGS list.':'You can inspect the most recently loaded player pool.'}</p>
       <div class="field-group"><label for="draft-search">Find available player</label><input class="search-input" id="draft-search" value="${esc(draftSearch)}" placeholder="Search player, club or position"></div>
       <div class="draft-search-results" id="draft-search-results">${results.map(p=>`<button class="player-option ${selected?.player===p.player?'selected':''}" data-action="select-draft-player" data-player="${esc(p.player)}"><span><strong>${esc(p.player)}</strong><small>${esc(p.position)} - ${esc(p.club)}${Number(p.average||0)?` - Avg ${Number(p.average).toFixed(1)}`:''}</small></span><span class="money"><strong>${money(p.price||p.startPrice)}</strong><small>${ds.active?'frozen':'price'}</small></span></button>`).join('')||'<div class="empty">No available players match.</div>'}</div>
-      <div class="form-grid" style="margin-top:14px"><div class="field-group"><label for="draft-contract">Contract</label><select class="select" id="draft-contract"><option>Main</option><option>Rookie</option></select></div><div class="field-group"><label for="draft-status">List location</label><select class="select" id="draft-status"><option>Field</option><option>Interchange</option></select></div><div class="field-group"><label for="draft-fixed-position">PEGS position for contract</label><select class="select" id="draft-fixed-position" ${selected?'':'disabled'}>${selected?String(selected.position||'').split('/').map(pos=>`<option value="${esc(pos)}">${esc(pos)}</option>`).join(''):'<option>Select player first</option>'}</select></div></div>
-      <div id="draft-check-output">${selected?draftCheckOutput(currentTeam,selected,'Main','Field',myTurn,Boolean(pendingCurrent),String(selected.position||'').split('/')[0]):'<div class="notice" style="margin-top:16px">Select an available player to run the salary-cap, list-size and positional checks.</div>'}</div></article></section>`;
+      <div class="form-grid" style="margin-top:14px">${(()=>{const rookie=normalizedDraftType(ds.type)==='Rookie Draft';return `<div class="field-group"><label for="draft-contract">Contract</label><select class="select" id="draft-contract" disabled><option>${rookie?'Rookie':'Main'}</option></select><small>${rookie?'Rookie Draft selections are one-season Rookie contracts.':'Main draft selections use Main contracts.'}</small></div><div class="field-group"><label for="draft-status">List location</label><select class="select" id="draft-status" ${rookie?'disabled':''}>${rookie?'<option>Interchange</option>':'<option>Field</option><option>Interchange</option>'}</select><small>${rookie?'Rookie Draft players start on the Rookie List.':''}</small></div>`;})()}<div class="field-group"><label for="draft-fixed-position">PEGS position for contract</label><select class="select" id="draft-fixed-position" ${selected?'':'disabled'}>${selected?String(selected.position||'').split('/').map(pos=>`<option value="${esc(pos)}">${esc(pos)}</option>`).join(''):'<option>Select player first</option>'}</select></div></div>
+      <div id="draft-check-output">${selected?draftCheckOutput(currentTeam,selected,normalizedDraftType(ds.type)==='Rookie Draft'?'Rookie':'Main',normalizedDraftType(ds.type)==='Rookie Draft'?'Interchange':'Field',myTurn,false,String(selected.position||'').split('/')[0]):'<div class="notice" style="margin-top:16px">Select an available player to run the salary-cap, list-size and positional checks.</div>'}</div></article></section>`;
     startDraftTicker();
+  }
+
+  function applyDirectDraftPickLocal(state,key,pick,p,contract,status,fixedPosition){
+    const season=Number(state.season||draftSeasonFor(state.type)),action={type:'Drafted',status:'CONFIRMED',phase:normalizedDraftType(state.type),draftSeason:season,sessionId:state.sessionId||'',pick,team:key,player:p.player,position:fixedPosition,club:p.club||'',contract,listStatus:status,salary:Number(p.price||p.startPrice||0),contractEnd:normalizedDraftType(state.type)==='Rookie Draft'?season:season+2,timestamp:new Date().toISOString(),detail:`${normalizedDraftType(state.type)} pick ${pick}: ${p.player} (${fixedPosition}) · ${money(p.price||p.startPrice||0)}`};
+    const all=getCommissionerActions();all.unshift(action);saveCommissionerActions(all);const next=advanceDraftLocal('SELECTED');
+    if(!next.active){const dt=normalizedDraftType(state.type);if(dt==='Pre-Season')setRosterCyclePhase('ROOKIE_DRAFT',{season,reason:'preseason_draft_complete'});else if(dt==='Rookie Draft'){captureScoringSnapshot('Pre-Season',1,season);setRosterCyclePhase('ROSTERS_LOCKED',{season,reason:'rookie_draft_complete'});}else if(dt==='Mid-Season'){const from=nextUnfinalizedScoringRound();captureScoringSnapshot('Mid-Season',from,season);setRosterCyclePhase('POST_MIDSEASON_LOCKED',{season,reason:'midseason_draft_complete'});}}
+    return action;
   }
 
   async function handleDraftProposalSubmission() {
@@ -2222,22 +2408,21 @@
     if(!state.active){toast('The draft is closed.');render();return;}
     if(!teamLoggedIn()){toast('Team Login required to draft.');return;}
     if(loggedTeamKey()!==key){toast(`It is ${team(key).owner}'s pick.`);return;}
-    if(proposalCache.some(x=>x.type==='DRAFT_PICK'&&activeProposalStatus(x.status)&&Number(x.payload?.pick)===pick&&x.proposerTeam===key)){toast('This pick already has a submitted selection.');return;}
-    const contract=document.getElementById('draft-contract')?.value||'Main',status=document.getElementById('draft-status')?.value||'Field',fixedPosition=document.getElementById('draft-fixed-position')?.value||String(p?.position||'').split('/')[0];
+    const rookie=normalizedDraftType(state.type)==='Rookie Draft',contract=rookie?'Rookie':'Main',status=rookie?'Interchange':(document.getElementById('draft-status')?.value||'Field'),fixedPosition=document.getElementById('draft-fixed-position')?.value||String(p?.position||'').split('/')[0];
     const checks=validateDraft(key,p,contract,status,fixedPosition);if(!p||!checks.length||!checks.every(c=>c.pass)){toast('That selection is blocked by the league rules.');return;}
     try{
-      await submitProposal({type:'DRAFT_PICK',phase:state.type||'Draft',proposerTeam:key,payload:{pick,draftSeason:Number(state.season||draftSeasonFor(state.type)),sessionId:state.sessionId||'',player:p.player,position:fixedPosition,club:p.club,salary:Number(p.price||p.startPrice||0),contract,listStatus:status,poolSessionId:state.poolSessionId||''}});
       if(backendConfigured()){
-        const value=await backendFetch('/rest/v1/rpc/pegs_advance_draft_after_submission',{method:'POST',body:JSON.stringify({p_pick:pick,p_team:key})});
-        if(value&&typeof value==='object')localStorage.setItem(DRAFT_STATE_KEY,JSON.stringify(value));await pullSharedState();
-      }else advanceDraftLocal('SUBMITTED');
-      draftSelection=null;toast(`Pick ${pick} submitted. Next franchise is on the clock.`);render();
-    }catch(e){toast(e.message||'Could not submit the draft pick.');}
+        const result=await backendFetch('/rest/v1/rpc/pegs_submit_draft_pick_direct',{method:'POST',body:JSON.stringify({p_pick:pick,p_player:p.player,p_position:fixedPosition,p_contract:contract,p_list_status:status,p_session_id:state.sessionId||''})});
+        if(result?.draft_state)localStorage.setItem(DRAFT_STATE_KEY,JSON.stringify(result.draft_state));
+        await pullSharedState();await syncServerAuthority();
+      }else applyDirectDraftPickLocal(state,key,pick,p,contract,status,fixedPosition);
+      draftSelection=null;toast(`Pick ${pick} confirmed. ${p.player} has been added to ${team(key).name}.`);render();
+    }catch(e){toast(e.message||'Could not complete the draft pick.');}
   }
 
   function draftCheckOutput(teamKey,player,contract,status,canSubmit=false,alreadyPending=false,fixedPosition='') {
-    const checks=validateDraft(teamKey,player,contract,status,fixedPosition),pass=checks.length&&checks.every(c=>c.pass),buttonText=alreadyPending?'Selection already submitted':canSubmit?'Submit my pick':'Only team on clock can submit';
-    return `<div class="draft-check"><div class="section-title"><h3>${esc(player.player)} - ${esc(player.position)}</h3><span class="badge ${pass?'green':'red'}">${pass?'Selection legal':'Selection blocked'}</span></div><div class="notice"><strong>Draft salary:</strong> ${money(player.price||player.startPrice)} — frozen from the current-price player pool captured before this draft.</div>${checks.map(c=>`<div class="rule-check"><span>${esc(c.label)}</span><span class="${c.pass?'check-pass':'check-fail'}">${c.pass?'PASS':'FAIL'} - ${esc(c.detail)}</span></div>`).join('')}<div class="button-row"><button class="primary-button" id="submit-draft-proposal" ${pass&&canSubmit&&!alreadyPending?'':'disabled'}>${buttonText}</button></div></div>`;
+    const checks=validateDraft(teamKey,player,contract,status,fixedPosition),pass=checks.length&&checks.every(c=>c.pass),buttonText=canSubmit?'Confirm draft pick':'Only team on clock can submit';
+    return `<div class="draft-check"><div class="section-title"><h3>${esc(player.player)} - ${esc(player.position)}</h3><span class="badge ${pass?'green':'red'}">${pass?'Selection legal':'Selection blocked'}</span></div><div class="notice"><strong>Draft salary:</strong> ${money(player.price||player.startPrice)} — frozen from the current-price player pool captured before this draft. Valid selections are confirmed immediately; Commissioner approval is not required.</div>${checks.map(c=>`<div class="rule-check"><span>${esc(c.label)}</span><span class="${c.pass?'check-pass':'check-fail'}">${c.pass?'PASS':'FAIL'} - ${esc(c.detail)}</span></div>`).join('')}<div class="button-row"><button class="primary-button" id="submit-draft-proposal" ${pass&&canSubmit?'':'disabled'}>${buttonText}</button></div></div>`;
   }
 
   function modernTransactionRecord(action){return {timestamp:action.timestamp,type:action.type,team:action.team||action.teamA,detail:action.detail||'',status:action.status,_source:'modern',_action:action,_txKey:modernTransactionKey(action)};}
@@ -2331,7 +2516,7 @@
     const teamTools=logged?`<section class="team-moves-banner card card-pad"><div>${teamIdentity(myTeam,'sm')}<div><span class="eyebrow">Signed in as coach</span><h2>${esc(team(myTeam).owner)}</h2><p>Every form below is locked to ${esc(team(myTeam).name)}.</p></div></div><button class="secondary-button" id="moves-team-logout">Log out</button></section>
       ${incoming.length?`<section class="card card-pad incoming-trades"><div class="section-title"><div><span class="eyebrow">Action required</span><h2>Trade requests</h2></div><span class="badge amber">${incoming.length}</span></div><div class="proposal-list">${incomingCards}</div></section>`:''}
       <section class="proposal-grid"><article class="card card-pad"><div class="section-title"><div><span class="eyebrow">${esc(team(myTeam).owner)} proposes</span><h2>Trade proposal</h2></div>${tradeStatus}</div>
-      ${tradeOpen?`<div class="notice"><strong>${esc(tradePhase)} trading is open.</strong> PEGS checks both franchises before allowing submission. The other coach must accept before the Commissioner sees it.${conditionalDelistOpen?' Because delisting is also open, this trade can include up to three conditional delistings for each franchise.':' Conditional trade delistings are available only while the matching delisting window is also open.'}</div>`:`<div class="notice danger"><strong>Trading is closed.</strong></div>`}<input type="hidden" id="proposal-phase" value="${esc(tradePhase)}"><input type="hidden" id="proposal-team-a" value="${esc(myTeam)}">
+      ${tradeOpen?`<div class="notice"><strong>${esc(tradePhase)} trading is open.</strong> PEGS checks both franchises before allowing submission. The other coach must accept before the Commissioner sees it.${conditionalDelistOpen?' Because delisting is also open, this trade can include up to three conditional delistings for each franchise.':' Conditional trade delistings are available only while the roster window is open.'}</div>`:`<div class="notice danger"><strong>Trading is closed.</strong></div>`}<input type="hidden" id="proposal-phase" value="${esc(tradePhase)}"><input type="hidden" id="proposal-team-a" value="${esc(myTeam)}">
       <div class="form-grid" style="margin-top:14px"><div class="field-group"><label>Your team</label><input class="search-input" value="${esc(team(myTeam).name)} (${esc(team(myTeam).owner)})" disabled></div><div class="field-group"><label for="proposal-team-b">Trade partner</label><select class="select" id="proposal-team-b" ${tradeOpen?'':'disabled'}><option value="">Select trade partner…</option>${D.teams.filter(t=>t.key!==myTeam).map(t=>`<option value="${t.key}">${esc(t.name)} (${esc(t.owner)})</option>`).join('')}</select></div><div id="proposal-pick-owner-note" class="field-help"></div></div>
       <div class="trade-sides"><div class="trade-side"><h3 id="proposal-side-a-title">${esc(team(myTeam).name)} sends</h3><div id="proposal-side-a-players">${playerSlots('a',myTeam)}</div><div id="proposal-side-a-picks">${pickSlots('a',myTeam)}</div>${conditionalDelistOpen?`<div class="conditional-delist-builder"><div class="conditional-delist-builder-head"><span class="eyebrow">Conditional on this trade</span><strong>Delist up to 3</strong></div><p>Only occurs if the complete trade is accepted and approved.</p><div id="proposal-side-a-delists">${conditionalDelistSlots('a',myTeam)}</div></div>`:''}</div><div class="trade-arrow">⇄</div><div class="trade-side"><h3 id="proposal-side-b-title">Trade partner sends</h3><div id="proposal-side-b-players">${playerSlots('b')}</div><div id="proposal-side-b-picks">${pickSlots('b')}</div>${conditionalDelistOpen?`<div class="conditional-delist-builder"><div class="conditional-delist-builder-head"><span class="eyebrow">Conditional on this trade</span><strong>Delist up to 3</strong></div><p>The other coach accepts these delistings as part of the whole trade.</p><div id="proposal-side-b-delists">${conditionalDelistSlots('b')}</div></div>`:''}</div></div>
       <div class="trade-visual-title"><div><span class="eyebrow">Visual proposal</span><h3>Complete trade package</h3></div><span>Players, picks and conditional delistings update live as you build the trade.</span></div><div id="proposal-trade-visual" class="trade-visual-shell"><div class="trade-visual-empty trade-visual-empty-wide">Choose a trade partner to open the visual trade board.</div></div>
@@ -2363,7 +2548,7 @@
       const action=tradeActionFor(a,b,assetsA,assetsB,da,db),after=effectiveRosters(action),legalA=rosterIsLegal(after[a]||[]),legalB=rosterIsLegal(after[b]||[]),ownA=picksOwnedBy(a,pka,type),ownB=picksOwnedBy(b,pkb,type),hasEach=(pa.length+pka.length)>0&&(pb.length+pkb.length)>0;
       const ok=!duplicate&&!delistTradeConflict&&delistTermsValid&&ownsConditionalDelists&&hasEach&&ownA&&ownB&&legalA&&legalB;
       const conditionalSummary=(da.length||db.length)?`<div class="notice conditional-trade-note"><strong>Conditional delistings:</strong> ${esc(team(a).name)} ${da.length?esc(da.join(', ')):'none'} · ${esc(team(b).name)} ${db.length?esc(db.join(', ')):'none'}. They occur only if the entire trade is accepted and Commissioner-approved.</div>`:(conditionalDelistOpen?'<div class="notice"><strong>Optional:</strong> both franchises may include up to three conditional delistings in this trade.</div>':'');
-      tv.innerHTML=`<div class="trade-impact-intro"><strong>Live trade impact · before submission</strong><span>Recalculates the final roster after traded players, picks and conditional delistings are applied together.</span></div>${conditionalSummary}${tradeImpactHtml(a,b,assetsA,assetsB,da,db)}${duplicate?'<div class="notice danger">The same player, pick or conditional delisting cannot be selected twice on one side.</div>':''}${delistTradeConflict?'<div class="notice danger">A player cannot be both traded away and conditionally delisted by the same franchise.</div>':''}${!hasEach?'<div class="notice danger">Each team must send at least one player or draft pick. A conditional delisting is not a traded asset.</div>':''}${!ownA||!ownB?'<div class="notice danger">A selected draft pick is no longer owned by the offering team.</div>':''}${!ownsConditionalDelists?'<div class="notice danger">A conditional delisting player is no longer owned by that franchise.</div>':''}${!delistTermsValid?'<div class="notice danger">Conditional delistings require the matching delisting window to be open and are limited to three per franchise.</div>':''}${!legalA?`<div class="notice danger"><strong>${esc(team(a).name)} cannot accommodate the complete transaction.</strong> Adjust trade assets or conditional delistings until every rule is green.</div>`:''}${!legalB?`<div class="notice danger"><strong>${esc(team(b).name)} cannot accommodate the complete transaction.</strong> The receiving coach could not legally accept these terms.</div>`:''}`;
+      tv.innerHTML=`<div class="trade-impact-intro"><strong>Live trade impact · before submission</strong><span>Recalculates the final roster after traded players, picks and conditional delistings are applied together.</span></div>${conditionalSummary}${tradeImpactHtml(a,b,assetsA,assetsB,da,db)}${duplicate?'<div class="notice danger">The same player, pick or conditional delisting cannot be selected twice on one side.</div>':''}${delistTradeConflict?'<div class="notice danger">A player cannot be both traded away and conditionally delisted by the same franchise.</div>':''}${!hasEach?'<div class="notice danger">Each team must send at least one player or draft pick. A conditional delisting is not a traded asset.</div>':''}${!ownA||!ownB?'<div class="notice danger">A selected draft pick is no longer owned by the offering team.</div>':''}${!ownsConditionalDelists?'<div class="notice danger">A conditional delisting player is no longer owned by that franchise.</div>':''}${!delistTermsValid?'<div class="notice danger">Conditional delistings require the roster window to be open and are limited to three per franchise.</div>':''}${!legalA?`<div class="notice danger"><strong>${esc(team(a).name)} cannot accommodate the complete transaction.</strong> Adjust trade assets or conditional delistings until every rule is green.</div>`:''}${!legalB?`<div class="notice danger"><strong>${esc(team(b).name)} cannot accommodate the complete transaction.</strong> The receiving coach could not legally accept these terms.</div>`:''}`;
       submitTrade.disabled=!ok;submitTrade.textContent=ok?`Send complete request to ${team(b).owner}`:'Trade blocked';return ok;
     };
     const bindTradeAssets=()=>document.querySelectorAll('.proposal-player,.proposal-pick,.proposal-conditional-delist').forEach(x=>{x.addEventListener('change',tradeValidation);x.addEventListener('input',tradeValidation);});
@@ -2426,7 +2611,7 @@
   }
 
   function commissionerTabs(){
-    const tabs=[['scores','Round control'],['season','Season setup'],['finals','Finals'],['windows','League windows'],['approvals','Approvals'],['draft','Draft control'],['accounts','Team accounts'],['figureheads','Figureheads'],['backups','Data & recovery']];
+    const tabs=[['scores','Round control'],['season','Season setup'],['windows','Roster cycle'],['finals','Finals'],['approvals','Approvals'],['draft','Draft control'],['accounts','Team accounts'],['figureheads','Figureheads'],['backups','Data & recovery']];
     return `<div class="admin-tabs">${tabs.map(([id,label])=>`<button class="tab-button ${commissionerTab===id?'active':''}" data-admin-tab="${id}">${label}</button>`).join('')}</div>`;
   }
 
@@ -2437,12 +2622,36 @@
     return `<div class="admin-readout"><strong>${esc(team(teamKey).name)}</strong><span class="badge ${legal?'green':'red'}">${legal?'LEGAL':'BLOCKED'}</span><small>Main ${compactMoney(x.caps.main)} / ${compactMoney(D.rules.mainContractCap)} · Field ${compactMoney(x.caps.field)} / ${compactMoney(D.rules.fieldCap)} · Rookie ${compactMoney(x.caps.rookie)} / ${compactMoney(D.rules.rookieContractCap)} · Field ${x.counts.field}/${D.rules.maxFieldPlayers}</small></div>`;
   }
   function normalizedDraftType(value){
-    return String(value||'').toLowerCase().startsWith('mid') ? 'Mid-Season' : 'Pre-Season';
+    const raw=String(value||'').trim().toLowerCase();
+    if(raw.startsWith('mid'))return 'Mid-Season';
+    if(raw.startsWith('rook'))return 'Rookie Draft';
+    return 'Pre-Season';
   }
+  function draftPoolPhase(type){return normalizedDraftType(type)==='Rookie Draft'?'Pre-Season':normalizedDraftType(type);}
   function draftSeasonFor(type){
-    const base=currentSeason(); return normalizedDraftType(type)==='Pre-Season' ? base+(activeSeasonSetup()?0:1) : base;
+    const normalized=normalizedDraftType(type),cycle=rosterCycleState(),base=currentSeason();
+    return ['Pre-Season','Rookie Draft'].includes(normalized)?Number(cycle?.season||base+(activeSeasonSetup()?0:1)):Number(activeSeasonSetup()?.season||base);
   }
   function draftRoundsFor(type){ return DRAFT_ROUNDS[normalizedDraftType(type)] || 3; }
+  function midSeasonDraftReadiness(){
+    const setup=activeSeasonSetup();
+    if(!setup)return {ready:false,afterRound:null,reason:'Activate the season before starting the Mid-Season Draft.'};
+    const afterRound=midSeasonDraftRound(setup.midSeasonDraftAfterRound,setup.pegsRegularRounds),closed=Boolean(roundFinalized(afterRound)),cycle=rosterCycleState(),windowClosed=Number(cycle.season)===Number(setup.season)&&cycle.phase==='MIDSEASON_DRAFT';
+    if(!closed)return {ready:false,afterRound,reason:`The Mid-Season roster break opens after Round ${afterRound} is formally closed.`};
+    if(!windowClosed)return {ready:false,afterRound,reason:`Round ${afterRound} is closed. Close the Mid-Season Roster Window before starting the draft.`};
+    return {ready:true,afterRound,reason:`Round ${afterRound} is closed and the roster window is complete. The Mid-Season Draft is ready.`};
+  }
+  function draftLifecycleReadiness(type){
+    const normalized=normalizedDraftType(type),cycle=rosterCycleState(),season=draftSeasonFor(normalized),required=normalized==='Pre-Season'?'PRESEASON_DRAFT':normalized==='Rookie Draft'?'ROOKIE_DRAFT':'MIDSEASON_DRAFT';
+    if(Number(cycle.season)!==Number(season))return {ready:false,reason:`Roster Cycle is currently configured for ${cycle.season}, not ${season}.`};
+    if(cycle.phase!==required){
+      const reason=normalized==='Pre-Season'?'Close the Preseason Roster Window before starting the Pre-Season Draft.':normalized==='Rookie Draft'?'Complete the Pre-Season Draft first. The Rookie Draft follows immediately afterwards.':'Close the Mid-Season Roster Window before starting the Mid-Season Draft.';
+      return {ready:false,reason};
+    }
+    if(normalized==='Mid-Season')return midSeasonDraftReadiness();
+    if(normalized==='Rookie Draft')return {ready:true,reason:'The Pre-Season Draft is complete. The Rookie Draft is now ready in the same draft order.'};
+    return {ready:true,reason:'The Preseason Roster Window is closed. The Pre-Season Draft is ready.'};
+  }
   function reverseLadderOrder(){
     return [...effectiveLadder()].sort((a,b)=>Number(b.position||0)-Number(a.position||0)).map(r=>r.team).filter(k=>teamMap[k]);
   }
@@ -2451,7 +2660,7 @@
     if(setup?.preSeasonDraftOrder?.length)return setup.preSeasonDraftOrder.filter(k=>teamMap[k]);
     return [...D.ladder].sort((a,b)=>Number(b.position||0)-Number(a.position||0)).map(r=>r.team).filter(k=>teamMap[k]);
   }
-  function draftLadderOrder(type){ return normalizedDraftType(type)==='Pre-Season'?preSeasonDraftOrder():reverseLadderOrder(); }
+  function draftLadderOrder(type){ return ['Pre-Season','Rookie Draft'].includes(normalizedDraftType(type))?preSeasonDraftOrder():reverseLadderOrder(); }
   function draftPickRef(type,pick,season=draftSeasonFor(type)){
     return `${Number(season)}|${normalizedDraftType(type)}|${Number(pick)}`;
   }
@@ -2526,29 +2735,29 @@
     return (refs||[]).map(ref=>{const x=decodePickRef(ref,type),rec=draftPickLedger(type,{season:x.season}).find(p=>p.id===x.id)||x;return {id:x.id,type:x.type,season:x.season,pick:x.pick,round:rec.round||0,originalOwner:rec.originalOwner||'',from,to};});
   }
   function scoringLockStatusHtml(){
-    const season=String(currentSeason()),x=getScoringSnapshots()?.[season]||{},pre=x.preSeason,mid=x.midSeason;
+    const season=String(rosterCycleState()?.season||currentSeason()),x=getScoringSnapshots()?.[season]||{},pre=x.preSeason,mid=x.midSeason;
     const card=(label,snap)=>`<div class="stat-box"><span>${label}</span><strong>${snap?'LOCKED':'NOT LOCKED'}</strong><small>${snap?`From Round ${Number(snap.effectiveFromRound||1)} · ${fmtDate(snap.capturedAt)}`:'Ends when that draft is completed'}</small></div>`;
-    return `<div class="notice" style="margin-top:14px"><strong>Scoring roster locks:</strong> a player's scores remain attached to the roster snapshot for that period. Pre-Season rosters persist until the Mid-Season scoring lock replaces them; completed earlier rounds never use the later list.</div><div class="stat-strip" style="grid-template-columns:repeat(2,minmax(0,1fr));margin-top:12px">${card('Pre-Season list',pre)}${card('Mid-Season list',mid)}</div>`;
+    return `<div class="notice" style="margin-top:14px"><strong>Scoring roster locks:</strong> the preseason scoring list is captured only after both the Pre-Season Draft and Rookie Draft are complete. It persists until the Mid-Season scoring lock replaces it; completed earlier rounds never use the later list.</div><div class="stat-strip" style="grid-template-columns:repeat(2,minmax(0,1fr));margin-top:12px">${card('Pre-Season list',pre)}${card('Mid-Season list',mid)}</div>`;
   }
   function draftOrderPreviewHtml(type){
-    type=normalizedDraftType(type); const ledger=draftPickLedger(type),first=ledger.filter(p=>p.round===1),source=type==='Pre-Season'?`${currentSeason()-1} final ladder reversed`:`${currentSeason()} ladder reversed at draft activation`;
+    type=normalizedDraftType(type); const ledger=draftPickLedger(type),first=ledger.filter(p=>p.round===1),draftSeason=draftSeasonFor(type),source=['Pre-Season','Rookie Draft'].includes(type)?`${draftSeason-1} final ladder reversed${type==='Rookie Draft'?' · same order as Pre-Season Draft':''}`:`${draftSeason} ladder reversed at draft activation`;
     return `<div class="notice"><strong>Order source:</strong> ${esc(source)}. Standard AFL format repeats the same ladder order each round. Approved trades set pick ownership before/during the draft; if a 3-minute clock expires, the Commissioner may push that live pick back one slot, temporarily reordering the next two pick positions.</div><div class="draft-order-preview">${first.map(p=>`<div class="draft-order-chip"><span>${p.pick}</span>${figurehead(p.owner,'sm')}<strong>${esc(team(p.owner).owner)}</strong>${p.owner!==p.originalOwner?`<small>from ${esc(team(p.originalOwner).owner)}</small>`:''}</div>`).join('')}</div>`;
   }
   function approvalDetail(p){
     if(p.type==='TRADE'){
       const x=p.payload||{},a=x.assetsA||{players:[],picks:[]},b=x.assetsB||{players:[],picks:[]},da=x.conditionalDelistsA||[],db=x.conditionalDelistsB||[];
-      return `<div class="notice"><strong>Counterparty:</strong> ${p.counterpartyDecidedAt?'Accepted '+fmtDate(p.counterpartyDecidedAt):'Awaiting team acceptance'}</div>${(da.length||db.length)?'<div class="notice conditional-trade-note"><strong>Atomic trade package:</strong> conditional delistings below execute only with this approved trade. Rejecting the trade leaves every listed player on their current roster.</div>':''}${tradeVisualAssetsHtml(p.proposerTeam,p.counterpartyTeam,a,b,p.phase||'Pre-Season',da,db)}${tradeImpactHtml(p.proposerTeam,p.counterpartyTeam,a,b,da,db)}`;
+      return `<div class="notice"><strong>Counterparty:</strong> ${p.counterpartyDecidedAt?'Accepted '+fmtDate(p.counterpartyDecidedAt):'Awaiting team acceptance'}</div>${(da.length||db.length)?'<div class="notice conditional-trade-note"><strong>Atomic trade package:</strong> conditional delistings below execute only with this approved trade. Rejecting the trade leaves every listed player on their current roster.</div>':''}${tradeVisualAssetsHtml(p.proposerTeam,p.counterpartyTeam,a,b,p.phase||'Pre-Season',da,db)}${tradeImpactHtml(p.proposerTeam,p.counterpartyTeam,a,b,da,db)}${commissionerProjectedRosterHtml(p.proposerTeam)}${commissionerProjectedRosterHtml(p.counterpartyTeam)}`;
     }
     if(p.type==='SWAP'){
       const x=p.payload||{},action={type:'Rookie swap',status:'CONFIRMED',team:p.proposerTeam,playerIn:x.playerIn,playerOut:x.playerOut,playerInPosition:x.fieldPosition||''},before=effectiveRosters(),rosters=effectiveRosters(action);
       return `${x.fieldPosition?`<div class="notice"><strong>Field position:</strong> ${esc(x.playerIn||'')} will enter as ${esc(x.fieldPosition)}.</div>`:''}${rosterImpactTeamHtml(p.proposerTeam,before[p.proposerTeam]||[],rosters[p.proposerTeam]||[],'After proposed swap')}`;
     }
     if(p.type==='DELIST'){
-      const x=p.payload||{},players=x.players||[],action={type:'Delisted',status:'CONFIRMED',team:p.proposerTeam,players},rosters=effectiveRosters(action);return `<div class="notice"><strong>Players to remove:</strong> ${esc(players.join(', '))}</div>`+capReadout(p.proposerTeam,rosters);
+      const x=p.payload||{},players=x.players||[],action={type:'Delisted',status:'CONFIRMED',team:p.proposerTeam,players},rosters=effectiveRosters(action);return `<div class="notice"><strong>Players to remove:</strong> ${esc(players.join(', '))}</div>`+capReadout(p.proposerTeam,rosters)+commissionerProjectedRosterHtml(p.proposerTeam);
     }
     if(p.type==='ELEVATION'){
       const x=p.payload||{},action={type:'Rookie elevation',status:'CONFIRMED',team:p.proposerTeam,player:x.player,newSalary:Number(x.newSalary||0),newPosition:x.position||'',contractEnd:Number(x.contractEnd||0)},before=effectiveRosters(),after=effectiveRosters(action),season=Number(x.season||elevationSeasonFor(p.phase));
-      return `<div class="notice"><strong>Upgrade terms:</strong> ${esc(x.player||'')} · ${money(x.oldSalary||0)} → ${money(x.newSalary||0)} · ${esc(x.oldPosition||'')} → ${esc(x.position||'')} · Main contract to ${Number(x.contractEnd||season+3)}</div>${rosterImpactTeamHtml(p.proposerTeam,before[p.proposerTeam]||[],after[p.proposerTeam]||[],'After rookie elevation')}<div class="notice"><strong>Elevations used:</strong> ${rookieElevationsUsed(p.proposerTeam,season)} / 1 before this request.</div>`;
+      return `<div class="notice"><strong>Upgrade terms:</strong> ${esc(x.player||'')} · ${money(x.oldSalary||0)} → ${money(x.newSalary||0)} · ${esc(x.oldPosition||'')} → ${esc(x.position||'')} · Main contract to ${Number(x.contractEnd||season+3)}</div>${rosterImpactTeamHtml(p.proposerTeam,before[p.proposerTeam]||[],after[p.proposerTeam]||[],'After rookie elevation')}<div class="notice"><strong>Elevations used:</strong> ${rookieElevationsUsed(p.proposerTeam,season)} / 1 before this request.</div>${commissionerProjectedRosterHtml(p.proposerTeam)}`;
     }
     if(p.type==='DRAFT_PICK'){
       const x=p.payload||{},pl={player:x.player,club:x.club||'',position:x.position||'',price:Number(x.salary||0),startPrice:Number(x.salary||0)},checks=validateDraft(p.proposerTeam,pl,x.contract||'Main',x.listStatus||'Field',x.position||'');
@@ -2661,16 +2870,58 @@
     const players={}; for(const [key,p] of Object.entries(feed.players||{})){if(p.actual!==null&&p.actual!==undefined&&String(p.gameStatus||'').toUpperCase()==='FT')players[key]={player:p.player,club:p.club,actual:Number(p.actual),source:p.source||feed.source};}
     const all=getOpeningBank(); all[String(currentSeason())]={season:currentSeason(),capturedAt:new Date().toISOString(),players}; saveOpeningBank(all); toast(`${Object.keys(players).length} Opening Round scores banked.`); render(); renderCommissionerControls();
   }
+  function finalLadderSeeds(){
+    return [...effectiveLadder()].sort((a,b)=>Number(a.position)-Number(b.position)).slice(0,4).map(x=>x.team).filter(Boolean);
+  }
+  function seedFinalsAutomatically(setup){
+    const seeds=finalLadderSeeds();
+    if(seeds.length!==4||new Set(seeds).size!==4)return setup;
+    const f=seasonFinalsForRegularRounds(setup.pegsRegularRounds);
+    return {...setup,finals:{...f,bracket:{seededAt:new Date().toISOString(),seedSource:'FINAL_REGULAR_LADDER',seeds}}};
+  }
+  async function closeCurrentSeason(){
+    let setup=activeSeasonSetup();
+    if(!setup){toast('There is no active season to close.');return false;}
+    const f=finalsConfig(setup),gfRound=Number(f.grandFinalRound),gfRecord=roundFinalized(gfRound),bracket=calculatedFinalsBracket(setup),gf=bracket?.gf;
+    if(!gfRecord){toast(`Finalise the Grand Final (Round ${gfRound}) before closing the season.`);return false;}
+    const result=gf?.home&&gf?.away?finalsResult(gfRound,gf.home,gf.away):null;
+    if(!result?.winner){toast('The Grand Final needs a confirmed winner before the season can be closed.');return false;}
+    setup={...setup,active:false,status:'COMPLETE',currentRound:gfRound,completedThroughRound:gfRound,seasonClosedAt:new Date().toISOString(),premier:result.winner,runnerUp:result.loser,finals:{...setup.finals,bracket:setup.finals?.bracket||bracket}};
+    saveSeasonSetup(setup);
+    setRosterCyclePhase('PRESEASON_WINDOW_OPEN',{season:Number(setup.season)+1,reason:'previous_season_closed'});
+    if(backendConfigured()&&commissionerLoggedIn()){
+      try{await pushSharedState('season_setup',setup);await logCommissioner('SEASON_CLOSED','season',setup.season,{premier:result.winner,runnerUp:result.loser,grandFinalRound:gfRound});}catch(e){console.warn(e);}
+    }
+    commissionerTab='season';
+    toast(`${setup.season} season closed. ${setup.season+1} preseason roster management is now open and Season Setup is ready.`);
+    render();renderCommissionerControls();
+    return true;
+  }
   async function finalizeRound(round,force=false){
     let setup=activeSeasonSetup();if(!setup){toast('Activate a season setup first.');return;}
+    const midAfter=midSeasonDraftRound(setup.midSeasonDraftAfterRound,setup.pegsRegularRounds);
+    if(rosterCycleBlocksRound(setup)&&Number(round)>midAfter){toast(`Round ${round} is locked until the Mid-Season Roster Window closes and the Mid-Season Draft is completed.`);return;}
     const feed=getLiveFeed(),expected=Number(feed.expectedGameCount||0),matched=Number(feed.matchedGameCount||feed.games?.length||0),completed=Number(feed.completedGameCount||0);
     if(!force&&Number(feed.season)===currentSeason()&&Number(feed.round)===Number(round)&&expected>0&&(matched<expected||completed<expected)){toast(`Round ${round} is incomplete: ${matched}/${expected} games retrieved and ${completed}/${expected} final. Sync again or use Finalise anyway.`);return;}
     const teamScores={},players={};D.teams.forEach(t=>{const c=calcTeamRound(round,t.key);teamScores[t.key]=c.actual;players[t.key]=c.players.map(p=>({player:p.player,position:p.position,status:'Field',club:p.club,score:p.score,projected:p.liveValue,scoreSource:'Finalised live round',availability:'FT',gameStatus:'FT'}));});
     const all=getSeasonResults(),season=String(currentSeason());all[season]=all[season]||{};all[season][String(round)]={round:Number(round),teamScores,players,finalizedAt:new Date().toISOString(),topPlayers:topPlayersForRound(round),feedGames:{expected,matched,completed,forced:Boolean(force)}};saveSeasonResults(all);
-    setup={...setup,completedThroughRound:Math.max(Number(setup.completedThroughRound||0),Number(round)),currentRound:Number(round)+1,updatedAt:new Date().toISOString()};saveSeasonSetup(setup);
+    const f=finalsConfig(setup),regular=Number(setup.pegsRegularRounds||20),isFinalRegular=Number(round)===regular,isGrandFinal=Number(round)===Number(f.grandFinalRound),nextRound=isGrandFinal?Number(round):Number(round)+1;
+    setup={...setup,completedThroughRound:Math.max(Number(setup.completedThroughRound||0),Number(round)),currentRound:nextRound,status:isGrandFinal?'AWAITING_CLOSE':'ACTIVE',updatedAt:new Date().toISOString()};
+    if(isFinalRegular)setup=seedFinalsAutomatically(setup);
+    saveSeasonSetup(setup);
+    if(isFinalRegular)setRosterCyclePhase('FINALS',{season:setup.season,reason:'regular_season_complete'});
+    else if(Number(round)===midAfter&&!getScoringSnapshots()?.[String(setup.season)]?.midSeason)setRosterCyclePhase('MIDSEASON_WINDOW_OPEN',{season:setup.season,reason:'midseason_break_reached'});
     if(backendConfigured()&&commissionerLoggedIn()){
-      try{await Promise.all([pushSharedState('season_results',all),pushSharedState('season_setup',setup)]);await syncServerAuthority();const backupId=await createServerBackup('ROUND_FINALIZED',`${roundLabel(round)} finalised`);await logCommissioner('ROUND_FINALIZED','round',round,{forced:Boolean(force),backupId});toast(`${roundLabel(round)} finalised and backup #${backupId} created.`);}catch(e){console.warn(e);toast(`${roundLabel(round)} finalised, but automatic backup needs attention.`);}
-    }else toast(`${roundLabel(round)} finalised${force?' by Commissioner override':''}.`);
+      try{await Promise.all([pushSharedState('season_results',all),pushSharedState('season_setup',setup)]);await syncServerAuthority();const backupId=await createServerBackup('ROUND_FINALIZED',`${roundLabel(round)} finalised`);await logCommissioner('ROUND_FINALIZED','round',round,{forced:Boolean(force),backupId});
+        if(isGrandFinal)toast(`${roundLabel(round)} finalised and archived. Close the season when you are ready.`);
+        else if(isFinalRegular){const seeds=setup.finals?.bracket?.seeds||[];toast(`${roundLabel(round)} finalised. Final top four locked${seeds.length===4?`: ${seeds.map((k,i)=>`${i+1}. ${team(k).name}`).join(' · ')}`:''}.`);}
+        else if(Number(round)===midAfter)toast(`${roundLabel(round)} finalised and archived. The Mid-Season Roster Window is now open; Round ${Number(round)+1} is locked until the draft is complete.`);
+        else toast(`${roundLabel(round)} finalised and archive #${backupId} created.`);
+      }catch(e){console.warn(e);toast(`${roundLabel(round)} finalised, but automatic archive needs attention.`);}
+    }else if(isGrandFinal)toast(`${roundLabel(round)} finalised. Close the season when you are ready.`);
+    else if(isFinalRegular)toast(`${roundLabel(round)} finalised. The final ladder top four are locked for finals.`);
+    else if(Number(round)===midAfter)toast(`${roundLabel(round)} finalised. The Mid-Season Roster Window is now open and the next round is locked until the draft is complete.`);
+    else toast(`${roundLabel(round)} finalised${force?' by Commissioner override':''}.`);
     render();renderCommissionerControls();
   }
 
@@ -2687,85 +2938,189 @@
     if(!fixtures?.length)return '<div class="empty">No PEGS H2H fixture loaded.</div>'; const grouped={}; fixtures.forEach(f=>(grouped[f.round]||(grouped[f.round]=[])).push(f));
     return `<div class="fixture-setup-preview">${Object.entries(grouped).slice(0,limit).map(([r,fs])=>`<div class="setup-fixture-round"><strong>R${r}</strong><span>${fs.map(f=>`${esc(team(f.home).owner)} v ${esc(team(f.away).owner)}`).join(' · ')}</span></div>`).join('')}</div>`;
   }
+
+  function seasonFixtureVerified(setup){
+    return Boolean(setup?.fixtureVerified)&&Number(setup?.fixtureProviderYear||0)===Number(setup?.season||0)&&Number(setup?.aflGameCount||0)>0;
+  }
+  function seasonFixtureCoverage(setup){
+    const f=finalsConfig(setup),required=Number(f.grandFinalRound),available=Math.max(0,...(setup?.rounds||[]).map(r=>Number(r.round||0)));
+    return {required,available,ok:available>=required};
+  }
+  function seasonStructurePreview(setup){
+    const regular=Math.max(1,Number(setup?.pegsRegularRounds||20)),mid=midSeasonDraftRound(setup?.midSeasonDraftAfterRound,regular),f=finalsConfig(setup);
+    return `<div class="season-structure-map">
+      <div class="season-structure-node main"><span class="season-structure-kicker">Regular season</span><strong>Rounds 1–${regular}</strong><small>${regular} head-to-head rounds</small></div>
+      <div class="season-structure-connector"><span>→</span></div>
+      <div class="season-structure-node draft"><span class="season-structure-kicker">Mid-season roster break</span><strong>After R${mid}</strong><small>Window → Draft → Lock</small></div>
+      <div class="season-structure-connector"><span>→</span></div>
+      <div class="season-structure-node finals"><span class="season-structure-kicker">Finals Week 1</span><strong>R${f.week1Round}</strong><small>1st v 2nd · 3rd v 4th</small></div>
+      <div class="season-structure-connector"><span>→</span></div>
+      <div class="season-structure-node finals"><span class="season-structure-kicker">Preliminary</span><strong>R${f.preliminaryRound}</strong><small>QF loser v EF winner</small></div>
+      <div class="season-structure-connector"><span>→</span></div>
+      <div class="season-structure-node grand"><span class="season-structure-kicker">Grand Final</span><strong>R${f.grandFinalRound}</strong><small>Winner crowned</small></div>
+    </div>`;
+  }
+  function fixtureConfirmationHtml(setup){
+    const verified=seasonFixtureVerified(setup),coverage=seasonFixtureCoverage(setup);
+    if(!verified)return `<div class="fixture-confirm-card required"><div class="fixture-confirm-icon">!</div><div><span class="eyebrow">Required before activation</span><h3>AFL fixture not confirmed</h3><p>Use <strong>Retrieve AFL fixture</strong>. Season activation stays locked until the published fixture is successfully retrieved for ${Number(setup?.season||0)}.</p></div><span class="badge amber">REQUIRED</span></div>`;
+    const source=setup.fixtureSource||'AFL fixture provider',when=setup.fixtureVerifiedAt||setup.fixtureRetrievedAt;
+    return `<div class="fixture-confirm-card ${coverage.ok?'confirmed':'warning'}"><div class="fixture-confirm-icon">${coverage.ok?'✓':'!'}</div><div><span class="eyebrow">AFL fixture verification</span><h3>${coverage.ok?'Fixture confirmed':'Fixture retrieved · rounds incomplete'}</h3><p>${esc(source)}${when?` · ${fmtDate(when)}`:''} · ${Number(setup.aflGameCount||0)} games · ${Number((setup.rounds||[]).length)} rounds. ${coverage.ok?`Covers PEGS through the Grand Final in R${coverage.required}.`:`PEGS needs AFL fixture coverage through R${coverage.required}, but only R${coverage.available} is loaded.`}</p></div><span class="badge ${coverage.ok?'green':'amber'}">${coverage.ok?'CONFIRMED':'CHECK ROUNDS'}</span></div>`;
+  }
+  function seasonActivationReadiness(setup,fixtures=null){
+    const pegs=fixtures||setup?.pegsFixtures||[],regular=Number(setup?.pegsRegularRounds||20),fixtureErrors=validatePegsFixture(pegs,regular),coverage=seasonFixtureCoverage(setup),roster=preSeasonRosterReady(setup?.season);
+    return {
+      structure:Boolean(regular>=1&&Number(setup?.midSeasonDraftAfterRound||0)>=1&&Number(setup?.midSeasonDraftAfterRound||0)<regular),
+      afl:seasonFixtureVerified(setup)&&coverage.ok,
+      pegs:pegs.length>0&&!fixtureErrors.length,
+      finals:Boolean(finalsConfig(setup).grandFinalRound===regular+3),
+      roster,
+      fixtureErrors
+    };
+  }
+  function seasonActivationChecklistHtml(setup,fixtures=null){
+    const r=seasonActivationReadiness(setup,fixtures),rows=[['Season structure',r.structure,`${Number(setup.pegsRegularRounds||20)} H2H rounds · roster break after R${Number(setup.midSeasonDraftAfterRound||0)} · finals R${finalsConfig(setup).week1Round}–R${finalsConfig(setup).grandFinalRound}`],['Preseason roster cycle',r.roster,r.roster?'Preseason window closed · Pre-Season Draft complete · Rookie Draft complete · rosters locked':'Close the preseason window, complete the Pre-Season Draft, then complete the Rookie Draft'],['AFL fixture',r.afl,r.afl?'Retrieved and verified for the full PEGS season':'Successful fixture retrieval is required'],['PEGS fixture',r.pegs,r.pegs?'Every team has one matchup per H2H round':(r.fixtureErrors[0]||'Generate or correct the H2H fixture')],['Finals schedule',r.finals,'Top 4 locks automatically after the final H2H round']];
+    return `<div class="activation-checklist">${rows.map(([label,ok,detail])=>`<div class="activation-check ${ok?'pass':'wait'}"><span class="activation-check-icon">${ok?'✓':'•'}</span><div><strong>${esc(label)}</strong><small>${esc(detail)}</small></div><span class="badge ${ok?'green':'neutral'}">${ok?'READY':'WAITING'}</span></div>`).join('')}</div>`;
+  }
+  function roundPhaseStrip(setup){
+    const regular=Number(setup?.pegsRegularRounds||20),f=finalsConfig(setup),completed=Number(setup?.completedThroughRound||0),current=Number(setup?.currentRound||1),closed=String(setup?.status||'').toUpperCase()==='COMPLETE',awaitClose=String(setup?.status||'').toUpperCase()==='AWAITING_CLOSE';
+    const stateFor=(round,start,end=round)=>closed?'done':completed>=end?'done':current>=start&&current<=end?'active':'future';
+    const items=[{label:'Regular H2H',sub:`R1–R${regular}`,state:stateFor(regular,1,regular)},{label:'Finals Week 1',sub:`R${f.week1Round}`,state:stateFor(f.week1Round,f.week1Round)},{label:'Preliminary',sub:`R${f.preliminaryRound}`,state:stateFor(f.preliminaryRound,f.preliminaryRound)},{label:'Grand Final',sub:`R${f.grandFinalRound}`,state:stateFor(f.grandFinalRound,f.grandFinalRound)},{label:'Close season',sub:closed?'Complete':awaitClose?'Ready':'After GF',state:closed?'done':awaitClose?'active':'future'}];
+    return `<div class="round-phase-strip">${items.map((x,i)=>`<div class="round-phase-item ${x.state}"><span>${x.state==='done'?'✓':i+1}</span><div><strong>${x.label}</strong><small>${x.sub}</small></div></div>`).join('')}</div>`;
+  }
+  function rosterCycleTimelineHtml(cycle=rosterCycleState()){
+    const phases=[['PRESEASON_WINDOW_OPEN','Preseason window','Trades · Delist · Elevate'],['PRESEASON_DRAFT','Pre-Season Draft','Main contracts'],['ROOKIE_DRAFT','Rookie Draft','Immediately after'],['ROSTERS_LOCKED','Regular season','Rosters locked'],['MIDSEASON_WINDOW_OPEN','Mid-season window','Trades · Delist · Elevate'],['MIDSEASON_DRAFT','Mid-Season Draft','Main contracts only'],['POST_MIDSEASON_LOCKED','Post mid-season','Rosters locked'],['FINALS','Finals','Rosters locked']];
+    const order=phases.map(x=>x[0]),idx=Math.max(0,order.indexOf(cycle.phase));
+    return `<div class="roster-cycle-strip">${phases.map((x,i)=>`<div class="roster-cycle-step ${i<idx?'done':i===idx?'active':'future'}"><span>${i<idx?'✓':i+1}</span><div><strong>${x[1]}</strong><small>${x[2]}</small></div></div>`).join('')}</div>`;
+  }
+  function rosterCyclePhaseTitle(phase){return ({PRESEASON_WINDOW_OPEN:'Preseason Roster Window',PRESEASON_DRAFT:'Pre-Season Draft',ROOKIE_DRAFT:'Rookie Draft',ROSTERS_LOCKED:'Rosters Locked',MIDSEASON_WINDOW_OPEN:'Mid-Season Roster Window',MIDSEASON_DRAFT:'Mid-Season Draft',POST_MIDSEASON_LOCKED:'Rosters Locked',FINALS:'Finals · Rosters Locked'}[phase]||'Roster Cycle');}
+  function rosterWindowOfficialReadiness(){
+    const official=effectiveRosters(),illegal=(D.teams||[]).filter(t=>!rosterIsLegal(official[t.key]||[]));
+    return {official,illegal,ready:illegal.length===0};
+  }
+  function rosterWindowLeagueReadinessHtml(){
+    const {official,illegal:officialIllegal}=rosterWindowOfficialReadiness();
+    const cards=(D.teams||[]).map(t=>{
+      const currentRows=official[t.key]||[],ctx=plannerContext(t.key,{includePreview:false}),currentLegal=rosterIsLegal(currentRows),projectedLegal=ctx.legal,pending=ctx.included.length,issues=plannerIssueList(ctx.projectedRows);
+      return `<article class="cycle-readiness-team ${currentLegal?'is-ready':'is-review'}"><div class="cycle-readiness-team-head">${teamIdentity(t.key,'sm')}<div><strong>${esc(t.name)}</strong><small>${esc(t.owner)}</small></div><span class="badge ${currentLegal?'green':'red'}">${currentLegal?'OFFICIAL LEGAL':'OFFICIAL REVIEW'}</span></div><div class="cycle-readiness-team-meta"><span>Pending included <b>${pending}</b></span><span>Projected <b class="${projectedLegal?'planner-good':'planner-bad'}">${projectedLegal?'LEGAL':'REVIEW'}</b></span></div>${!projectedLegal&&issues.length?`<small class="cycle-readiness-issues">${esc(issues.join(' · '))}</small>`:''}</article>`;
+    }).join('');
+    return `<section class="cycle-league-readiness"><div class="section-title"><div><span class="eyebrow">League readiness</span><h3>Official and projected roster check</h3><p>Projected includes submitted delistings/elevations and trades already accepted by both coaches. Every <strong>official</strong> roster must be legal before the window can close.</p></div><span class="badge ${officialIllegal.length?'amber':'green'}">${officialIllegal.length?`${officialIllegal.length} TO REVIEW`:'ALL OFFICIAL ROSTERS LEGAL'}</span></div><div class="cycle-readiness-grid">${cards}</div></section>`;
+  }
+  function rosterCycleStatusCopy(cycle=rosterCycleState()){
+    const setup=getSeasonSetup(),mid=midSeasonDraftRound(setup.midSeasonDraftAfterRound,setup.pegsRegularRounds);
+    if(cycle.phase==='PRESEASON_WINDOW_OPEN')return 'Trades, delistings and rookie elevations are open together for the entire preseason. Close this window only when list management is finished.';
+    if(cycle.phase==='PRESEASON_DRAFT')return 'List management is closed. Complete the Pre-Season Draft first; the Rookie Draft opens immediately afterwards in the same order.';
+    if(cycle.phase==='ROOKIE_DRAFT')return 'The Pre-Season Draft is complete. Run the Rookie Draft now; there is no mid-season Rookie Draft.';
+    if(cycle.phase==='ROSTERS_LOCKED')return `Teams are locked. The next roster window opens automatically after Round ${mid} is formally closed.`;
+    if(cycle.phase==='MIDSEASON_WINDOW_OPEN')return `The scheduled break is active between Round ${mid} and Round ${mid+1}. Trades, delistings and rookie elevations are open together.`;
+    if(cycle.phase==='MIDSEASON_DRAFT')return `The Mid-Season Roster Window is closed. Complete the Mid-Season Draft before Round ${mid+1} can proceed.`;
+    if(cycle.phase==='POST_MIDSEASON_LOCKED')return 'The Mid-Season Draft is complete. Rosters are locked for the remainder of the regular season.';
+    if(cycle.phase==='FINALS')return 'The final Top 4 is locked and all roster movement remains closed throughout the finals.';
+    return 'PEGS manages roster access from one competition phase.';
+  }
   function renderCommissionerControls(){
     clearInteractionDraft();
     const ds=getDraftState(); let panel='';
     if(commissionerTab==='scores'){
-      const active=activeSeasonSetup();
-      if(!active&&Boolean(D.meta.seasonComplete)){
-        panel=`<div class="admin-section-hero"><div><span class="eyebrow">Round control</span><h3>No active scoring round</h3><p>The ${Number(D.meta.season||2026)} season is complete and locked in history. Start the next competition in Season Setup before live scoring resumes.</p></div><span class="badge green">${Number(D.meta.season||2026)} COMPLETE</span></div>
-        <div class="admin-kpi-strip"><div><span>Completed season</span><strong>${Number(D.meta.season||2026)}</strong></div><div><span>Completed through</span><strong>R${Number(D.meta.completedThroughRound||D.meta.currentRound||23)}</strong></div><div><span>Premier</span><strong>${esc(team(D.meta.premier).name)}</strong></div><div><span>Next action</span><strong>Season setup</strong></div></div>
-        <div class="admin-workflow"><article class="admin-step ready"><span class="admin-step-number">✓</span><div><span class="eyebrow">Archived</span><h3>2026 scoring is closed</h3><p>Historical round scores, finals and the premiership remain available throughout the site and in the consolidated Excel archive.</p></div></article><article class="admin-step"><span class="admin-step-number">1</span><div><span class="eyebrow">Next season</span><h3>Prepare ${Number(D.meta.season||2026)+1}</h3><p>Load the AFL fixture, confirm the PEGS fixture and activate the new season. Round Control will then automatically switch to the new active round.</p><div class="button-row"><button class="primary-button" id="go-season-setup">Open Season Setup</button></div></div></article></div>`;
+      const stored=getSeasonSetup(),completedSetup=!stored?.active&&String(stored?.status||'').toUpperCase()==='COMPLETE'?stored:null,active=activeSeasonSetup();
+      if(!active){
+        const completedYear=Number(completedSetup?.season||D.meta.season||2026),completedRound=Number(completedSetup?.completedThroughRound||D.meta.completedThroughRound||D.meta.currentRound||23),premierKey=completedSetup?.premier||D.meta.premier,nextYear=completedYear+1;
+        panel=`<div class="admin-section-hero"><div><span class="eyebrow">Round control</span><h3>${completedYear} season complete</h3><p>Scoring is closed and locked in history. The next scoring round cannot open until ${nextYear} Season Setup is verified and activated.</p></div><span class="badge green">SEASON CLOSED</span></div>
+        ${roundPhaseStrip(completedSetup||legacySeasonSetup())}
+        <div class="admin-kpi-strip"><div><span>Completed season</span><strong>${completedYear}</strong></div><div><span>Completed through</span><strong>R${completedRound}</strong></div><div><span>Premier</span><strong>${premierKey?esc(team(premierKey).name):'Recorded'}</strong></div><div><span>Next action</span><strong>${nextYear} setup</strong></div></div>
+        <div class="season-close-card complete"><div class="season-close-icon">✓</div><div><span class="eyebrow">Season archived</span><h3>${completedYear} is closed</h3><p>Round scores, finals and the premiership remain in history. Continue directly into the next season setup when you are ready.</p></div><button class="primary-button" id="go-season-setup">Set up ${nextYear}</button></div>`;
       }else{
-        const round=effectiveCurrentRound(),keys=D.teams.map(t=>t.key),defaultTeam=keys[0],feed=getLiveFeed(),expected=Number(feed.expectedGameCount||0),matched=Number(feed.matchedGameCount||feed.games?.length||0),completed=Number(feed.completedGameCount||0),feedIsCurrent=Number(feed.season)===currentSeason()&&Number(feed.round)===round,ready=feedIsCurrent&&expected>0&&matched>=expected&&completed>=expected,counted=topPlayersForRound(round),finalized=roundFinalized(round);
-        panel=`<div class="admin-section-hero"><div><span class="eyebrow">Round workflow</span><h3>${esc(roundLabel(round))}</h3><p>Sync the live feed, review the round, make any exceptional corrections, then finalise once every AFL game is complete.</p></div><span class="badge ${finalized?'green':ready?'green':feedIsCurrent?'amber':'neutral'}">${finalized?'FINALISED':ready?'READY TO FINALISE':feedIsCurrent?'LIVE / INCOMPLETE':'NOT SYNCED'}</span></div>
-        <div class="admin-kpi-strip"><div><span>Season</span><strong>${currentSeason()}</strong></div><div><span>PEGS scores counted</span><strong>${counted}</strong></div><div><span>AFL games loaded</span><strong>${expected?`${matched}/${expected}`:'—'}</strong></div><div><span>Games final</span><strong>${expected?`${completed}/${expected}`:'—'}</strong></div></div>
-        <div class="admin-workflow">
-          <article class="admin-step"><span class="admin-step-number">1</span><div><span class="eyebrow">Sync</span><h3>Refresh live scores</h3><p>Pull the current SuperCoach scores, game status and team-list information for this round.</p>${liveFeedSummary()}<div class="button-row"><button class="primary-button" id="sync-live-feed">Sync live scores now</button></div></div></article>
-          <article class="admin-step"><span class="admin-step-number">2</span><div><span class="eyebrow">Review</span><h3>Check matchups</h3><p>Use the normal Matchups page to review all head-to-head scores. Commissioner Mode adds the official score correction tools there when required.</p><div class="button-row"><button class="secondary-button" id="open-matchups-from-admin">Open Matchups & score editor</button></div></div></article>
-          <article class="admin-step ${ready?'ready':''}"><span class="admin-step-number">3</span><div><span class="eyebrow">Lock</span><h3>Finalise ${esc(roundLabel(round))}</h3><p>${finalized?'This round already has a finalised result snapshot.':ready?'All configured AFL games are final. Finalising stores the results, advances the season and creates a named restore point.':'PEGS will block normal finalisation until all configured AFL games are retrieved and final.'}</p><div class="button-row"><button class="primary-button" id="finalise-current-round" ${finalized?'disabled':''}>${finalized?'Round already finalised':`Finalise ${esc(roundLabel(round))}`}</button></div><details class="admin-details"><summary>Emergency finalisation</summary><div class="notice danger"><strong>Use only when the provider cannot complete the round.</strong> This bypasses the AFL-game completion check but still creates an official result and recovery checkpoint.</div><div class="button-row"><button class="secondary-button danger-button" id="force-finalise-current-round" ${finalized?'disabled':''}>Finalise anyway</button></div></details></div></article>
-        </div>
-        <details class="admin-details admin-advanced" style="margin-top:16px"><summary>Advanced · correct player selection status</summary><div class="notice" style="margin-top:12px"><strong>Selection status only.</strong> Use this when the provider incorrectly marks a player selected or OUT. Official score corrections belong in Matchups.</div><div class="form-grid" style="margin-top:16px"><div class="field-group"><label for="comm-round">Round</label><select class="select" id="comm-round">${(activeSeasonSetup()?.rounds||Object.keys(D.roundSchedule).map(r=>({round:Number(r)}))).map(x=>`<option value="${x.round}" ${Number(x.round)===round?'selected':''}>Round ${x.round}</option>`).join('')}</select></div><div class="field-group"><label for="comm-team">Team</label><select class="select" id="comm-team">${keys.map(k=>`<option value="${k}">${esc(team(k).name)}</option>`).join('')}</select></div><div class="field-group"><label for="comm-player">Player</label><select class="select" id="comm-player">${teamRoundPlayers(round,defaultTeam).map(p=>`<option value="${esc(p.player)}">${esc(p.player)}</option>`).join('')}</select></div><div class="field-group"><label for="comm-selection">Selection override</label><select class="select" id="comm-selection"><option value="">Use live feed</option><option value="SELECTED">Force selected</option><option value="OUT">Force OUT (projects 0)</option></select></div></div><div class="button-row"><button class="secondary-button" id="save-selection-override">Save override</button><button class="secondary-button" id="clear-selection-override">Use feed again</button></div></details>`;
+        const round=effectiveCurrentRound(),keys=D.teams.map(t=>t.key),defaultTeam=keys[0],feed=getLiveFeed(),expected=Number(feed.expectedGameCount||0),matched=Number(feed.matchedGameCount||feed.games?.length||0),completed=Number(feed.completedGameCount||0),feedIsCurrent=Number(feed.season)===currentSeason()&&Number(feed.round)===round,ready=feedIsCurrent&&expected>0&&matched>=expected&&completed>=expected,counted=topPlayersForRound(round),finalized=roundFinalized(round),f=finalsConfig(active),grandFinalDone=Boolean(roundFinalized(f.grandFinalRound))&&Number(active.completedThroughRound||0)>=Number(f.grandFinalRound),regular=Number(active.pegsRegularRounds||20),midAfter=Number(active.midSeasonDraftAfterRound||midSeasonDraftRound(null,regular)),cycle=rosterCycleState(),midBreak=Number(cycle.season)===Number(active.season)&&['MIDSEASON_WINDOW_OPEN','MIDSEASON_DRAFT'].includes(cycle.phase);
+        if(grandFinalDone){
+          const bracket=calculatedFinalsBracket(active),gf=bracket?.gf,result=gf?.home&&gf?.away?finalsResult(f.grandFinalRound,gf.home,gf.away):null;
+          panel=`<div class="admin-section-hero"><div><span class="eyebrow">Round control</span><h3>Grand Final complete</h3><p>The final scoring round is locked. Review the premiership result, then formally close ${currentSeason()} to unlock ${currentSeason()+1} Season Setup.</p></div><span class="badge green">READY TO CLOSE</span></div>
+          ${roundPhaseStrip(active)}
+          <div class="admin-kpi-strip"><div><span>Season</span><strong>${currentSeason()}</strong></div><div><span>Grand Final</span><strong>R${f.grandFinalRound}</strong></div><div><span>Premier</span><strong>${result?.winner?esc(team(result.winner).name):'Confirm result'}</strong></div><div><span>Next season</span><strong>${currentSeason()+1}</strong></div></div>
+          <div class="season-close-card"><div class="season-close-icon">🏆</div><div><span class="eyebrow">Final season action</span><h3>Close ${currentSeason()} season</h3><p>Closing the season marks it COMPLETE, preserves the final ladder and finals result, and takes you straight to ${currentSeason()+1} Season Setup. This does not create another archive—the Grand Final archive already exists.</p></div><button class="primary-button close-season-button" id="close-current-season" ${result?.winner?'':'disabled'}>Close ${currentSeason()} season</button></div>`;
+        }else if(midBreak){
+          const windowOpen=cycle.phase==='MIDSEASON_WINDOW_OPEN',nextRound=midAfter+1;
+          panel=`<div class="admin-section-hero"><div><span class="eyebrow">Mid-season roster break</span><h3>${windowOpen?'Roster Window Open':'Mid-Season Draft Required'}</h3><p>Round ${midAfter} is closed. Round ${nextRound} is intentionally locked until list management and the Mid-Season Draft are completed.</p></div><span class="badge ${windowOpen?'green':'amber'}">${windowOpen?'LIST MANAGEMENT OPEN':'DRAFT NEXT'}</span></div>
+          ${roundPhaseStrip(active)}
+          <div class="admin-kpi-strip"><div><span>Season</span><strong>${currentSeason()}</strong></div><div><span>Last round closed</span><strong>R${midAfter}</strong></div><div><span>Next scoring round</span><strong>R${nextRound} · LOCKED</strong></div><div><span>Roster phase</span><strong>${windowOpen?'WINDOW OPEN':'DRAFT'}</strong></div></div>
+          <div class="midseason-break-card"><div class="midseason-break-icon">↔</div><div><span class="eyebrow">Between-round roster period</span><h3>${windowOpen?'Complete list management':'Complete the Mid-Season Draft'}</h3><p>${windowOpen?'Trades, delistings and rookie elevations are available together. Close the roster window when teams have finished their moves.':'The list window is closed. End the Mid-Season Draft to capture the new scoring rosters and unlock the next round.'}</p></div><button class="primary-button" id="go-roster-cycle-from-round">${windowOpen?'Manage Roster Window':'Open Draft Step'}</button></div>`;
+        }else{
+          const specialFinalRegular=Number(round)===regular,grandFinal=Number(round)===Number(f.grandFinalRound);
+          panel=`<div class="admin-section-hero"><div><span class="eyebrow">Round workflow</span><h3>${esc(roundLabel(round))}</h3><p>One round at a time: sync the AFL feed, review the matchups, then finalise. PEGS archives the round automatically when it closes.</p></div><span class="badge ${finalized?'green':ready?'green':feedIsCurrent?'amber':'neutral'}">${finalized?'FINALISED':ready?'READY TO CLOSE':feedIsCurrent?'LIVE / INCOMPLETE':'NOT SYNCED'}</span></div>
+          ${roundPhaseStrip(active)}
+          <div class="admin-kpi-strip"><div><span>Season</span><strong>${currentSeason()}</strong></div><div><span>PEGS scores counted</span><strong>${counted}</strong></div><div><span>AFL games loaded</span><strong>${expected?`${matched}/${expected}`:'—'}</strong></div><div><span>Games final</span><strong>${expected?`${completed}/${expected}`:'—'}</strong></div></div>
+          <div class="admin-workflow round-control-workflow">
+            <article class="admin-step"><span class="admin-step-number">1</span><div><span class="eyebrow">Sync</span><h3>Refresh live scores</h3><p>Pull current SuperCoach scores, game status and team-list information for this round.</p>${liveFeedSummary()}<div class="button-row"><button class="primary-button" id="sync-live-feed">Sync live scores now</button></div></div></article>
+            <article class="admin-step"><span class="admin-step-number">2</span><div><span class="eyebrow">Review</span><h3>Check every matchup</h3><p>Review the live head-to-head scores. Commissioner score corrections remain on the Matchups page when required.</p><div class="button-row"><button class="secondary-button" id="open-matchups-from-admin">Open Matchups & score editor</button></div></div></article>
+            <article class="admin-step ${ready?'ready':''}"><span class="admin-step-number">3</span><div><span class="eyebrow">Close round</span><h3>Finalise ${esc(roundLabel(round))}</h3><p>${ready?(specialFinalRegular?'All AFL games are final. Closing this round also locks the final ladder Top 4 and creates the finals bracket automatically.':grandFinal?'All AFL games are final. Closing the Grand Final records the premiership and reveals the separate Close Season action.':'All AFL games are final. Closing stores the official results, advances the competition and creates the round archive.'):'PEGS blocks normal finalisation until every configured AFL game is retrieved and final.'}</p><div class="button-row"><button class="primary-button" id="finalise-current-round" ${finalized?'disabled':''}>${finalized?'Round already finalised':`Finalise ${esc(roundLabel(round))}`}</button></div><details class="admin-details"><summary>Emergency finalisation</summary><div class="notice danger"><strong>Use only when the provider cannot complete the round.</strong> This bypasses the AFL-game completion check but still creates the official result and round archive.</div><div class="button-row"><button class="secondary-button danger-button" id="force-finalise-current-round" ${finalized?'disabled':''}>Finalise anyway</button></div></details></div></article>
+          </div>
+          <details class="admin-details admin-advanced" style="margin-top:16px"><summary>Advanced · correct player selection status</summary><div class="notice" style="margin-top:12px"><strong>Selection status only.</strong> Use this when the provider incorrectly marks a player selected or OUT. Official score corrections belong in Matchups.</div><div class="form-grid" style="margin-top:16px"><div class="field-group"><label for="comm-round">Round</label><select class="select" id="comm-round">${(activeSeasonSetup()?.rounds||Object.keys(D.roundSchedule).map(r=>({round:Number(r)}))).map(x=>`<option value="${x.round}" ${Number(x.round)===round?'selected':''}>Round ${x.round}</option>`).join('')}</select></div><div class="field-group"><label for="comm-team">Team</label><select class="select" id="comm-team">${keys.map(k=>`<option value="${k}">${esc(team(k).name)}</option>`).join('')}</select></div><div class="field-group"><label for="comm-player">Player</label><select class="select" id="comm-player">${teamRoundPlayers(round,defaultTeam).map(p=>`<option value="${esc(p.player)}">${esc(p.player)}</option>`).join('')}</select></div><div class="field-group"><label for="comm-selection">Selection override</label><select class="select" id="comm-selection"><option value="">Use live feed</option><option value="SELECTED">Force selected</option><option value="OUT">Force OUT (projects 0)</option></select></div></div><div class="button-row"><button class="secondary-button" id="save-selection-override">Save override</button><button class="secondary-button" id="clear-selection-override">Use feed again</button></div></details>`;
+        }
       }
     } else if(commissionerTab==='season'){
-      const existing=localStorage.getItem(SEASON_SETUP_KEY)?getSeasonSetup():null,saved=existing&&!(Boolean(D.meta.seasonComplete)&&Number(existing.season)<=Number(D.meta.season||2026))?existing:newSeasonTemplate(),pegsCsv=pegsFixtureCsv(saved.pegsFixtures||[]),loaded=Number(saved.aflGameCount||0)>0||(saved.rounds||[]).length>0;
-      panel=`<div class="admin-section-hero"><div><span class="eyebrow">Season setup</span><h3>${Number(saved.season||currentSeason()+1)} competition</h3><p>Set the season basics, load the AFL fixture, confirm the PEGS head-to-head fixture and then activate the season.</p></div><span class="badge ${saved.active?'green':loaded?'amber':'neutral'}">${saved.active?'ACTIVE':loaded?'READY TO REVIEW':'SETUP'}</span></div>
+      const existing=localStorage.getItem(SEASON_SETUP_KEY)?getSeasonSetup():null,completedExisting=existing&&!existing.active&&String(existing.status||'').toUpperCase()==='COMPLETE',saved=completedExisting?newSeasonTemplate(existing):(existing||newSeasonTemplate()),pegsCsv=pegsFixtureCsv(saved.pegsFixtures||[]),verification=seasonFixtureVerified(saved),readiness=seasonActivationReadiness(saved,saved.pegsFixtures||[]),activationReady=readiness.structure&&readiness.roster&&readiness.afl&&readiness.pegs&&readiness.finals,regular=Number(saved.pegsRegularRounds||20),mid=midSeasonDraftRound(saved.midSeasonDraftAfterRound,regular),midOptions=Array.from({length:Math.max(1,regular-1)},(_,i)=>i+1).map(r=>`<option value="${r}" ${r===mid?'selected':''}>After Round ${r}</option>`).join('');
+      panel=`<div class="admin-section-hero"><div><span class="eyebrow">Season setup</span><h3>${Number(saved.season)} competition</h3><p>Define the season structure once. Finals are always the three rounds immediately after the regular H2H season, and the final ladder Top 4 qualify automatically.</p></div><span class="badge ${saved.active?'green':activationReady?'green':verification?'amber':'neutral'}">${saved.active?'ACTIVE':activationReady?'READY TO ACTIVATE':verification?'FIXTURE CONFIRMED':'SETUP'}</span></div>
+      <div class="season-setup-overview"><span>1 · Structure</span><span>2 · AFL fixture</span><span>3 · PEGS fixture</span><span>4 · Activate</span></div>
       <div class="admin-workflow compact-workflow">
-        <article class="admin-step"><span class="admin-step-number">1</span><div><span class="eyebrow">Basics</span><h3>Competition settings</h3><div class="form-grid" style="margin-top:12px"><div class="field-group"><label for="season-year">Season</label><input class="search-input" id="season-year" type="number" value="${Number(saved.season||currentSeason()+1)}"></div><div class="field-group"><label for="season-current-round">Current round</label><input class="search-input" id="season-current-round" type="number" min="1" value="${Number(saved.currentRound||1)}"></div><div class="field-group"><label for="season-regular-rounds">Regular H2H rounds</label><input class="search-input" id="season-regular-rounds" type="number" min="1" max="40" value="${Number(saved.pegsRegularRounds||20)}"></div><div class="field-group"><label>Live scoring</label><select class="select" id="season-live-enabled"><option value="1" ${saved.liveScoringEnabled!==false?'selected':''}>Enabled</option><option value="0" ${saved.liveScoringEnabled===false?'selected':''}>Disabled</option></select></div></div></div></article>
-        <article class="admin-step"><span class="admin-step-number">2</span><div><span class="eyebrow">AFL fixture</span><h3>Load byes & scoring counts</h3><p>Retrieve the published AFL fixture. From 2027 onward, PEGS automatically counts exactly one player score for each AFL club playing that round. There is no Opening Round banking.</p><div class="button-row"><button class="primary-button" id="retrieve-afl-fixture">Retrieve AFL fixture</button><button class="secondary-button" id="analyse-afl-fixture">Recalculate</button></div><div id="season-round-preview" style="margin-top:14px">${seasonRoundPreview(saved)}</div><details class="admin-details"><summary>Advanced · fixture CSV fallback</summary><div class="field-group" style="margin-top:12px"><label for="afl-fixture-csv">AFL fixture CSV</label><textarea class="setup-textarea" id="afl-fixture-csv" rows="7" placeholder="1,ADE,RIC\n1,COL,HAW\n2,SYD,CAR\n...">${esc(saved.aflFixtureCsv||'')}</textarea><small>Automatically filled after retrieval. Paste or upload only if the published fixture needs manual correction.</small></div><div class="button-row"><label class="secondary-button file-button" for="afl-fixture-file">Upload fixture CSV</label><input id="afl-fixture-file" type="file" accept=".csv,.txt,text/csv,text/plain" hidden></div><div id="opening-round-map" style="margin-top:12px">${openingRoundMappingControls(saved)}</div></details></div></article>
-        <article class="admin-step"><span class="admin-step-number">3</span><div><span class="eyebrow">PEGS fixture</span><h3>Confirm who plays who</h3><p>Generate the standard round-robin fixture, then review the matchup preview before activation.</p><div class="button-row"><button class="secondary-button" id="generate-pegs-fixture">Generate round-robin</button></div><div id="pegs-fixture-preview" style="margin-top:14px">${seasonFixturePreview(saved.pegsFixtures||[])}</div><details class="admin-details"><summary>Advanced · edit PEGS fixture CSV</summary><div class="field-group" style="margin-top:12px"><label for="pegs-fixture-csv">PEGS H2H fixture CSV</label><textarea class="setup-textarea" id="pegs-fixture-csv" rows="10">${esc(pegsCsv)}</textarea><small>Format: round,home-team-key,away-team-key. Team keys: ${D.teams.map(t=>t.key).join(', ')}.</small></div></details></div></article>
-        <article class="admin-step activation-step"><span class="admin-step-number">4</span><div><span class="eyebrow">Activate</span><h3>Make the season live</h3><p>Activation saves the verified AFL and PEGS fixtures as the authoritative season configuration. Future Commissioner changes are automatically checkpointed.</p><div class="button-row"><button class="primary-button" id="save-season-setup">Save & activate season</button>${saved.active?'<button class="secondary-button" id="deactivate-season-setup">Deactivate season</button>':'<button class="secondary-button" id="deactivate-season-setup">Return to archived 2026</button>'}</div></div></article>
+        <article class="admin-step"><span class="admin-step-number">1</span><div><span class="eyebrow">Season structure</span><h3>Choose the H2H length & roster break</h3><p>Finals are calculated automatically as the next three rounds. The mid-season break controls the only in-season roster window and draft.</p><div class="form-grid season-basics-grid" style="margin-top:14px"><div class="field-group"><label for="season-year">Season</label><input class="search-input" id="season-year" type="number" value="${Number(saved.season)}"></div><div class="field-group"><label for="season-regular-rounds">Regular H2H rounds</label><input class="search-input" id="season-regular-rounds" type="number" min="4" max="40" value="${regular}"></div><div class="field-group"><label for="season-mid-draft-round">Mid-Season Roster Break</label><select class="select" id="season-mid-draft-round">${midOptions}</select><small>Begins after this round is closed.</small></div></div><div id="season-structure-preview" style="margin-top:16px">${seasonStructurePreview(saved)}</div><details class="admin-details" style="margin-top:12px"><summary>Advanced · live scoring</summary><div class="field-group" style="margin-top:12px;max-width:320px"><label>Live scoring</label><select class="select" id="season-live-enabled"><option value="1" ${saved.liveScoringEnabled!==false?'selected':''}>Enabled</option><option value="0" ${saved.liveScoringEnabled===false?'selected':''}>Disabled</option></select></div></details></div></article>
+        <article class="admin-step ${verification?'ready':''}"><span class="admin-step-number">2</span><div><span class="eyebrow">AFL fixture</span><h3>Retrieve & verify the AFL schedule</h3><p>This is a hard activation requirement. Successful server retrieval confirms AFL byes and determines how many PEGS player scores count in every round.</p><div class="button-row"><button class="primary-button" id="retrieve-afl-fixture">Retrieve ${Number(saved.season)} AFL fixture</button></div><div id="season-fixture-status" style="margin-top:14px">${fixtureConfirmationHtml(saved)}</div><div id="season-round-preview" style="margin-top:14px">${seasonRoundPreview(saved)}</div><details class="admin-details"><summary>Advanced · inspect / correct fixture CSV</summary><div class="field-group" style="margin-top:12px"><label for="afl-fixture-csv">AFL fixture CSV</label><textarea class="setup-textarea" id="afl-fixture-csv" rows="7" placeholder="1,ADE,RIC\n1,COL,HAW\n2,SYD,CAR\n...">${esc(saved.aflFixtureCsv||'')}</textarea><small>Manual CSV entry can correct the retrieved data, but it cannot replace the required successful AFL fixture retrieval.</small></div><div class="button-row"><label class="secondary-button file-button" for="afl-fixture-file">Load CSV for review</label><input id="afl-fixture-file" type="file" accept=".csv,.txt,text/csv,text/plain" hidden></div><div id="opening-round-map" style="margin-top:12px">${openingRoundMappingControls(saved)}</div></details></div></article>
+        <article class="admin-step"><span class="admin-step-number">3</span><div><span class="eyebrow">PEGS fixture</span><h3>Confirm the head-to-head draw</h3><p>The H2H fixture covers the regular season only. Finals are generated from the final ladder and never need to be manually appended.</p><div class="button-row"><button class="secondary-button" id="generate-pegs-fixture">Generate ${regular}-round H2H fixture</button></div><div id="pegs-fixture-preview" style="margin-top:14px">${seasonFixturePreview(saved.pegsFixtures||[])}</div><details class="admin-details"><summary>Advanced · edit PEGS fixture CSV</summary><div class="field-group" style="margin-top:12px"><label for="pegs-fixture-csv">PEGS H2H fixture CSV</label><textarea class="setup-textarea" id="pegs-fixture-csv" rows="10">${esc(pegsCsv)}</textarea><small>Format: round,home-team-key,away-team-key. Team keys: ${D.teams.map(t=>t.key).join(', ')}.</small></div></details></div></article>
+        <article class="admin-step activation-step ${activationReady?'ready':''}"><span class="admin-step-number">4</span><div><span class="eyebrow">Activation gate</span><h3>${saved.active?'Season is live':'Activate only when everything is green'}</h3><p>PEGS will not activate a new season until the preseason roster cycle is complete, the AFL fixture is confirmed and the full H2H/finals structure validates.</p><div id="season-activation-status" style="margin-top:14px">${seasonActivationChecklistHtml(saved,saved.pegsFixtures||[])}</div><div class="button-row">${saved.active?'':`<button class="secondary-button" id="save-season-progress">Save setup progress</button>`}${!readiness.roster&&!saved.active?'<button class="secondary-button" id="go-roster-cycle">Manage Preseason Roster Cycle</button>':''}<button class="primary-button" id="save-season-setup" ${activationReady?'':'disabled'}>${saved.active?'Save active season settings':'Activate season'}</button></div>${saved.active?'<details class="admin-details"><summary>Advanced · deactivate active season</summary><div class="notice danger" style="margin-top:12px"><strong>Use with care.</strong> Deactivation returns PEGS to the last completed season until another season is activated.</div><div class="button-row"><button class="secondary-button danger-button" id="deactivate-season-setup">Deactivate season</button></div></details>':''}</div></article>
       </div>`;
     } else if(commissionerTab==='finals'){
-      const setup=getSeasonSetup(),f=finalsConfig(setup),b=calculatedFinalsBracket(setup),ladder=[...effectiveLadder()].sort((a,b)=>Number(a.position)-Number(b.position)),archived=!activeSeasonSetup()&&Boolean(D.meta.seasonComplete)?effectiveFinals():[];
-      const seeds=b?.seeds||ladder.slice(0,4).map(x=>x.team),seedSelect=(i)=>`<select class="select" id="final-seed-${i}">${D.teams.map(t=>`<option value="${t.key}" ${seeds[i]===t.key?'selected':''}>${i+1}. ${esc(t.name)} · ${esc(t.owner)}</option>`).join('')}</select>`;
+      const setup=activeSeasonSetup()||getSeasonSetup(),f=finalsConfig(setup),b=activeSeasonSetup()?calculatedFinalsBracket(setup):null,ladder=[...effectiveLadder()].sort((a,b)=>Number(a.position)-Number(b.position)),archived=!activeSeasonSetup()&&Boolean(D.meta.seasonComplete)?effectiveFinals():[],archivedSeeds=archived.length>=2?[archived[0]?.home,archived[0]?.away,archived[1]?.home,archived[1]?.away].filter(Boolean):null,regular=Number(setup.pegsRegularRounds||20),regularComplete=Number(setup.completedThroughRound||0)>=regular||(!activeSeasonSetup()&&Boolean(D.meta.seasonComplete)),lockedSeeds=b?.seeds||archivedSeeds||null,displaySeeds=lockedSeeds||ladder.slice(0,4).map(x=>x.team),seedSelect=(i)=>`<select class="select" id="final-seed-${i}">${D.teams.map(t=>`<option value="${t.key}" ${displaySeeds[i]===t.key?'selected':''}>${i+1}. ${esc(t.name)} · ${esc(t.owner)}</option>`).join('')}</select>`;
       const card=(label,x)=>{const hs=Number(x?.homeScore),as=Number(x?.awayScore),hasScore=Number.isFinite(hs)&&Number.isFinite(as),winner=x?.winner;return `<div class="final-card admin-final-card"><div class="final-team">${x?.home?teamIdentity(x.home,'sm'):'TBC'}${hasScore?`<strong class="final-score ${winner===x?.home?'winner-score':''}">${hs}</strong>`:''}</div><div><div class="final-round">${label}<br><small>Round ${Number(x?.round||0)}</small></div><div class="vs-dot" style="width:34px;height:34px;font-size:10px">VS</div></div><div class="final-team">${x?.away?teamIdentity(x.away,'sm'):'TBC'}${hasScore?`<strong class="final-score ${winner===x?.away?'winner-score':''}">${as}</strong>`:''}</div></div>`;};
-      const displayed=b?[card('Qualifying Final',b.qf),card('Elimination Final',b.ef),card('Preliminary Final',b.pf),card('Grand Final',b.gf)].join(''):archived.length?archived.map((x,i)=>card(x.label||(['Qualifying Final','Elimination Final','Preliminary Final','Grand Final'][i]||'Final'),x)).join(''):'<div class="empty">No finals bracket has been seeded yet.</div>';
-      const regularComplete=Number(setup.completedThroughRound||0)>=Number(setup.pegsRegularRounds||20)||(!activeSeasonSetup()&&Boolean(D.meta.seasonComplete));
-      panel=`<div class="admin-section-hero"><div><span class="eyebrow">Finals control</span><h3>Top-four Page finals</h3><p>Seed the top four from the ladder, confirm the AFL rounds used for each finals week, then let PEGS advance winners automatically as results are finalised.</p></div><span class="badge ${archived.length?'green':b?'amber':regularComplete?'green':'neutral'}">${archived.length?'2026 COMPLETE':b?'BRACKET SEEDED':regularComplete?'READY TO SEED':'REGULAR SEASON'}</span></div>
-      <div class="admin-kpi-strip"><div><span>Finals Week 1</span><strong>R${f.week1Round}</strong></div><div><span>Preliminary Final</span><strong>R${f.preliminaryRound}</strong></div><div><span>Grand Final</span><strong>R${f.grandFinalRound}</strong></div><div><span>Format</span><strong>Top 4</strong></div></div>
-      <div class="section-title" style="margin-top:20px"><div><span class="eyebrow">Bracket</span><h3>${archived.length?'Completed finals':'Finals path'}</h3></div>${!archived.length?'<button class="primary-button" id="seed-finals-from-ladder">Seed from current ladder</button>':''}</div><div class="finals-list">${displayed}</div>
-      ${archived.length?'<div class="notice" style="margin-top:14px"><strong>Archived season:</strong> the completed 2026 finals are locked into the historical league data. Activate a new season before configuring the next finals series.</div>':`<details class="admin-details admin-advanced" style="margin-top:18px" open><summary>Finals setup & manual seeding</summary><div class="form-grid" style="margin-top:14px"><div class="field-group"><label for="final-week1-round">Finals Week 1 AFL round</label><input class="search-input" id="final-week1-round" type="number" min="1" value="${f.week1Round}"></div><div class="field-group"><label for="final-prelim-round">Preliminary Final AFL round</label><input class="search-input" id="final-prelim-round" type="number" min="1" value="${f.preliminaryRound}"></div><div class="field-group"><label for="final-gf-round">Grand Final AFL round</label><input class="search-input" id="final-gf-round" type="number" min="1" value="${f.grandFinalRound}"></div><div class="field-group"><label>Finals format</label><input class="search-input" value="Top 4 · Page system" disabled></div></div><div class="section-title" style="margin-top:18px"><div><span class="eyebrow">Seeds</span><h3>Final ladder top four</h3></div></div><div class="form-grid"><div class="field-group"><label>Seed 1</label>${seedSelect(0)}</div><div class="field-group"><label>Seed 2</label>${seedSelect(1)}</div><div class="field-group"><label>Seed 3</label>${seedSelect(2)}</div><div class="field-group"><label>Seed 4</label>${seedSelect(3)}</div></div><div class="button-row"><button class="primary-button" id="save-finals-setup">Save finals setup</button><button class="secondary-button" id="clear-finals-bracket">Clear bracket</button></div></details>`}`;
+      const displayed=b?[card('Qualifying Final',b.qf),card('Elimination Final',b.ef),card('Preliminary Final',b.pf),card('Grand Final',b.gf)].join(''):archived.length?archived.map((x,i)=>card(x.label||(['Qualifying Final','Elimination Final','Preliminary Final','Grand Final'][i]||'Final'),x)).join(''):'<div class="empty">The bracket will appear automatically after the final H2H round is closed.</div>';
+      panel=`<div class="admin-section-hero"><div><span class="eyebrow">Finals control</span><h3>Automatic Top 4 finals</h3><p>No separate finals setup is required. The finals rounds follow immediately after the regular H2H season, and the ladder Top 4 lock automatically when Round ${regular} is closed.</p></div><span class="badge ${archived.length?'green':lockedSeeds?'green':regularComplete?'amber':'neutral'}">${archived.length?'COMPLETE':lockedSeeds?'TOP 4 LOCKED':regularComplete?'LOCKING TOP 4':'QUALIFICATION LIVE'}</span></div>
+      <div class="finals-roadmap"><div class="finals-roadmap-card"><span>Qualification</span><strong>Top 4 after R${regular}</strong><small>${regularComplete?'Regular season complete':'Positions remain live until the round closes'}</small></div><div class="finals-roadmap-arrow">→</div><div class="finals-roadmap-card"><span>Finals Week 1</span><strong>R${f.week1Round}</strong><small>1 v 2 · 3 v 4</small></div><div class="finals-roadmap-arrow">→</div><div class="finals-roadmap-card"><span>Preliminary</span><strong>R${f.preliminaryRound}</strong><small>QF loser v EF winner</small></div><div class="finals-roadmap-arrow">→</div><div class="finals-roadmap-card grand"><span>Grand Final</span><strong>R${f.grandFinalRound}</strong><small>Premiership</small></div></div>
+      <div class="section-title" style="margin-top:20px"><div><span class="eyebrow">${lockedSeeds?'Locked finalists':'Qualification'}</span><h3>${lockedSeeds?'Final ladder Top 4':'Current Top 4'}</h3></div><span class="badge ${lockedSeeds?'green':'neutral'}">${lockedSeeds?'LOCKED':'PROVISIONAL'}</span></div>
+      <div class="finals-seed-grid">${displaySeeds.map((k,i)=>`<div class="finals-seed-card ${lockedSeeds?'locked':''}"><span>${i+1}</span>${teamIdentity(k,'sm')}<small>${lockedSeeds?'Final seed':'Current ladder position'}</small></div>`).join('')}</div>
+      <div class="section-title" style="margin-top:22px"><div><span class="eyebrow">Bracket</span><h3>${archived.length?'Completed finals':lockedSeeds?'Finals path':'Waiting for final H2H round'}</h3></div></div><div class="finals-list">${displayed}</div>
+      ${archived.length?'<div class="notice" style="margin-top:14px"><strong>Archived season:</strong> the completed 2026 finals remain locked in historical league data.</div>':`<details class="admin-details admin-advanced" style="margin-top:18px"><summary>Advanced · emergency seed override</summary><div class="notice" style="margin-top:12px"><strong>Normal process:</strong> do not use this. PEGS automatically locks the final ladder Top 4 after Round ${regular} is closed.</div><div class="form-grid" style="margin-top:14px"><div class="field-group"><label>Seed 1</label>${seedSelect(0)}</div><div class="field-group"><label>Seed 2</label>${seedSelect(1)}</div><div class="field-group"><label>Seed 3</label>${seedSelect(2)}</div><div class="field-group"><label>Seed 4</label>${seedSelect(3)}</div></div><div class="button-row"><button class="secondary-button" id="save-finals-setup">Save emergency override</button><button class="secondary-button" id="reset-finals-ladder" ${regularComplete?'':'disabled'}>Reset to final ladder Top 4</button></div></details>`}`;
     } else if(commissionerTab==='windows'){
-      const w=getProposalWindows(),trade=w.trade||{},delist=w.delist||{},elevation=w.elevation||{},draft=getDraftState();
-      panel=`<div class="notice"><strong>League submission windows:</strong> teams cannot submit trades, rookie elevations, draft selections or delistings until you open the relevant activity. Existing pending proposals remain available for approval after a window closes.</div>
-      <div class="window-admin-grid" style="margin-top:16px">
-        <article class="window-admin-card"><div class="section-title"><div><span class="eyebrow">Trading</span><h3>Trade window</h3></div><span class="badge ${trade.open?'green':'red'}">${trade.open?'OPEN':'CLOSED'}</span></div><p class="muted-copy">Teams can only submit trades while this window is open. The phase you choose also controls which owned draft picks appear in trade forms.</p><div class="field-group"><label for="admin-trade-phase">Trading phase</label><select class="select" id="admin-trade-phase" ${trade.open?'disabled':''}><option ${trade.phase==='Pre-Season'?'selected':''}>Pre-Season</option><option ${trade.phase==='Mid-Season'?'selected':''}>Mid-Season</option></select></div><div class="button-row"><button class="primary-button" id="open-trade-window" ${trade.open?'disabled':''}>Open trading</button><button class="secondary-button" id="close-trade-window" ${trade.open?'':'disabled'}>Close trading</button></div>${trade.open?`<div class="notice"><strong>Active:</strong> ${esc(trade.phase)} trading opened ${fmtDate(trade.openedAt)}.</div>`:''}</article>
-        <article class="window-admin-card"><div class="section-title"><div><span class="eyebrow">Delisting</span><h3>Delisting window</h3></div><span class="badge ${delist.open?'green':'red'}">${delist.open?'OPEN':'CLOSED'}</span></div><p class="muted-copy">Teams can submit one request containing one or more currently-owned players. Nothing is removed until you approve it.</p><div class="field-group"><label for="admin-delist-phase">Delisting phase</label><select class="select" id="admin-delist-phase" ${delist.open?'disabled':''}><option ${delist.phase==='Pre-Season'?'selected':''}>Pre-Season</option><option ${delist.phase==='Mid-Season'?'selected':''}>Mid-Season</option></select></div><div class="button-row"><button class="primary-button" id="open-delist-window" ${delist.open?'disabled':''}>Open delisting</button><button class="secondary-button" id="close-delist-window" ${delist.open?'':'disabled'}>Close delisting</button></div>${delist.open?`<div class="notice"><strong>Active:</strong> ${esc(delist.phase)} delisting opened ${fmtDate(delist.openedAt)}.</div>`:''}</article>
-        <article class="window-admin-card"><div class="section-title"><div><span class="eyebrow">Rookie elevation</span><h3>Elevation window</h3></div><span class="badge ${elevation.open?'green':'red'}">${elevation.open?'OPEN':'CLOSED'}</span></div><p class="muted-copy">Open only at the Pre-Season or Mid-Season draft stage. Each franchise may complete one Rookie → Main elevation per season, subject to Commissioner approval.</p><div class="field-group"><label for="admin-elevation-phase">Elevation phase</label><select class="select" id="admin-elevation-phase" ${elevation.open?'disabled':''}><option ${elevation.phase==='Pre-Season'?'selected':''}>Pre-Season</option><option ${elevation.phase==='Mid-Season'?'selected':''}>Mid-Season</option></select></div><div class="button-row"><button class="primary-button" id="open-elevation-window" ${elevation.open?'disabled':''}>Open rookie elevations</button><button class="secondary-button" id="close-elevation-window" ${elevation.open?'':'disabled'}>Close rookie elevations</button></div>${elevation.open?`<div class="notice"><strong>Active:</strong> ${esc(elevation.phase)} · ${Number(elevation.season||elevationSeasonFor(elevation.phase))} · opened ${fmtDate(elevation.openedAt)}.</div>`:''}</article>
-        <article class="window-admin-card"><div class="section-title"><div><span class="eyebrow">Drafting</span><h3>Draft window</h3></div><span class="badge ${draft.active?'green':'red'}">${draft.active?'OPEN':'CLOSED'}</span></div><p class="muted-copy">Drafting is opened by starting a Pre-Season or Mid-Season Draft in Draft Control. When live, only the franchise on the clock can submit the current pick. Each pick gets 3:00; expiry creates OVERTIME but does not automatically skip anyone. The Commissioner may push an overdue pick back one slot.</p><div class="notice"><strong>${draft.active?'Live now':'Currently closed'}:</strong> ${draft.active?`${esc(draft.type||'Draft')} · Pick ${Number(draft.currentPick||1)} · ${esc(team(currentDraftTeam(draft)).name)}`:'Use Draft Control to open drafting.'}</div><div class="button-row"><button class="secondary-button" id="go-draft-control">Open Draft Control</button></div></article>
-      </div><div class="notice" style="margin-top:14px"><strong>Interchange Requests:</strong> these remain available for teams to propose at any time from their Teams page, but every request still requires Commissioner approval and must pass the swap-limit/roster checks.</div>`;
+      const cycle=rosterCycleState(),phase=cycle.phase,windowPhase=rosterCyclePhaseWindow(phase),isWindow=Boolean(windowPhase),pending=windowPhase?rosterCyclePending(windowPhase):[],draft=getDraftState(),setup=getSeasonSetup(),mid=midSeasonDraftRound(setup.midSeasonDraftAfterRound,setup.pegsRegularRounds),nextRound=mid+1;
+      const phaseTone=isWindow?'green':phase.includes('DRAFT')?'amber':'neutral',phaseBadge=isWindow?'WINDOW OPEN':phase.includes('DRAFT')?(draft.active?'DRAFT LIVE':'DRAFT NEXT'):'LOCKED';
+      let action='';
+      if(phase==='PRESEASON_WINDOW_OPEN')action=`<button class="primary-button" id="close-roster-window">Close Preseason Roster Window</button>`;
+      else if(phase==='MIDSEASON_WINDOW_OPEN')action=`<button class="primary-button" id="close-roster-window">Close Mid-Season Roster Window</button>`;
+      else if(phase==='PRESEASON_DRAFT')action=`<button class="primary-button" id="go-cycle-draft" data-draft-type="Pre-Season">Open Pre-Season Draft Control</button>`;
+      else if(phase==='ROOKIE_DRAFT')action=`<button class="primary-button" id="go-cycle-draft" data-draft-type="Rookie Draft">Open Rookie Draft Control</button>`;
+      else if(phase==='MIDSEASON_DRAFT')action=`<button class="primary-button" id="go-cycle-draft" data-draft-type="Mid-Season">Open Mid-Season Draft Control</button>`;
+      panel=`<div class="admin-section-hero roster-cycle-hero"><div><span class="eyebrow">Roster cycle · ${cycle.season}</span><h3>${esc(rosterCyclePhaseTitle(phase))}</h3><p>${esc(rosterCycleStatusCopy(cycle))}</p></div><span class="badge ${phaseTone}">${phaseBadge}</span></div>
+      ${rosterCycleTimelineHtml(cycle)}
+      <div class="admin-kpi-strip roster-cycle-kpis"><div><span>Trade submissions</span><strong>${isWindow?'OPEN':'CLOSED'}</strong></div><div><span>Delistings</span><strong>${isWindow?'OPEN':'CLOSED'}</strong></div><div><span>Rookie elevations</span><strong>${isWindow?'OPEN':'CLOSED'}</strong></div><div><span>Unresolved requests</span><strong>${pending.length}</strong></div></div>
+      <div class="roster-cycle-action-card ${isWindow?'open':'locked'}"><div><span class="eyebrow">Current Commissioner action</span><h3>${isWindow?`Manage ${windowPhase} list period`:phase.includes('DRAFT')?'Complete the draft':'No roster action required'}</h3><p>${isWindow?`All three list-management activities are controlled together. ${pending.length?`${pending.length} unresolved request${pending.length===1?'':'s'} must be resolved before the window can close.`:'There are no unresolved requests. PEGS will also verify every official roster is legal before allowing the window to close.'}`:phase==='PRESEASON_DRAFT'?'The Rookie Draft follows immediately after the Pre-Season Draft. The season remains locked until both are complete.':phase==='ROOKIE_DRAFT'?'Complete the Rookie Draft to capture the preseason scoring roster and unlock Season activation. There is no mid-season Rookie Draft.':phase==='MIDSEASON_DRAFT'?`Round ${nextRound} stays locked until this draft is ended.`:phase==='ROSTERS_LOCKED'?`Normal scoring continues. Mid-season list management opens after Round ${mid}.`:phase==='POST_MIDSEASON_LOCKED'?'No further trades, delistings or elevations are available this season.':phase==='FINALS'?'No roster changes are available during finals.':'PEGS will surface the next action automatically.'}</p>${pending.length?`<div class="notice amber"><strong>${pending.length} unresolved:</strong> approve, reject or resolve these requests before the roster window can close.</div>`:''}</div><div class="roster-cycle-action-buttons">${action}${pending.length?'<button class="secondary-button" id="go-cycle-approvals">Review requests</button>':''}</div></div>
+      ${isWindow?rosterWindowLeagueReadinessHtml():''}
+      <div class="roster-cycle-rule-grid"><article><span class="eyebrow">Preseason</span><strong>Window → Pre-Season Draft → Rookie Draft → Lock</strong><p>List management stays open throughout preseason. The Rookie Draft follows immediately after the Pre-Season Draft in the same order; only after both drafts finish are teams locked for Round 1.</p></article><article><span class="eyebrow">Mid-season</span><strong>Round ${mid} → Window → Mid-Season Draft → Round ${nextRound}</strong><p>Closing Round ${mid} opens the only in-season list window. There is no mid-season Rookie Draft.</p></article><article><span class="eyebrow">After mid-season</span><strong>Locked through finals</strong><p>Once the Mid-Season Draft finishes, the roster stays locked through the rest of the season and finals.</p></article></div>
+      <div class="notice" style="margin-top:14px"><strong>Interchange Requests:</strong> these remain available from the Teams page under the existing Commissioner approval and roster checks; they are not part of the trade/delist/elevation list window.</div>`;
     } else if(commissionerTab==='approvals'){
-      const pending=proposalCache.filter(p=>p.status==='AWAITING_COMMISSIONER'&&p.type!=='DRAFT_PICK');
-      panel=`<div class="notice"><strong>Approval inbox:</strong> team proposals do not change any roster until you approve them. All rules are re-checked against the current roster at approval time.</div><div class="proposal-list" style="margin-top:14px">${commissionerProposalCards(pending)}</div>`;
+      const pending=proposalCache.filter(p=>activeProposalStatus(p.status)&&p.type!=='DRAFT_PICK');
+      panel=`<div class="notice"><strong>Roster request inbox:</strong> all unresolved trade, delisting and elevation requests are shown here. Requests awaiting another coach are visible for context; Commissioner action buttons appear once a request reaches Commissioner approval.</div><div class="proposal-list" style="margin-top:14px">${commissionerProposalCards(pending)}</div>`;
     } else if(commissionerTab==='draft'){
-      const pending=proposalCache.filter(p=>p.status==='AWAITING_COMMISSIONER'&&p.type==='DRAFT_PICK');
-      const current=currentDraftTeam(ds),defaultType=normalizedDraftType(ds.type||'Pre-Season');
+      const current=currentDraftTeam(ds),cycle=rosterCycleState(),cycleDraftType=cycle.phase==='MIDSEASON_DRAFT'?'Mid-Season':cycle.phase==='ROOKIE_DRAFT'?'Rookie Draft':cycle.phase==='PRESEASON_DRAFT'?'Pre-Season':'',defaultType=normalizedDraftType(ds.active?ds.type:(cycleDraftType||ds.type||'Pre-Season')),lifecycle=draftLifecycleReadiness(defaultType);
       const liveRec=Array.isArray(ds.picks)?ds.picks.find(p=>Number(p.pick)===Number(ds.currentPick||1)):null;
       const nextKey=nextDraftTeam(ds),over=draftIsOvertime(ds),pickNo=Number(ds.currentPick||1);
       panel=`<div class="commissioner-draft-state ${ds.active?'live':''}"><div><span class="eyebrow">Current draft status</span><h3>${ds.active?'LIVE - '+esc(ds.type||'Draft'):'Draft closed'}</h3><p>${ds.active?`${Number(ds.season||draftSeasonFor(ds.type))} · Pick ${pickNo} · ${esc(team(current).name)} · <strong id="admin-draft-countdown" class="${over?'overtime-clock':''}">${draftClockText(ds)}</strong>${liveRec&&liveRec.owner!==liveRec.originalOwner?` · slot originally ${esc(team(liveRec.originalOwner).owner)}`:''}`:'Draft order is generated automatically from the ladder rule.'}</p></div><span id="admin-draft-clock-badge" class="badge ${ds.active?(over?'amber':'red'):'neutral'}">${ds.active?(over?'OVERTIME':'3 MIN CLOCK'):'CLOSED'}</span></div>
       ${ds.active?`<div id="admin-draft-overtime-notice" class="notice danger" style="display:${over?'block':'none'};margin-top:14px"><strong>Overtime decision:</strong> ${nextKey?`Push back will promote ${esc(team(nextKey).name)} from Pick ${pickNo+1} to Pick ${pickNo}, and move ${esc(team(current).name)} back to Pick ${pickNo+1}. A new 3:00 clock starts immediately for ${esc(team(nextKey).name)}.`:'This is the final pick, so there is no later franchise to promote.'}</div>`:''}
       ${scoringLockStatusHtml()}
-      <div class="form-grid" style="margin-top:16px"><div class="field-group"><label for="admin-draft-type">Draft type</label><select class="select" id="admin-draft-type" ${ds.active?'disabled':''}><option ${defaultType==='Pre-Season'?'selected':''}>Pre-Season</option><option ${defaultType==='Mid-Season'?'selected':''}>Mid-Season</option></select></div><div class="field-group"><label>Pick clock</label><input class="search-input" value="3:00 + Commissioner overtime control" disabled></div></div>
+      <div id="draft-lifecycle-readiness" class="notice ${lifecycle.ready?'success':'amber'}" style="margin-top:12px"><strong>Roster Cycle:</strong> ${esc(lifecycle.reason)}</div>
+      <div id="midseason-draft-readiness" class="notice" style="margin-top:12px;display:${defaultType==='Mid-Season'?'block':'none'}"><strong>Scheduled Mid-Season Draft:</strong> ${esc(midSeasonDraftReadiness().reason)}</div>
+      <div class="form-grid" style="margin-top:16px"><div class="field-group"><label for="admin-draft-type">Draft type</label><select class="select" id="admin-draft-type" ${ds.active||cycleDraftType?'disabled':''}><option ${defaultType==='Pre-Season'?'selected':''}>Pre-Season</option><option ${defaultType==='Rookie Draft'?'selected':''}>Rookie Draft</option><option ${defaultType==='Mid-Season'?'selected':''}>Mid-Season</option></select><small>${cycleDraftType?'Controlled by the active Roster Cycle phase.':'No draft is currently due in the Roster Cycle.'}</small></div><div class="field-group"><label>Pick clock</label><input class="search-input" value="3:00 + Commissioner overtime control" disabled></div></div>
       <div id="admin-draft-order-preview" style="margin-top:14px">${draftOrderPreviewHtml(defaultType)}</div>
       <div id="admin-draft-pool-status" style="margin-top:14px">${draftPoolStatusHtml(defaultType)}</div>
-      <div class="button-row"><button class="secondary-button" id="refresh-draft-pool" ${ds.active?'disabled':''}>Refresh current AFL player pool</button><button class="primary-button" id="start-draft" ${ds.active?'disabled':''}>Start draft</button><button class="secondary-button" id="push-draft-back" ${ds.active&&over&&nextKey?'':'disabled'}>Push overdue pick back 1</button><button class="secondary-button" id="end-draft" ${ds.active?'':'disabled'}>End draft</button></div>
+      <div class="button-row"><button class="secondary-button" id="refresh-draft-pool" ${ds.active||!lifecycle.ready||defaultType==='Rookie Draft'?'disabled':''}>${defaultType==='Rookie Draft'?'Uses Pre-Season player pool':'Refresh current AFL player pool'}</button><button class="primary-button" id="start-draft" ${ds.active||!lifecycle.ready?'disabled':''}>Start draft</button><button class="secondary-button" id="push-draft-back" ${ds.active&&over&&nextKey?'':'disabled'}>Push overdue pick back 1</button><button class="secondary-button" id="end-draft" ${ds.active?'':'disabled'}>End draft</button></div>
       ${(ds.reorders||[]).length?`<div class="notice" style="margin-top:14px"><strong>Overtime reorder history:</strong><br>${[...(ds.reorders||[])].slice(-5).reverse().map(r=>`Pick ${Number(r.pick)}: ${esc(team(r.promotedTeam).name)} promoted; ${esc(team(r.lateTeam).name)} moved to Pick ${Number(r.pushedTo||Number(r.pick)+1)} · ${fmtDate(r.timestamp)}`).join('<br>')}</div>`:''}
-      <hr style="border:0;border-top:1px solid var(--line);margin:22px 0"><div class="section-title"><div><span class="eyebrow">Team selections</span><h3>Draft approval inbox</h3></div><span class="badge amber">${pending.length} pending</span></div><div class="proposal-list">${commissionerProposalCards(pending)}</div>`;
+      <div class="notice success" style="margin-top:18px"><strong>No draft approval inbox.</strong> A coach's selection is validated against current ownership, frozen price, salary caps, list size and positional rules when they confirm the pick. If every rule passes, the player is added immediately and the next franchise goes on the clock.</div>`;
     } else if(commissionerTab==='accounts'){
       const rows=D.teams.map(t=>{const a=teamAccountsCache.find(x=>x.teamKey===t.key)||{};return `<tr><td>${teamIdentity(t.key,'sm')}</td><td><strong>${esc(t.owner)}</strong></td><td><code>${esc(a.username||String(t.owner).toLowerCase())}</code></td><td><span class="badge ${a.provisioned&&a.active!==false?'green':'amber'}">${a.provisioned&&a.active!==false?'ACTIVE':'NOT PROVISIONED'}</span></td><td><button class="secondary-button compact-button" data-reset-team-password="${t.key}">${a.provisioned?'Reset password':'Create account'}</button></td></tr>`;}).join('');
       panel=`<div class="notice"><strong>12 franchise logins:</strong> each coach account is permanently tied to one team. Passwords are not displayed by the server after creation/reset; a coach may optionally remember their own password in their browser on that device.</div><div class="button-row" style="margin-top:14px"><button class="primary-button" id="provision-team-accounts">Provision missing team accounts</button><button class="secondary-button" id="reload-team-accounts">Refresh status</button></div><div id="team-credential-output" style="margin-top:14px">${teamCredentialCache.length?credentialsTable(teamCredentialCache):''}</div><div class="table-wrap" style="margin-top:16px"><table class="data-table"><thead><tr><th>Franchise</th><th>Coach</th><th>Username</th><th>Status</th><th>Password</th></tr></thead><tbody>${rows}</tbody></table></div>`;
     } else if(commissionerTab==='backups'){
-      const latest=backupCache[0],autoCount=backupCache.filter(x=>String(x.reason||'').toUpperCase()==='AUTO_CHANGE').length,rows=backupCache.slice(0,50).map(b=>{const reason=String(b.reason||'').toUpperCase(),kind=reason==='AUTO_CHANGE'?'Automatic':reason==='ROUND_FINALIZED'?'Round finalised':reason==='PRE_RESTORE'?'Pre-restore safeguard':reason==='MANUAL_EXPORT'?'Excel archive':reason==='MANUAL'?'Manual':'System';return `<tr><td><strong>${fmtDate(b.created_at)}</strong><small class="table-subline">#${b.id}</small></td><td><span class="badge ${reason==='PRE_RESTORE'?'amber':reason==='ROUND_FINALIZED'?'green':'neutral'}">${kind}</span></td><td>${b.season||'—'}${b.round?` · R${b.round}`:''}</td><td>${esc(b.label||'Checkpoint')}</td><td><div class="backup-actions"><button class="secondary-button compact-button" data-backup-excel="${b.id}">Excel</button><button class="secondary-button compact-button danger-button" data-backup-restore="${b.id}">Restore</button></div></td></tr>`;}).join('');
+      const latest=backupCache[0],lastRound=backupCache.filter(x=>String(x.reason||'').toUpperCase()==='ROUND_FINALIZED').sort((a,b)=>Number(b.round||0)-Number(a.round||0))[0];
+      const rows=backupCache.slice(0,100).map(b=>{const reason=String(b.reason||'').toUpperCase(),kind=reason==='ROUND_FINALIZED'?'Round closed':reason==='MANUAL'?'Manual':'Archive';return `<tr><td><strong>${fmtDate(b.created_at)}</strong><small class="table-subline">#${b.id}</small></td><td><span class="badge ${reason==='ROUND_FINALIZED'?'green':'neutral'}">${kind}</span></td><td>${b.season||'—'}${b.round?` · R${b.round}`:''}</td><td>${esc(b.label||'Archive')}</td><td><div class="backup-actions"><button class="secondary-button compact-button" data-backup-excel="${b.id}">Download</button><button class="secondary-button compact-button danger-button" data-backup-restore="${b.id}">Restore</button></div></td></tr>`;}).join('');
       const audit=auditCache.slice(0,20).map(a=>`<div class="audit-row"><time>${fmtDate(a.created_at)}</time><strong>${esc(a.action)}</strong><span>${esc(a.actor_team||a.actor_role||'')}</span><small>${esc(a.entity_type||'')} ${esc(a.entity_id||'')}</small></div>`).join('');
-      panel=`<div class="admin-section-hero"><div><span class="eyebrow">Data & recovery</span><h3>One archive, safe restore points</h3><p>Excel is the single Commissioner archive format. PEGS automatically saves timestamped restore points after material Commissioner changes; any restore point can be exported to the same consolidated Excel structure.</p></div><span class="badge green">AUTO BACKUP ON</span></div>
-      <div class="admin-kpi-strip"><div><span>Latest restore point</span><strong>${latest?fmtDate(latest.created_at):'None'}</strong></div><div><span>Restore points loaded</span><strong>${backupCache.length}</strong></div><div><span>Automatic checkpoints</span><strong>${autoCount}</strong></div><div><span>Archive format</span><strong>Excel</strong></div></div>
-      <div class="recovery-action-grid">
-        <article class="recovery-action-card primary"><span class="eyebrow">Full league archive</span><h3>Download current Excel archive</h3><p>Creates a fresh restore point, then exports the same recovery data to one consolidated Excel workbook. It includes the complete league archive plus the current PEGS state.</p><button class="primary-button" id="download-current-archive">Download Excel archive</button></article>
-        <article class="recovery-action-card"><span class="eyebrow">Before a major change</span><h3>Create manual restore point</h3><p>Add a named point-in-time checkpoint without downloading anything. Automatic checkpoints continue in the background.</p><button class="secondary-button" id="create-manual-backup">Create restore point now</button></article>
-      </div>
-      <div class="notice" style="margin-top:14px"><strong>What the Excel archive replaces:</strong> the old Legacy Data JSON export and the separate backup export. The consolidated workbook carries the meaningful records from the full 102-sheet legacy workbook: roster history, raw PEGS/AFL scores, 2018-2026 draft/trade/delisting history, written rules, former franchise identities, weekly player market history, draft order/timing and Grand Final scorecards, plus the current PEGS state. Formula/helper/display sheets are deliberately replaced by their canonical source tables. The Workbook Map sheet accounts for every original sheet.</div>
-      <div class="section-title" style="margin-top:22px"><div><span class="eyebrow">Point-in-time restore</span><h3>Restore history</h3></div><button class="secondary-button" id="reload-backups">Refresh</button></div><div class="notice"><strong>Restore protection:</strong> restoring any point first creates an automatic safeguard of the state you are leaving. Team login passwords are never rolled back.</div><div class="table-wrap recovery-table" style="margin-top:14px"><table class="data-table"><thead><tr><th>When</th><th>Type</th><th>Season</th><th>Checkpoint</th><th>Actions</th></tr></thead><tbody>${rows||'<tr><td colspan="5">No restore points yet.</td></tr>'}</tbody></table></div>
+      panel=`<div class="admin-section-hero"><div><span class="eyebrow">Data & recovery</span><h3>Round archives & point-in-time restore</h3><p>PEGS automatically creates one archive when each round is finalised. Create a manual archive whenever you want an extra checkpoint. Every archive can be downloaded to Excel or restored directly.</p></div><span class="badge green">ROUND ARCHIVES ON</span></div>
+      <div class="admin-kpi-strip"><div><span>Latest archive</span><strong>${latest?fmtDate(latest.created_at):'None'}</strong></div><div><span>Archives</span><strong>${backupCache.length}</strong></div><div><span>Last closed round</span><strong>${lastRound?`R${lastRound.round}`:'—'}</strong></div><div><span>Download format</span><strong>Excel</strong></div></div>
+      <div class="recovery-action-grid single-action-grid"><article class="recovery-action-card primary"><span class="eyebrow">Manual checkpoint</span><h3>Create manual archive</h3><p>Save the current league state as an extra restore point. This is optional; PEGS will automatically archive every round when you finalise it.</p><button class="primary-button" id="create-manual-backup">Create manual archive</button></article></div>
+      <div class="notice" style="margin-top:14px"><strong>Automatic archive rule:</strong> one archive is created only when a round is formally finalised. Normal Commissioner edits, live-score refreshes and Excel downloads do not create restore points.</div>
+      <div class="section-title" style="margin-top:22px"><div><span class="eyebrow">Archive history</span><h3>Download or restore any point</h3></div><button class="secondary-button" id="reload-backups">Refresh</button></div><div class="notice"><strong>Restore:</strong> restoring replaces the current league state with the selected archive. It does not create another archive automatically. Team login passwords are never rolled back.</div><div class="table-wrap recovery-table" style="margin-top:14px"><table class="data-table"><thead><tr><th>When</th><th>Type</th><th>Season</th><th>Archive</th><th>Actions</th></tr></thead><tbody>${rows||'<tr><td colspan="5">No archives yet.</td></tr>'}</tbody></table></div>
       <details class="admin-details" style="margin-top:18px"><summary>Recent audit activity</summary><div class="audit-list" style="margin-top:12px">${audit||'<div class="empty">No audit entries loaded.</div>'}</div></details>`;
     } else if(commissionerTab==='figureheads'){
       const overrides=getFigureheadOverrides();
@@ -2774,7 +3129,7 @@
       panel=`<div class="notice"><strong>Commissioner section unavailable.</strong> Choose another control-centre tab.</div>`;
     }
     commissionerContent.innerHTML=`<div class="commissioner-body"><div class="commissioner-title-row"><div><span class="eyebrow">Private administration</span><h3>Commissioner Control Centre</h3></div><div class="commissioner-title-actions"><span class="badge green">Unlocked</span><button class="secondary-button commissioner-logout-button" id="commissioner-logout">Log Out Commissioner</button></div></div>${commissionerTabs()}<div class="admin-panel">${panel}</div></div>`;
-    document.querySelectorAll('[data-admin-tab]').forEach(btn=>btn.addEventListener('click',async()=>{commissionerTab=btn.dataset.adminTab;if(commissionerTab==='accounts')await loadTeamAccounts();if(commissionerTab==='backups')await Promise.all([syncBackups(),syncAudit()]);renderCommissionerControls();}));
+    document.querySelectorAll('[data-admin-tab]').forEach(btn=>btn.addEventListener('click',async()=>{commissionerTab=btn.dataset.adminTab;if(commissionerTab==='accounts')await loadTeamAccounts();if(commissionerTab==='backups'){await Promise.all([syncBackups(),syncAudit()]);try{if(await ensure2026ArchiveBaseline())toast('2026 R23 archive refreshed with the current roster-cycle state.');}catch(e){toast(e.message||'Archive history clean-up needs attention.');}}renderCommissionerControls();}));
     document.getElementById('commissioner-logout')?.addEventListener('click',()=>{teamCredentialCache=[];clearCommissionerSession();dismissDialog(commissionerDialog);toast(`Commissioner logged out.${teamLoggedIn()?' Team Login remains active.':''}`);enforceAccessAfterLogout('Commissioner logged out. Log in to re-enter PEGS.');});
     document.querySelectorAll('[data-proposal-approve]').forEach(btn=>btn.addEventListener('click',()=>void approveProposal(btn.dataset.proposalApprove)));
     document.querySelectorAll('[data-proposal-reject]').forEach(btn=>btn.addEventListener('click',()=>void rejectProposal(btn.dataset.proposalReject)));
@@ -2786,6 +3141,8 @@
       document.getElementById('finalise-current-round')?.addEventListener('click',()=>void finalizeRound(effectiveCurrentRound(),false));
       document.getElementById('force-finalise-current-round')?.addEventListener('click',()=>{if(confirm('Finalise this round even though the live-feed game check may be incomplete?'))void finalizeRound(effectiveCurrentRound(),true);});
       document.getElementById('go-season-setup')?.addEventListener('click',()=>{commissionerTab='season';renderCommissionerControls();});
+      document.getElementById('close-current-season')?.addEventListener('click',()=>{if(confirm(`Close the ${currentSeason()} season? This marks the season COMPLETE and opens ${currentSeason()+1} Season Setup.`))void closeCurrentSeason();});
+      document.getElementById('go-roster-cycle-from-round')?.addEventListener('click',()=>{const c=rosterCycleState();commissionerTab=c.phase==='MIDSEASON_DRAFT'?'draft':'windows';renderCommissionerControls();if(c.phase==='MIDSEASON_DRAFT'){const el=document.getElementById('admin-draft-type');if(el){el.value='Mid-Season';el.dispatchEvent(new Event('change',{bubbles:true}));}}});
       const roundEl=document.getElementById('comm-round'),teamEl=document.getElementById('comm-team'),playerEl=document.getElementById('comm-player'),selectionEl=document.getElementById('comm-selection');
       if(roundEl&&teamEl&&playerEl&&selectionEl){
         const load=()=>{selectionEl.value=selectionOverride(Number(roundEl.value),teamEl.value,playerEl.value)||'';};
@@ -2799,61 +3156,84 @@
     }
     if(commissionerTab==='finals'){
       const saveFinals=(useLadder=false)=>{
-        const setup=getSeasonSetup(),ladder=[...effectiveLadder()].sort((a,b)=>Number(a.position)-Number(b.position)),seeds=useLadder?ladder.slice(0,4).map(x=>x.team):[0,1,2,3].map(i=>document.getElementById(`final-seed-${i}`)?.value).filter(Boolean);
+        const setup=getSeasonSetup(),seeds=useLadder?finalLadderSeeds():[0,1,2,3].map(i=>document.getElementById(`final-seed-${i}`)?.value).filter(Boolean);
         if(seeds.length!==4||new Set(seeds).size!==4){toast('Finals require four different teams.');return;}
-        const finals={enabled:true,format:'TOP4_PAGE',week1Round:Number(document.getElementById('final-week1-round')?.value||21),preliminaryRound:Number(document.getElementById('final-prelim-round')?.value||22),grandFinalRound:Number(document.getElementById('final-gf-round')?.value||23),bracket:{seededAt:new Date().toISOString(),seeds}};
-        if(!(finals.week1Round<finals.preliminaryRound&&finals.preliminaryRound<finals.grandFinalRound)){toast('Finals rounds must run in chronological order.');return;}
-        saveSeasonSetup({...setup,finals,updatedAt:new Date().toISOString()});toast(`Finals seeded: ${seeds.map((k,i)=>`${i+1} ${team(k).name}`).join(' · ')}`);render();renderCommissionerControls();
+        const finals={...seasonFinalsForRegularRounds(setup.pegsRegularRounds),bracket:{seededAt:new Date().toISOString(),seedSource:useLadder?'FINAL_REGULAR_LADDER':'COMMISSIONER_OVERRIDE',seeds}};
+        saveSeasonSetup({...setup,finals,updatedAt:new Date().toISOString()});toast(`${useLadder?'Final ladder Top 4 restored':'Emergency finals seed override saved'}: ${seeds.map((k,i)=>`${i+1}. ${team(k).name}`).join(' · ')}`);render();renderCommissionerControls();
       };
-      document.getElementById('seed-finals-from-ladder')?.addEventListener('click',()=>saveFinals(true));
       document.getElementById('save-finals-setup')?.addEventListener('click',()=>saveFinals(false));
-      document.getElementById('clear-finals-bracket')?.addEventListener('click',()=>{const setup=getSeasonSetup(),f=finalsConfig(setup);saveSeasonSetup({...setup,finals:{...f,bracket:null},updatedAt:new Date().toISOString()});toast('Finals bracket cleared.');render();renderCommissionerControls();});
+      document.getElementById('reset-finals-ladder')?.addEventListener('click',()=>saveFinals(true));
     }
     if(commissionerTab==='windows'){
-      document.getElementById('open-trade-window')?.addEventListener('click',()=>{const w=getProposalWindows(),phase=document.getElementById('admin-trade-phase').value,now=new Date().toISOString();saveProposalWindows({...w,trade:{open:true,phase,openedAt:now,closedAt:null}});toast(`${phase} trading is now open.`);render();renderCommissionerControls();});
-      document.getElementById('close-trade-window')?.addEventListener('click',()=>{const w=getProposalWindows();saveProposalWindows({...w,trade:{...(w.trade||{}),open:false,closedAt:new Date().toISOString()}});toast('Trading submissions closed.');render();renderCommissionerControls();});
-      document.getElementById('open-delist-window')?.addEventListener('click',()=>{const w=getProposalWindows(),phase=document.getElementById('admin-delist-phase').value,now=new Date().toISOString();saveProposalWindows({...w,delist:{open:true,phase,openedAt:now,closedAt:null}});toast(`${phase} delisting is now open.`);render();renderCommissionerControls();});
-      document.getElementById('close-delist-window')?.addEventListener('click',()=>{const w=getProposalWindows();saveProposalWindows({...w,delist:{...(w.delist||{}),open:false,closedAt:new Date().toISOString()}});toast('Delisting submissions closed.');render();renderCommissionerControls();});
-      document.getElementById('open-elevation-window')?.addEventListener('click',()=>{const w=getProposalWindows(),phase=document.getElementById('admin-elevation-phase').value,season=elevationSeasonFor(phase),now=new Date().toISOString();saveProposalWindows({...w,elevation:{open:true,phase,season,openedAt:now,closedAt:null}});toast(`${season} ${phase} rookie elevations are now open.`);render();renderCommissionerControls();});
-      document.getElementById('close-elevation-window')?.addEventListener('click',()=>{const w=getProposalWindows();saveProposalWindows({...w,elevation:{...(w.elevation||{}),open:false,closedAt:new Date().toISOString()}});toast('Rookie elevation submissions closed.');render();renderCommissionerControls();});
-      document.getElementById('go-draft-control')?.addEventListener('click',()=>{commissionerTab='draft';renderCommissionerControls();});
+      document.getElementById('go-cycle-approvals')?.addEventListener('click',()=>{commissionerTab='approvals';renderCommissionerControls();});
+      document.getElementById('go-cycle-draft')?.addEventListener('click',e=>{commissionerTab='draft';renderCommissionerControls();const el=document.getElementById('admin-draft-type');if(el){el.value=e.currentTarget.dataset.draftType||'Pre-Season';el.dispatchEvent(new Event('change',{bubbles:true}));}});
+      document.getElementById('close-roster-window')?.addEventListener('click',async()=>{
+        const cycle=rosterCycleState(),phase=rosterCyclePhaseWindow(cycle.phase);if(!phase)return;
+        const pending=rosterCyclePending(phase);
+        if(pending.length){toast(`${pending.length} unresolved ${phase} request${pending.length===1?' remains':'s remain'}. Resolve every request before closing the roster window.`);commissionerTab='approvals';renderCommissionerControls();return;}
+        const readiness=rosterWindowOfficialReadiness(),illegal=readiness.illegal;
+        if(!readiness.ready){toast(`Roster window cannot close: ${illegal.map(t=>t.owner).join(', ')} ${illegal.length===1?'still has':'still have'} an illegal official roster.`);renderCommissionerControls();return;}
+        try{
+          setRosterCyclePhase(phase==='Pre-Season'?'PRESEASON_DRAFT':'MIDSEASON_DRAFT',{season:cycle.season,reason:'roster_window_closed'});
+          toast(`${phase} Roster Window closed. ${phase} Draft is now the next step.`);commissionerTab='draft';render();renderCommissionerControls();
+          const el=document.getElementById('admin-draft-type');if(el){el.value=phase;el.dispatchEvent(new Event('change',{bubbles:true}));}
+        }catch(e){toast(e.message||'Could not close the roster window.');}
+      });
     }
     if(commissionerTab==='season'){
-      let analysed=getSeasonSetup();
-      const renderSeasonAnalysis=()=>{document.getElementById('season-round-preview').innerHTML=seasonRoundPreview(analysed);document.getElementById('opening-round-map').innerHTML=openingRoundMappingControls(analysed);};
-      const analyse=()=>{
-        const year=Number(document.getElementById('season-year').value||currentSeason()+1),regular=Number(document.getElementById('season-regular-rounds').value||20);
-        const parsed=applySeasonFixtureRules(parseAflFixtureCsv(document.getElementById('afl-fixture-csv').value),year);
-        const existing=analysed?.openingRound?.bankDestinations||{};
-        const mapped=openingRoundBankingAllowed(year)?applyOpeningBankDestinations(parsed,Object.keys(existing).length?existing:parsed.openingRound?.suggestedBankDestinations||{}):parsed;
-        analysed={...analysed,season:year,currentRound:Number(document.getElementById('season-current-round').value||1),openingRound:mapped.openingRound,aflFixtureCsv:document.getElementById('afl-fixture-csv').value,aflGameCount:mapped.games.length,rounds:mapped.rounds,pegsRegularRounds:regular,liveScoringEnabled:document.getElementById('season-live-enabled').value==='1'};
-        renderSeasonAnalysis(); return analysed;
+      document.getElementById('go-roster-cycle')?.addEventListener('click',()=>{commissionerTab='windows';renderCommissionerControls();});
+      let analysed=(()=>{const x=getSeasonSetup();return !x.active&&String(x.status||'').toUpperCase()==='COMPLETE'?newSeasonTemplate(x):x;})();
+      const currentPegsFixtures=()=>parsePegsFixtureCsv(document.getElementById('pegs-fixture-csv')?.value||'');
+      const refreshMidOptions=()=>{
+        const regular=Math.max(4,Number(document.getElementById('season-regular-rounds')?.value||20)),el=document.getElementById('season-mid-draft-round');if(!el)return;
+        const selected=midSeasonDraftRound(el.value||analysed.midSeasonDraftAfterRound,regular);
+        el.innerHTML=Array.from({length:Math.max(1,regular-1)},(_,i)=>i+1).map(r=>`<option value="${r}" ${r===selected?'selected':''}>After Round ${r}</option>`).join('');
       };
+      const renderSeasonAnalysis=()=>{
+        const pegs=currentPegsFixtures(),structure=document.getElementById('season-structure-preview'),fixtureStatus=document.getElementById('season-fixture-status'),roundPreview=document.getElementById('season-round-preview'),opening=document.getElementById('opening-round-map'),activation=document.getElementById('season-activation-status'),activateBtn=document.getElementById('save-season-setup');
+        if(structure)structure.innerHTML=seasonStructurePreview(analysed);
+        if(fixtureStatus)fixtureStatus.innerHTML=fixtureConfirmationHtml(analysed);
+        if(roundPreview)roundPreview.innerHTML=seasonRoundPreview(analysed);
+        if(opening)opening.innerHTML=openingRoundMappingControls(analysed);
+        if(activation)activation.innerHTML=seasonActivationChecklistHtml(analysed,pegs);
+        const r=seasonActivationReadiness(analysed,pegs),ready=r.structure&&r.roster&&r.afl&&r.pegs&&r.finals;
+        if(activateBtn)activateBtn.disabled=!ready;
+      };
+      const analyse=()=>{
+        const year=Number(document.getElementById('season-year')?.value||analysed.season||currentSeason()+1),regular=Math.max(4,Number(document.getElementById('season-regular-rounds')?.value||20)),mid=midSeasonDraftRound(document.getElementById('season-mid-draft-round')?.value||analysed.midSeasonDraftAfterRound,regular),csv=document.getElementById('afl-fixture-csv')?.value||'',parsed=applySeasonFixtureRules(parseAflFixtureCsv(csv),year),existing=analysed?.openingRound?.bankDestinations||{},mapped=openingRoundBankingAllowed(year)?applyOpeningBankDestinations(parsed,Object.keys(existing).length?existing:parsed.openingRound?.suggestedBankDestinations||{}):parsed,verified=Boolean(analysed.fixtureVerified)&&Number(analysed.fixtureProviderYear||0)===year;
+        analysed={...analysed,season:year,currentRound:analysed.active?Number(analysed.currentRound||1):1,completedThroughRound:analysed.active?Number(analysed.completedThroughRound||0):0,openingRound:mapped.openingRound,aflFixtureCsv:csv,aflGameCount:mapped.games.length,rounds:mapped.rounds,pegsRegularRounds:regular,midSeasonDraftAfterRound:mid,finals:seasonFinalsForRegularRounds(regular,analysed.finals?.bracket||null),fixtureVerified:verified,liveScoringEnabled:(document.getElementById('season-live-enabled')?.value||'1')==='1'};
+        renderSeasonAnalysis();return analysed;
+      };
+      document.getElementById('season-regular-rounds')?.addEventListener('change',()=>{refreshMidOptions();analyse();});
+      document.getElementById('season-mid-draft-round')?.addEventListener('change',()=>analyse());
+      document.getElementById('season-year')?.addEventListener('change',()=>analyse());
+      document.getElementById('season-live-enabled')?.addEventListener('change',()=>analyse());
       document.getElementById('retrieve-afl-fixture')?.addEventListener('click',async()=>{
-        const btn=document.getElementById('retrieve-afl-fixture'),year=Number(document.getElementById('season-year').value||currentSeason()+1);btn.disabled=true;btn.textContent='Retrieving…';
+        const btn=document.getElementById('retrieve-afl-fixture'),year=Number(document.getElementById('season-year')?.value||analysed.season||currentSeason()+1);btn.disabled=true;btn.textContent='Retrieving…';
         try{
-          const payload=await retrieveAflFixtureForSeason(year);
-          document.getElementById('afl-fixture-csv').value=payload.csv;
-          analysed={...analysed,fixtureSource:payload.source||'Squiggle AFL fixture API',fixtureRetrievedAt:payload.retrievedAt||new Date().toISOString(),fixtureProviderYear:Number(payload.season||year)};
+          const payload=await retrieveAflFixtureForSeason(year);document.getElementById('afl-fixture-csv').value=payload.csv;
+          analysed={...analysed,fixtureSource:payload.source||'Squiggle AFL fixture API',fixtureRetrievedAt:payload.retrievedAt||new Date().toISOString(),fixtureVerifiedAt:new Date().toISOString(),fixtureProviderYear:Number(payload.season||year),fixtureVerified:true};
           analyse();
-          toast(`${year} AFL fixture retrieved: ${analysed.aflGameCount} games. ${openingRoundBankingAllowed(year)?(analysed.openingRound?.enabled?'Opening Round detected.':'No Opening Round detected.'):'Post-2026 bye counts applied; no Opening Round banking.'}`);
-        }catch(e){console.warn(e);toast(e.message||'AFL fixture retrieval failed.');}
-        finally{btn.disabled=false;btn.textContent='Retrieve AFL fixture';}
+          const coverage=seasonFixtureCoverage(analysed);toast(coverage.ok?`${year} AFL fixture confirmed. Season activation gate is now satisfied.`:`${year} AFL fixture retrieved, but PEGS requires coverage through Round ${coverage.required}.`);
+        }catch(e){console.warn(e);toast(e.message||'AFL fixture retrieval failed. Season activation remains locked.');}
+        finally{btn.disabled=false;btn.textContent=`Retrieve ${year} AFL fixture`;}
       });
-      document.getElementById('analyse-afl-fixture')?.addEventListener('click',()=>{analyse();toast(`${openingRoundBankingAllowed(analysed.season)?(analysed.openingRound?.enabled?'Opening Round detected.':'No Opening Round detected.'):'Opening Round banking disabled.'} Bye counts recalculated.`);});
-      document.getElementById('afl-fixture-file')?.addEventListener('change',async e=>{const f=e.target.files?.[0];if(!f)return;try{document.getElementById('afl-fixture-csv').value=await f.text();analysed={...analysed,fixtureSource:'Commissioner CSV upload',fixtureRetrievedAt:new Date().toISOString()};analyse();toast(`Fixture loaded: ${analysed.rounds.length} AFL rounds. ${openingRoundBankingAllowed(analysed.season)?(analysed.openingRound?.enabled?'Opening Round detected.':'No Opening Round detected.'):'Post-2026 bye counts applied.'}`);}catch(_){toast('The AFL fixture file could not be read.');}});
-      document.getElementById('opening-round-map')?.addEventListener('change',()=>{analysed=readOpeningRoundMapping(analysed);document.getElementById('season-round-preview').innerHTML=seasonRoundPreview(analysed);});
-      document.getElementById('generate-pegs-fixture')?.addEventListener('click',()=>{const regular=Number(document.getElementById('season-regular-rounds').value||20),fixtures=generatePegsFixture(regular);document.getElementById('pegs-fixture-csv').value=pegsFixtureCsv(fixtures);document.getElementById('pegs-fixture-preview').innerHTML=seasonFixturePreview(fixtures);toast(`${regular}-round PEGS fixture generated.`);});
-      document.getElementById('pegs-fixture-csv')?.addEventListener('input',e=>{document.getElementById('pegs-fixture-preview').innerHTML=seasonFixturePreview(parsePegsFixtureCsv(e.target.value));});
-      document.getElementById('save-season-setup')?.addEventListener('click',()=>{let base=analyse();base=readOpeningRoundMapping(base);if(!Number(base.aflGameCount||0)){toast('Retrieve or load the AFL fixture before activating the season.');return;}const fixtures=parsePegsFixtureCsv(document.getElementById('pegs-fixture-csv').value),regular=Number(document.getElementById('season-regular-rounds').value||20),errors=validatePegsFixture(fixtures,regular);if(errors.length){toast(errors[0]);return;}const priorOrder=(getSeasonSetup()?.preSeasonDraftOrder?.length?getSeasonSetup().preSeasonDraftOrder:[...D.ladder].sort((a,b)=>Number(b.position||0)-Number(a.position||0)).map(r=>r.team));const value={...base,active:true,pegsFixtures:fixtures,preSeasonDraftOrder:priorOrder,updatedAt:new Date().toISOString()};saveSeasonSetup(value);const pill=document.getElementById('season-pill-year');if(pill)pill.textContent=String(value.season);toast(`${value.season} season activated.`);render();renderCommissionerControls();});
-      document.getElementById('deactivate-season-setup')?.addEventListener('click',()=>{saveSeasonSetup({...getSeasonSetup(),active:false,updatedAt:new Date().toISOString()});const pill=document.getElementById('season-pill-year');if(pill)pill.textContent=String(D.meta.season);toast('Workbook season restored.');render();renderCommissionerControls();});
+      document.getElementById('afl-fixture-file')?.addEventListener('change',async e=>{const f=e.target.files?.[0];if(!f)return;try{document.getElementById('afl-fixture-csv').value=await f.text();analysed={...analysed,fixtureManualCorrection:true};analyse();toast(seasonFixtureVerified(analysed)?'Fixture CSV loaded for review. Successful retrieval remains confirmed.':'Fixture CSV loaded for review, but successful AFL fixture retrieval is still required before activation.');}catch(_){toast('The AFL fixture file could not be read.');}});
+      document.getElementById('afl-fixture-csv')?.addEventListener('change',()=>{analysed={...analysed,fixtureManualCorrection:true};analyse();});
+      document.getElementById('opening-round-map')?.addEventListener('change',()=>{analysed=readOpeningRoundMapping(analysed);renderSeasonAnalysis();});
+      document.getElementById('generate-pegs-fixture')?.addEventListener('click',()=>{const regular=Math.max(4,Number(document.getElementById('season-regular-rounds')?.value||20)),fixtures=generatePegsFixture(regular);document.getElementById('pegs-fixture-csv').value=pegsFixtureCsv(fixtures);analysed={...analysed,pegsFixtures:fixtures};document.getElementById('pegs-fixture-preview').innerHTML=seasonFixturePreview(fixtures);renderSeasonAnalysis();toast(`${regular}-round PEGS H2H fixture generated.`);});
+      document.getElementById('pegs-fixture-csv')?.addEventListener('input',e=>{const fixtures=parsePegsFixtureCsv(e.target.value);analysed={...analysed,pegsFixtures:fixtures};document.getElementById('pegs-fixture-preview').innerHTML=seasonFixturePreview(fixtures);renderSeasonAnalysis();});
+      document.getElementById('save-season-progress')?.addEventListener('click',()=>{let base=analyse();base=readOpeningRoundMapping(base);const fixtures=currentPegsFixtures(),regular=Number(base.pegsRegularRounds||20),prior=getSeasonSetup(),priorOrder=(prior?.preSeasonDraftOrder?.length?prior.preSeasonDraftOrder:[...D.ladder].sort((a,b)=>Number(b.position||0)-Number(a.position||0)).map(r=>r.team)),value={...base,active:false,status:'SETUP',currentRound:1,completedThroughRound:0,pegsFixtures:fixtures,finals:seasonFinalsForRegularRounds(regular,base.finals?.bracket||null),preSeasonDraftOrder:priorOrder,updatedAt:new Date().toISOString()};saveSeasonSetup(value);toast(`${value.season} Season Setup progress saved. You can now leave this tab and return without losing the fixture or structure.`);renderCommissionerControls();});
+      document.getElementById('save-season-setup')?.addEventListener('click',()=>{let base=analyse();base=readOpeningRoundMapping(base);const fixtures=currentPegsFixtures(),regular=Number(base.pegsRegularRounds||20),readiness=seasonActivationReadiness(base,fixtures);if(!readiness.roster){toast('Season activation is locked until the Preseason Roster Window, Pre-Season Draft and Rookie Draft are all completed.');return;}if(!readiness.afl){toast('Season activation is locked until the AFL fixture is successfully retrieved and confirmed through the Grand Final round.');return;}if(readiness.fixtureErrors.length){toast(readiness.fixtureErrors[0]);return;}const prior=getSeasonSetup(),priorOrder=(prior?.preSeasonDraftOrder?.length?prior.preSeasonDraftOrder:[...D.ladder].sort((a,b)=>Number(b.position||0)-Number(a.position||0)).map(r=>r.team)),wasActive=Boolean(base.active),value={...base,active:true,status:'ACTIVE',currentRound:wasActive?Number(base.currentRound||1):1,completedThroughRound:wasActive?Number(base.completedThroughRound||0):0,pegsFixtures:fixtures,finals:seasonFinalsForRegularRounds(regular,wasActive?base.finals?.bracket:null),preSeasonDraftOrder:priorOrder,updatedAt:new Date().toISOString()};saveSeasonSetup(value);setRosterCyclePhase('ROSTERS_LOCKED',{season:value.season,reason:'season_activated'});const pill=document.getElementById('season-pill-year');if(pill)pill.textContent=String(value.season);toast(`${value.season} season ${wasActive?'settings saved':'activated'}. Round Control is ready for Round ${value.currentRound}.`);render();renderCommissionerControls();});
+      document.getElementById('deactivate-season-setup')?.addEventListener('click',()=>{saveSeasonSetup({...getSeasonSetup(),active:false,status:'SETUP',updatedAt:new Date().toISOString()});const pill=document.getElementById('season-pill-year');if(pill)pill.textContent=String(D.meta.season);toast('Active season deactivated.');render();renderCommissionerControls();});
+      refreshMidOptions();renderSeasonAnalysis();
     }
     if(commissionerTab==='draft'){
       startDraftTicker();
       const adminTick=()=>{const el=document.getElementById('admin-draft-countdown');if(el)el.textContent=clockText(draftSecondsRemaining(getDraftState()));};adminTick();
-      document.getElementById('admin-draft-type')?.addEventListener('change',e=>{const box=document.getElementById('admin-draft-order-preview'),poolBox=document.getElementById('admin-draft-pool-status');if(box)box.innerHTML=draftOrderPreviewHtml(e.target.value);if(poolBox)poolBox.innerHTML=draftPoolStatusHtml(e.target.value);});
-      document.getElementById('refresh-draft-pool')?.addEventListener('click',async()=>{const btn=document.getElementById('refresh-draft-pool'),type=normalizedDraftType(document.getElementById('admin-draft-type').value),box=document.getElementById('admin-draft-pool-status');btn.disabled=true;try{await refreshCurrentDraftPool(type,(i,club)=>{if(box)box.innerHTML=`<div class="notice"><strong>Refreshing AFL player pool…</strong> ${Math.min(i,18)}/18 clubs${club&&club!=='DONE'?` · ${esc(club)}`:''}</div>`;});queueAutoBackup('draft_pool');toast('Current AFL player pool captured and frozen-ready.');}catch(e){toast(e.message||'Draft pool refresh failed.');}finally{btn.disabled=false;renderCommissionerControls();}});
-      document.getElementById('start-draft')?.addEventListener('click',async()=>{const type=normalizedDraftType(document.getElementById('admin-draft-type').value),pool=draftPoolRecord(),season=draftSeasonFor(type);if(!pool?.complete||Number(pool.season)!==season||normalizedDraftType(pool.phase)!==type){toast('Refresh a complete 18-club current-price player pool before starting this draft.');return;}await syncServerAuthority();const ladderSnapshot=draftLadderOrder(type),picks=draftPickLedger(type,{ladderOrder:ladderSnapshot}),order=picks.map(p=>p.owner),now=new Date().toISOString(),value={active:true,type,season,rounds:draftRoundsFor(type),timerSeconds:180,currentIndex:0,currentPick:1,ladderSnapshot,baseOrder:picks.map(p=>p.originalOwner),picks,order,poolSessionId:pool.session_id,sessionId:'draft-'+Date.now(),startedAt:now,pickStartedAt:now,updatedAt:now,reorders:[]};saveDraftState(value);await logCommissioner('DRAFT_STARTED','draft',value.sessionId,{type,season,poolSessionId:pool.session_id,playerCount:pool.player_count});toast(`${value.season} ${value.type} draft is live. Pick 1 has 3 minutes.`);render();renderCommissionerControls();});
+      document.getElementById('admin-draft-type')?.addEventListener('change',e=>{const box=document.getElementById('admin-draft-order-preview'),poolBox=document.getElementById('admin-draft-pool-status'),midBox=document.getElementById('midseason-draft-readiness'),lifeBox=document.getElementById('draft-lifecycle-readiness'),life=draftLifecycleReadiness(e.target.value);if(box)box.innerHTML=draftOrderPreviewHtml(e.target.value);if(poolBox)poolBox.innerHTML=draftPoolStatusHtml(e.target.value);if(lifeBox){lifeBox.className=`notice ${life.ready?'success':'amber'}`;lifeBox.innerHTML=`<strong>Roster Cycle:</strong> ${esc(life.reason)}`;}if(midBox){midBox.style.display=normalizedDraftType(e.target.value)==='Mid-Season'?'block':'none';midBox.innerHTML=`<strong>Scheduled Mid-Season Draft:</strong> ${esc(midSeasonDraftReadiness().reason)}`;}});
+      document.getElementById('refresh-draft-pool')?.addEventListener('click',async()=>{const btn=document.getElementById('refresh-draft-pool'),type=normalizedDraftType(document.getElementById('admin-draft-type').value),box=document.getElementById('admin-draft-pool-status');if(type==='Rookie Draft'){toast('The Rookie Draft reuses the frozen Pre-Season player pool. No second refresh is required.');return;}btn.disabled=true;try{await refreshCurrentDraftPool(type,(i,club)=>{if(box)box.innerHTML=`<div class="notice"><strong>Refreshing AFL player pool…</strong> ${Math.min(i,18)}/18 clubs${club&&club!=='DONE'?` · ${esc(club)}`:''}</div>`;});queueAutoBackup('draft_pool');toast('Current AFL player pool captured and frozen-ready.');}catch(e){toast(e.message||'Draft pool refresh failed.');}finally{btn.disabled=false;renderCommissionerControls();}});
+      document.getElementById('start-draft')?.addEventListener('click',async()=>{const type=normalizedDraftType(document.getElementById('admin-draft-type').value),pool=draftPoolRecord(),season=draftSeasonFor(type),life=draftLifecycleReadiness(type);if(!life.ready){toast(life.reason);return;}if(type==='Mid-Season'){const readiness=midSeasonDraftReadiness();if(!readiness.ready){toast(readiness.reason);return;}}if(!pool?.complete||Number(pool.season)!==season||normalizedDraftType(pool.phase)!==draftPoolPhase(type)){toast(type==='Rookie Draft'?'The completed Pre-Season player pool is required before starting the Rookie Draft.':'Refresh a complete 18-club current-price player pool before starting this draft.');return;}await syncServerAuthority();const ladderSnapshot=draftLadderOrder(type),picks=draftPickLedger(type,{ladderOrder:ladderSnapshot}),order=picks.map(p=>p.owner),now=new Date().toISOString(),value={active:true,type,season,rounds:draftRoundsFor(type),timerSeconds:180,currentIndex:0,currentPick:1,ladderSnapshot,baseOrder:picks.map(p=>p.originalOwner),picks,order,poolSessionId:pool.session_id,sessionId:'draft-'+Date.now(),startedAt:now,pickStartedAt:now,updatedAt:now,reorders:[]};saveDraftState(value);await logCommissioner('DRAFT_STARTED','draft',value.sessionId,{type,season,poolSessionId:pool.session_id,playerCount:pool.player_count});toast(`${value.season} ${value.type} draft is live. Pick 1 has 3 minutes.`);render();renderCommissionerControls();});
       document.getElementById('push-draft-back')?.addEventListener('click',async()=>{
         const before=getDraftState(),pick=Number(before.currentPick||1),lateTeam=currentDraftTeam(before),promotedTeam=nextDraftTeam(before);
         if(!before.active||!draftIsOvertime(before)||!promotedTeam){toast('That pick cannot currently be pushed back.');return;}
@@ -2870,8 +3250,9 @@
       });
       document.getElementById('end-draft')?.addEventListener('click',()=>{
         const current=getDraftState(),value={...current,active:false,endedAt:new Date().toISOString(),updatedAt:new Date().toISOString()};saveDraftState(value);
-        if(current.type==='Pre-Season'){captureScoringSnapshot('Pre-Season',1);toast('Pre-Season Draft ended. Scoring rosters locked from Round 1 until the Mid-Season Draft.');}
-        else if(current.type==='Mid-Season'){const from=nextUnfinalizedScoringRound();captureScoringSnapshot('Mid-Season',from);toast(`Mid-Season Draft ended. New scoring rosters locked from Round ${from}.`);}
+        if(normalizedDraftType(current.type)==='Pre-Season'){setRosterCyclePhase('ROOKIE_DRAFT',{season:current.season||draftSeasonFor('Pre-Season'),reason:'preseason_draft_complete'});commissionerTab='draft';toast('Pre-Season Draft ended. The Rookie Draft is now the next step in the same order.');}
+        else if(normalizedDraftType(current.type)==='Rookie Draft'){captureScoringSnapshot('Pre-Season',1,current.season||draftSeasonFor('Rookie Draft'));setRosterCyclePhase('ROSTERS_LOCKED',{season:current.season||draftSeasonFor('Rookie Draft'),reason:'rookie_draft_complete'});commissionerTab='season';toast('Rookie Draft ended. Preseason rosters are now locked and Season Setup can be activated once its other checks are green.');}
+        else if(normalizedDraftType(current.type)==='Mid-Season'){const from=nextUnfinalizedScoringRound();captureScoringSnapshot('Mid-Season',from,current.season||currentSeason());setRosterCyclePhase('POST_MIDSEASON_LOCKED',{season:current.season||currentSeason(),reason:'midseason_draft_complete'});commissionerTab='scores';toast(`Mid-Season Draft ended. Rosters are locked from Round ${from} through the end of the season. Round Control is ready.`);}
         else toast('Draft ended.');
         render();renderCommissionerControls();
       });
@@ -2882,11 +3263,10 @@
       document.querySelectorAll('[data-reset-team-password]').forEach(btn=>btn.addEventListener('click',async()=>{const k=btn.dataset.resetTeamPassword;if(!confirm(`Generate a new six-letter password for ${team(k).owner}? Their old password will stop working.`))return;try{const x=await teamAccountAdmin('reset',k);teamCredentialCache=x.credential?[x.credential]:[];await loadTeamAccounts();toast(`${team(k).owner} password reset.`);renderCommissionerControls();}catch(e){toast(e.message||'Password reset failed.');}}));
     }
     if(commissionerTab==='backups'){
-      document.getElementById('download-current-archive')?.addEventListener('click',async()=>{const btn=document.getElementById('download-current-archive');if(btn){btn.disabled=true;btn.textContent='Preparing Excel archive…';}try{const id=await exportCurrentLeagueExcel();await Promise.all([syncBackups(),syncAudit()]);toast(id?`Excel archive downloaded from restore point #${id}.`:'Excel archive downloaded.');renderCommissionerControls();}catch(e){if(btn){btn.disabled=false;btn.textContent='Download Excel archive';}toast(e.message||'Excel archive failed.');}});
-      document.getElementById('create-manual-backup')?.addEventListener('click',async()=>{const suggested=`Manual checkpoint · ${roundLabel(effectiveCurrentRound())}`;const entered=prompt('Name this restore point (optional):',suggested);if(entered===null)return;try{const id=await createServerBackup('MANUAL',String(entered||'').trim()||suggested);await syncAudit();toast(`Restore point #${id} created.`);renderCommissionerControls();}catch(e){toast(e.message||'Restore point failed.');}});
+      document.getElementById('create-manual-backup')?.addEventListener('click',async()=>{const suggested=`Manual archive · ${roundLabel(archivedSeasonRound())}`;const entered=prompt('Name this archive (optional):',suggested);if(entered===null)return;const btn=document.getElementById('create-manual-backup');if(btn){btn.disabled=true;btn.textContent='Creating archive…';}try{const id=await createServerBackup('MANUAL',String(entered||'').trim()||suggested);await syncAudit();toast(`Manual archive #${id} created.`);renderCommissionerControls();}catch(e){toast(e.message||'Manual archive failed.');if(btn){btn.disabled=false;btn.textContent='Create manual archive';}}});
       document.getElementById('reload-backups')?.addEventListener('click',async()=>{await Promise.all([syncBackups(),syncAudit()]);renderCommissionerControls();});
-      document.querySelectorAll('[data-backup-excel]').forEach(btn=>btn.addEventListener('click',()=>void exportBackupExcel(btn.dataset.backupExcel).catch(e=>toast(e.message||'Excel archive failed.'))));
-      document.querySelectorAll('[data-backup-restore]').forEach(btn=>btn.addEventListener('click',async()=>{try{if(await restoreServerBackup(btn.dataset.backupRestore)){await syncAudit();toast('Restore completed. A pre-restore safeguard was created automatically.');render();renderCommissionerControls();}}catch(e){toast(e.message||'Restore failed.');}}));
+      document.querySelectorAll('[data-backup-excel]').forEach(btn=>btn.addEventListener('click',async()=>{const original=btn.textContent;btn.disabled=true;btn.textContent='Preparing…';try{await exportBackupExcel(btn.dataset.backupExcel);toast('Excel archive downloaded.');}catch(e){toast(e.message||'Excel archive failed.');}finally{btn.disabled=false;btn.textContent=original;}}));
+      document.querySelectorAll('[data-backup-restore]').forEach(btn=>btn.addEventListener('click',async()=>{try{if(await restoreServerBackup(btn.dataset.backupRestore)){await syncAudit();toast('Archive restored.');render();renderCommissionerControls();}}catch(e){toast(e.message||'Restore failed.');}}));
     }
     if(commissionerTab==='figureheads'){
       document.querySelectorAll('[data-figurehead-select]').forEach(el=>el.addEventListener('change',()=>{const all=getFigureheadOverrides(),key=el.dataset.figureheadSelect;if(el.value)all[key]=el.value;else delete all[key];saveFigureheadOverrides(all);toast(el.value?`${team(key).name} figurehead pinned to ${el.value}.`:`${team(key).name} returned to automatic figurehead.`);render();renderCommissionerControls();}));
@@ -2916,8 +3296,8 @@
     const out=document.getElementById('draft-check-output'); if(!out) return;
     const p=draftSelection?draftPlayerByName(draftSelection):null;
     if(!p){out.innerHTML='<div class="notice" style="margin-top:16px">Select an available player to run the salary-cap and positional checks.</div>';return;}
-    const state=getDraftState(),key=currentDraftTeam(state),pending=proposalCache.some(x=>x.type==='DRAFT_PICK'&&activeProposalStatus(x.status)&&Number(x.payload?.pick)===Number(state.currentPick||1)&&x.proposerTeam===key),canSubmit=Boolean(state.active&&teamLoggedIn()&&loggedTeamKey()===key);
-    out.innerHTML=draftCheckOutput(key,p,document.getElementById('draft-contract').value,document.getElementById('draft-status').value,canSubmit,pending,document.getElementById('draft-fixed-position')?.value||String(p.position||'').split('/')[0]);
+    const state=getDraftState(),key=currentDraftTeam(state),canSubmit=Boolean(state.active&&teamLoggedIn()&&loggedTeamKey()===key);
+    out.innerHTML=draftCheckOutput(key,p,document.getElementById('draft-contract').value,document.getElementById('draft-status').value,canSubmit,false,document.getElementById('draft-fixed-position')?.value||String(p.position||'').split('/')[0]);
   }
 
   document.addEventListener('load',e=>{const img=e.target;if(!(img instanceof HTMLImageElement)||!img.dataset.playerPortrait)return;loadedPlayerPortraits.add(img.dataset.playerPortrait);failedPlayerPortraits.delete(img.dataset.playerPortrait);img.parentElement?.classList.add('photo-ready');},true);
@@ -2929,9 +3309,11 @@
     if(e.target.closest('#submit-draft-proposal')){void handleDraftProposalSubmission();return;}
     const action=e.target.closest('[data-action]'); if(!action)return;
     const type=action.dataset.action;
-    if(type==='open-team'){selectedRosterFilter='ALL';routeTo('team/'+action.dataset.team);}
+    if(type==='open-team'){selectedRosterFilter='ALL';teamRosterViewMode='CURRENT';plannerPreviewTradeIds.clear();routeTo('team/'+action.dataset.team);}
     if(type==='open-player-profile'){showPlayerProfile(action.dataset.team,action.dataset.player);}
     if(type==='roster-filter'){selectedRosterFilter=action.dataset.filter;render();}
+    if(type==='roster-planner-view'){teamRosterViewMode=String(action.dataset.view||'CURRENT').toUpperCase()==='PROJECTED'?'PROJECTED':'CURRENT';selectedRosterFilter='ALL';render();}
+    if(type==='planner-trade-toggle'){const id=String(action.dataset.proposalId||'');if(plannerPreviewTradeIds.has(id))plannerPreviewTradeIds.delete(id);else plannerPreviewTradeIds.add(id);teamRosterViewMode='PROJECTED';render();}
     if(type==='open-matchup'||type==='select-matchup'){routeTo(`matchups/${action.dataset.round}/${action.dataset.home}/${action.dataset.away}`);}
     if(type==='select-draft-player'){draftSelection=action.dataset.player;renderDraft();refreshDraftCheck();}
     if(type==='tx-filter'){const value=action.dataset.type,params=new URLSearchParams(location.hash.split('?')[1]||'');if(value==='All')params.delete('type');else params.set('type',value);if(teamLoggedIn()&&transactionScope==='all')params.set('scope','all');else params.delete('scope');location.hash='transactions'+(params.toString()?'?'+params.toString():'');render();}
@@ -2942,7 +3324,7 @@
     if(protectedInteractionTarget(e.target))markInteractionDraft();
     if(e.target.id==='round-select'){routeTo('matchups/'+e.target.value);}
     if(e.target.id==='results-round-select'){routeTo('results/'+e.target.value);}
-    if(e.target.id==='team-view-select'){selectedRosterFilter='ALL';const value=String(e.target.value||'').toUpperCase();if(value===loggedTeamKey())routeTo('teams');else routeTo('team/'+value);}
+    if(e.target.id==='team-view-select'){selectedRosterFilter='ALL';teamRosterViewMode='CURRENT';plannerPreviewTradeIds.clear();const value=String(e.target.value||'').toUpperCase();if(value===loggedTeamKey())routeTo('teams');else routeTo('team/'+value);}
     if(['draft-contract','draft-status','draft-fixed-position'].includes(e.target.id)) refreshDraftCheck();
   });
 
@@ -2965,7 +3347,7 @@
   window.addEventListener('storage',e=>{if([OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,TRANSACTION_REVERSALS_KEY,DRAFT_STATE_KEY,PROPOSALS_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,DRAFT_POOL_KEY].includes(e.key)){if(e.key===PROPOSALS_KEY)proposalCache=getLocalProposals();backgroundRefreshUi();}if(e.key===REMEMBERED_TEAM_LOGIN_KEY&&!siteAccessGranted())populateAccessGate();});
 
   // Lightweight non-UI test surface used by the bundled QA script.
-  window.__PEGS_TEST__={render,backupSheetRows,currentLocalRecoverySnapshot,markInteractionDraft,clearInteractionDraft,backgroundRefreshUi,parseAflFixtureCsv,applySeasonFixtureRules,openingRoundBankingAllowed,normalizeSeasonSetup,generatePegsFixture,validatePegsFixture,saveSeasonSetup,getSeasonSetup,saveLiveFeed,getLiveFeed,getSelectionOverrides,saveSelectionOverrides,saveOpeningBank,getOpeningBank,calcTeamRound,effectiveRoundRecord,scoreCountForRoundRecord,topPlayersForRound,effectiveLadder,projectedLadderForRound,liveRoundBadge,liveFeedCompleteForRound,normalizeAvailabilityStatus,unavailableForProjection,mergeProviderTeamRecord,preSeasonDraftOrder,draftPickLedger,teamRoundPlayers,availabilityInfo,currentSeason,effectiveCurrentRound,getProposalWindows,saveProposalWindows,proposalWindowOpen,getScoringSnapshots,saveScoringSnapshots,captureScoringSnapshot,scoringSnapshotForRound,scoringRostersForRound,futureScoringRound,nextUnfinalizedScoringRound,effectiveRosters,rosterSummary,rosterIsLegal,getTransactionReversals,saveTransactionReversals,visibleLegacyTransactions,transactionRecords,transactionPickRefs,transactionDependency,reverseTransaction,verifyCommissionerPassword,commissionerLoggedIn,teamLoggedIn,loggedTeamKey,clearBackendSession,clearCommissionerSession,dismissDialog,tradeActionFor,tradeImpactHtml,activeProposalStatus,submitProposal,respondTrade,approveProposal,getDraftState,saveDraftState,draftOrder,currentDraftTeam,nextDraftTeam,draftSecondsRemaining,draftIsOvertime,pushDraftPickBackLocal,advanceDraftLocal,getFigureheadOverrides,saveFigureheadOverrides,figureheadPlayer,figureheadAverage,playerPhotoUrl,warmTeamPortraitCache,teamRookieBench,playerProfileRoundCeiling,playerSeasonScoreHistory,playerPerformance,ordinal,teamFixtureRows,personalisedCurrentRound,completedTeamFixtures,personalisedLadderData,transactionInvolvesTeam,teamDashboardData,renderPersonalizedHome,finalsConfig,calculatedFinalsBracket,effectiveFinals,roundLabel,finalizeRound,rememberedTeamLogin,saveRememberedTeamLogin,siteAccessGranted,lockSiteForLogin,settleEntryViewport,completeSiteEntry,populateAccessGate};
+  window.__PEGS_TEST__={render,renderCommissionerControls,setIdentityForTest:(value)=>setIdentity(value),setProposalCacheForTest:(value)=>{proposalCache=Array.isArray(value)?value:[];},setPlannerPreviewTradeForTest:(id,on=true)=>{if(on)plannerPreviewTradeIds.add(String(id));else plannerPreviewTradeIds.delete(String(id));},setTeamRosterViewForTest:(view)=>{teamRosterViewMode=String(view||'CURRENT').toUpperCase()==='PROJECTED'?'PROJECTED':'CURRENT';},plannerContext,plannerIssueList,rosterPlannerHtml,rosterWindowOfficialReadiness,rosterWindowLeagueReadinessHtml,setCommissionerTabForTest:(tab)=>{commissionerTab=tab;renderCommissionerControls();},backupSheetRows,currentLocalRecoverySnapshot,writeArchiveWorkbook,completedWorkbookSeasonResults,recoveryStateSnapshot,ensure2026ArchiveBaseline,markInteractionDraft,clearInteractionDraft,backgroundRefreshUi,parseAflFixtureCsv,applySeasonFixtureRules,openingRoundBankingAllowed,normalizeSeasonSetup,newSeasonTemplate,seasonFinalsForRegularRounds,midSeasonDraftRound,seasonFixtureVerified,seasonFixtureCoverage,seasonActivationReadiness,seasonStructurePreview,roundPhaseStrip,generatePegsFixture,validatePegsFixture,saveSeasonSetup,getSeasonSetup,saveLiveFeed,getLiveFeed,getSelectionOverrides,saveSelectionOverrides,saveOpeningBank,getOpeningBank,calcTeamRound,effectiveRoundRecord,scoreCountForRoundRecord,topPlayersForRound,effectiveLadder,projectedLadderForRound,liveRoundBadge,liveFeedCompleteForRound,normalizeAvailabilityStatus,unavailableForProjection,mergeProviderTeamRecord,preSeasonDraftOrder,draftPickLedger,draftPoolPhase,teamRoundPlayers,availabilityInfo,currentSeason,effectiveCurrentRound,getProposalWindows,saveProposalWindows,proposalWindowOpen,normalizedDraftType,validateDraft,rosterCycleState,setRosterCyclePhase,rosterCyclePending,preSeasonRosterReady,rosterCycleBlocksRound,draftLifecycleReadiness,getScoringSnapshots,saveScoringSnapshots,captureScoringSnapshot,scoringSnapshotForRound,scoringRostersForRound,futureScoringRound,nextUnfinalizedScoringRound,effectiveRosters,rosterSummary,rosterIsLegal,getTransactionReversals,saveTransactionReversals,visibleLegacyTransactions,transactionRecords,transactionPickRefs,transactionDependency,reverseTransaction,verifyCommissionerPassword,commissionerLoggedIn,teamLoggedIn,loggedTeamKey,clearBackendSession,clearCommissionerSession,dismissDialog,tradeActionFor,tradeImpactHtml,activeProposalStatus,submitProposal,respondTrade,approveProposal,getDraftState,saveDraftState,draftOrder,currentDraftTeam,nextDraftTeam,draftSecondsRemaining,draftIsOvertime,pushDraftPickBackLocal,advanceDraftLocal,getFigureheadOverrides,saveFigureheadOverrides,figureheadPlayer,figureheadAverage,playerPhotoUrl,warmTeamPortraitCache,teamRookieBench,playerProfileRoundCeiling,playerSeasonScoreHistory,playerPerformance,ordinal,teamFixtureRows,personalisedCurrentRound,completedTeamFixtures,personalisedLadderData,transactionInvolvesTeam,teamDashboardData,renderPersonalizedHome,finalsConfig,calculatedFinalsBracket,effectiveFinals,roundLabel,seedFinalsAutomatically,closeCurrentSeason,finalizeRound,rememberedTeamLogin,saveRememberedTeamLogin,siteAccessGranted,lockSiteForLogin,settleEntryViewport,completeSiteEntry,populateAccessGate};
 
   if('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('./sw.js').catch(()=>{});
   proposalCache=getLocalProposals();

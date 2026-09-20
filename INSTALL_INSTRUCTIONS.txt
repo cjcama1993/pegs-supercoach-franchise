@@ -1,0 +1,53 @@
+PEGS v14.7 - PREMIUM MAIN SITE
+Drop-in patch for PEGS v14.6.1
+
+WHAT THIS PATCH CHANGES
+- Premium PEGS crest header and signed-in franchise profile control.
+- Refined glass / broadcast-style visual system across the loaded site.
+- Blue primary action hierarchy; red remains available for alerts / danger states.
+- Compact personalised franchise home with 2x2 mobile KPI layout.
+- Mobile franchise actions condensed into a single three-button row.
+- Proper SVG icons in the mobile bottom navigation.
+- Larger mobile touch targets and safe-area spacing for modern phones.
+- Matchups and Results round cards swipe horizontally on mobile instead of forming a long stack.
+- Mobile Ladder hides low-priority columns so the core ladder fits without horizontal scrolling.
+- Improved cards, tables, filters, team pages, matchup panels and responsive spacing.
+- Hidden login/theatrical transition layers are explicitly removed from layout after entry.
+
+NO DATABASE OR SQL CHANGES ARE REQUIRED.
+NO NEW ASSET FILES ARE REQUIRED.
+
+LOCAL INSTALL
+1. Start from the v14.6.1 website folder you have already approved.
+2. Make a backup copy of that folder.
+3. Extract this ZIP.
+4. Copy these four files into the folder containing START_LOCAL.bat:
+      index.html
+      app.js
+      styles.css
+      sw.js
+5. Choose Replace when Windows asks about the existing files.
+6. Run START_LOCAL.bat.
+7. In the browser press Ctrl + F5 once to clear the previous service-worker presentation cache.
+
+LOCAL TEST CHECKLIST
+- Log in with a normal team account and allow the theatrical entry to finish.
+- Home: confirm the franchise hero, 2x2 mobile KPIs and three quick actions look correct.
+- Matchups: on mobile, swipe the fixture strip horizontally and open a matchup.
+- Results: on mobile, confirm round fixture cards can be swiped horizontally.
+- Teams: confirm roster filters, player list and field remain usable.
+- Ladder: on mobile, confirm the main ladder fits without sideways page scrolling.
+- Draft / Moves / History: confirm normal navigation and actions still work.
+- Open Team Login from the header and confirm logout still returns to the login gate.
+- Test one real phone if possible, not only desktop browser emulation.
+
+ROLLBACK
+Restore the four files from your v14.6.1 backup and press Ctrl + F5.
+
+WHEN READY TO GO LIVE
+The production deployment only needs these four changed files:
+  index.html
+  app.js
+  styles.css
+  sw.js
+No Supabase migration is required.

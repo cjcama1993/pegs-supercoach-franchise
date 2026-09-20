@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 340" role="img" aria-labelledby="title desc">
+<title id="title">AFL logo fallback</title><desc id="desc">Australian Football League oval mark fallback.</desc>
+<ellipse cx="300" cy="170" rx="286" ry="154" fill="#0c3f8f"/>
+<ellipse cx="300" cy="170" rx="270" ry="139" fill="#ffffff"/>
+<ellipse cx="300" cy="170" rx="252" ry="124" fill="#0c3f8f"/>
+<ellipse cx="300" cy="170" rx="236" ry="108" fill="#c90010"/>
+<g fill="#0c3f8f">
+  <rect x="244" y="59" width="12" height="34" rx="2"/><rect x="269" y="52" width="12" height="39" rx="2"/><rect x="294" y="49" width="12" height="41" rx="2"/><rect x="319" y="52" width="12" height="39" rx="2"/><rect x="344" y="59" width="12" height="34" rx="2"/>
+  <rect x="238" y="79" width="124" height="10" rx="3"/>
+</g>
+<text x="300" y="226" text-anchor="middle" font-family="Arial Black, Impact, Arial, sans-serif" font-style="italic" font-weight="900" font-size="178" letter-spacing="-17" fill="#ffffff" stroke="#0c3f8f" stroke-width="14" paint-order="stroke fill">AFL</text>
+<text x="517" y="248" font-family="Arial, sans-serif" font-weight="700" font-size="24" fill="#ffffff">®</text>
+</svg>

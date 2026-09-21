@@ -1419,7 +1419,7 @@
 
   function archivedSeasonRound(){const setup=getSeasonSetup();if(Boolean(D.meta.seasonComplete)&&!activeSeasonSetup()&&Number(currentSeason())===Number(D.meta.season||2026))return Number(D.meta.completedThroughRound||D.meta.currentRound||23);return Number(setup?.completedThroughRound||setup?.currentRound||effectiveCurrentRound());}
   function backupDerivedData(){
-    return {meta:{league:D.meta.league,season:currentSeason(),round:archivedSeasonRound(),createdAt:new Date().toISOString(),archiveVersion:'14.8.3'},rules:D.rules,teams:D.teams,rosters:effectiveRosters(),ladder:effectiveLadder(),fixtures:effectiveFixtures(),finals:effectiveFinals(),transactions:[...getCommissionerActions().filter(x=>x.status==='CONFIRMED'),...visibleLegacyTransactions()],draftHistory:[...D.draft.filter(d=>!Object.keys(getTransactionReversals()).map(k=>LEGACY_TRANSACTION_META[k]).filter(m=>m?.type==='Drafted'&&m.pick).some(m=>Number(m.pick)===Number(d.pick)&&m.team===d.team&&canonicalPlayerName(m.players?.[0]||'')===canonicalPlayerName(d.player))),...getCommissionerActions().filter(x=>x.type==='Drafted'&&x.status==='CONFIRMED')],pickOwnership:{preSeason:draftPickLedger('Pre-Season'),rookieDraft:draftPickLedger('Rookie Draft'),midSeason:draftPickLedger('Mid-Season')},honours:D.honours};
+    return {meta:{league:D.meta.league,season:currentSeason(),round:archivedSeasonRound(),createdAt:new Date().toISOString(),archiveVersion:'14.8.5'},rules:D.rules,teams:D.teams,rosters:effectiveRosters(),ladder:effectiveLadder(),fixtures:effectiveFixtures(),finals:effectiveFinals(),transactions:[...getCommissionerActions().filter(x=>x.status==='CONFIRMED'),...visibleLegacyTransactions()],draftHistory:[...D.draft.filter(d=>!Object.keys(getTransactionReversals()).map(k=>LEGACY_TRANSACTION_META[k]).filter(m=>m?.type==='Drafted'&&m.pick).some(m=>Number(m.pick)===Number(d.pick)&&m.team===d.team&&canonicalPlayerName(m.players?.[0]||'')===canonicalPlayerName(d.player))),...getCommissionerActions().filter(x=>x.type==='Drafted'&&x.status==='CONFIRMED')],pickOwnership:{preSeason:draftPickLedger('Pre-Season'),rookieDraft:draftPickLedger('Rookie Draft'),midSeason:draftPickLedger('Mid-Season')},honours:D.honours};
   }
   async function syncBackups(){if(!commissionerLoggedIn())return [];try{backupCache=await commissionerFetch('/rest/v1/pegs_backups?select=id,created_at,season,round,label,reason&order=created_at.desc&limit=100')||[];}catch(e){console.warn(e);backupCache=[];}return backupCache;}
   async function createServerBackup(reason='MANUAL',label=''){
@@ -1458,7 +1458,7 @@
   }
   function recoveryStateSnapshot(){
     const archived=Boolean(D.meta.seasonComplete)&&Number(currentSeason())===Number(D.meta.season||2026),setup=archived?normalizeSeasonSetup(legacySeasonSetup()):getSeasonSetup(),results=archived?completedWorkbookSeasonResults():getSeasonResults();
-    return {score_overrides:getOverrides(),selection_overrides:getSelectionOverrides(),commissioner_actions:getCommissionerActions(),transaction_reversals:getTransactionReversals(),draft_state:getDraftState(),proposal_windows:getProposalWindows(),scoring_snapshots:getScoringSnapshots(),player_master:getPlayerMaster(),figurehead_overrides:getFigureheadOverrides(),season_setup:setup,season_results:results,live_feed:archived?{}:getLiveFeed(),opening_bank:getOpeningBank(),archive_model:{version:'14.8.4',baselineCleaned:true,rosterCycleCaptured:true,playerMasterCaptured:true}};
+    return {score_overrides:getOverrides(),selection_overrides:getSelectionOverrides(),commissioner_actions:getCommissionerActions(),transaction_reversals:getTransactionReversals(),draft_state:getDraftState(),proposal_windows:getProposalWindows(),scoring_snapshots:getScoringSnapshots(),player_master:getPlayerMaster(),figurehead_overrides:getFigureheadOverrides(),season_setup:setup,season_results:results,live_feed:archived?{}:getLiveFeed(),opening_bank:getOpeningBank(),archive_model:{version:'14.8.5',baselineCleaned:true,rosterCycleCaptured:true,playerMasterCaptured:true}};
   }
   async function syncCompletedSeasonRecoveryState(){
     if(!backendConfigured()||!commissionerLoggedIn()||!D.meta.seasonComplete||Number(currentSeason())!==Number(D.meta.season||2026))return false;
@@ -1466,17 +1466,34 @@
     await commissionerFetch('/rest/v1/pegs_state?on_conflict=key',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(rows)});
     localStorage.setItem(SEASON_SETUP_KEY,JSON.stringify(state.season_setup));localStorage.setItem(SEASON_RESULTS_KEY,JSON.stringify(state.season_results));localStorage.setItem(LIVE_FEED_KEY,'{}');return true;
   }
+  function backupProposalRecords(){
+    return (proposalCache||[]).map(p=>({
+      id:p.id??p.local_id??null,created_at:p.created_at||p.createdAt||new Date().toISOString(),type:p.type||'',phase:p.phase||'',
+      proposer_team:p.proposer_team||p.proposerTeam||'',counterparty_team:p.counterparty_team||p.counterpartyTeam||null,payload:p.payload||{},
+      status:p.status||'PENDING',commissioner_note:p.commissioner_note||p.commissionerNote||'',decided_at:p.decided_at||p.decidedAt||null,
+      counterparty_decided_at:p.counterparty_decided_at||p.counterpartyDecidedAt||null,counterparty_user_id:p.counterparty_user_id||p.counterpartyUserId||null
+    }));
+  }
+  function backupPickAuthorityRecords(){
+    const raw=[...draftPickLedger('Pre-Season'),...draftPickLedger('Mid-Season')],seen=new Map(),stamp=new Date().toISOString();
+    for(const p of raw){
+      const pickId=String(p.pick_id||p.id||'').trim();if(!pickId)continue;
+      seen.set(pickId,{pick_id:pickId,phase:p.phase||p.type||'',season:Number(p.season||0),pick:Number(p.pick||0),round:Number(p.round||0),original_owner:p.original_owner||p.originalOwner||'',owner:p.owner||'',updated_at:p.updated_at||p.updatedAt||stamp});
+    }
+    return [...seen.values()];
+  }
   function currentLocalRecoverySnapshot(){
-    return {schemaVersion:14,createdAt:new Date().toISOString(),state:recoveryStateSnapshot(),proposals:proposalCache||[],draftPools:draftPoolCache?[draftPoolCache]:[],rosterAuthority:effectiveRosters(),pickAuthority:[...draftPickLedger('Pre-Season'),...draftPickLedger('Mid-Season')],auditLog:auditCache||[],derived:backupDerivedData()};
+    return {schemaVersion:14,createdAt:new Date().toISOString(),state:recoveryStateSnapshot(),proposals:backupProposalRecords(),draftPools:draftPoolCache?[draftPoolCache]:[],rosterAuthority:effectiveRosters(),pickAuthority:backupPickAuthorityRecords(),auditLog:auditCache||[],derived:backupDerivedData()};
   }
   async function ensure2026ArchiveBaseline(){
     if(!commissionerLoggedIn()||!backendConfigured()||!D.meta.seasonComplete||activeSeasonSetup()||Number(currentSeason())!==Number(D.meta.season||2026))return false;
     try{
-      const marker=await commissionerFetch('/rest/v1/pegs_state?select=value&key=eq.archive_model&limit=1');
-      if(String(marker?.[0]?.value?.version||'')==='14.7.8'&&marker?.[0]?.value?.baselineCleaned===true&&marker?.[0]?.value?.rosterCycleCaptured===true)return false;
+      const marker=await commissionerFetch('/rest/v1/pegs_state?select=value&key=eq.archive_model&limit=1'),mark=marker?.[0]?.value||{};
+      if(mark?.baselineCleaned===true&&mark?.rosterCycleCaptured===true&&mark?.playerMasterCaptured===true)return false;
       cancelPendingAutoBackup();await syncCompletedSeasonRecoveryState();await Promise.all([syncProposals(),loadDraftPool(),syncAudit()]);
       const snapshot=currentLocalRecoverySnapshot(),season=Number(D.meta.season||2026),round=Number(D.meta.completedThroughRound||D.meta.currentRound||23),label=`Round ${round} · ${season} season closed`;
       await commissionerFetch('/rest/v1/rpc/pegs_replace_backups_with_snapshot',{method:'POST',body:JSON.stringify({p_label:label,p_reason:'ROUND_FINALIZED',p_snapshot:snapshot})});
+      await commissionerFetch('/rest/v1/pegs_state?on_conflict=key',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({key:'archive_model',value:snapshot.state.archive_model,updated_at:new Date().toISOString()})});
       await syncBackups();return true;
     }catch(e){console.warn('2026 archive baseline migration failed',e);throw new Error((e.message||'Archive baseline migration failed.')+' Run V14_7_5_ARCHIVE_MODEL.sql in Supabase, then refresh Data & Recovery.');}
   }
@@ -1579,7 +1596,7 @@
     if(backendConfigured()&&commissionerLoggedIn())await syncCompletedSeasonRecoveryState();
     const snapshot=currentLocalRecoverySnapshot();await writeArchiveWorkbook(snapshot,`PEGS-League-Archive-${currentSeason()}-${new Date().toISOString().slice(0,10)}.xlsx`);return null;
   }
-  async function restoreServerBackup(id){if(!commissionerLoggedIn())throw new Error('Commissioner login required.');const rec=backupCache.find(x=>String(x.id)===String(id));const when=rec?.created_at?fmtDate(rec.created_at):`#${id}`;const label=rec?.label||'this archive';const typed=prompt(`Restore PEGS to ${label} (${when})? This replaces the current league state. Team login passwords are not affected. Type RESTORE to continue.`);if(typed!=='RESTORE')return false;cancelPendingAutoBackup();await commissionerFetch('/rest/v1/rpc/pegs_restore_backup',{method:'POST',body:JSON.stringify({p_backup_id:Number(id)})});[OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,TRANSACTION_REVERSALS_KEY,DRAFT_STATE_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,PLAYER_MASTER_KEY,FIGUREHEAD_OVERRIDE_KEY,DRAFT_POOL_KEY].forEach(k=>localStorage.removeItem(k));draftPoolCache=null;proposalCache=[];await pullSharedState();await syncProposals();await loadDraftPool();await syncBackups();await syncServerAuthority();return true;}
+  async function restoreServerBackup(id){if(!commissionerLoggedIn())throw new Error('Commissioner login required.');const rec=backupCache.find(x=>String(x.id)===String(id));const when=rec?.created_at?fmtDate(rec.created_at):`#${id}`;const label=rec?.label||'this archive';const typed=prompt(`Restore PEGS to ${label} (${when})? This replaces the current league state. Team login passwords are not affected. Type RESTORE to continue.`);if(typed!=='RESTORE')return false;cancelPendingAutoBackup();await commissionerFetch('/rest/v1/rpc/pegs_restore_backup',{method:'POST',body:JSON.stringify({p_backup_id:Number(id)})});[OVERRIDE_KEY,SELECTION_OVERRIDE_KEY,COMM_ACTIONS_KEY,TRANSACTION_REVERSALS_KEY,DRAFT_STATE_KEY,PROPOSALS_KEY,STAGED_DRAFT_KEY,SEASON_SETUP_KEY,SEASON_RESULTS_KEY,LIVE_FEED_KEY,OPENING_BANK_KEY,PROPOSAL_WINDOWS_KEY,SCORING_SNAPSHOTS_KEY,PLAYER_MASTER_KEY,FIGUREHEAD_OVERRIDE_KEY,DRAFT_POOL_KEY].forEach(k=>localStorage.removeItem(k));draftPoolCache=null;proposalCache=[];await pullSharedState();await syncProposals();await loadDraftPool();await syncBackups();return true;}
   async function syncAudit(){if(!commissionerLoggedIn())return [];try{auditCache=await commissionerFetch('/rest/v1/pegs_audit_log?select=*&order=created_at.desc&limit=100')||[];}catch(e){auditCache=[];}return auditCache;}
 
   function validPegsPosition(value){return Object.prototype.hasOwnProperty.call(D.rules.positionMax,String(value||'').trim().toUpperCase());}
